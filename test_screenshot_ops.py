@@ -77,16 +77,16 @@ class TestClassifyComponent:
     def test_pre_attn_norm(self):
         c = _classify_component(
             "model.layers.0.input_layernorm", "aten.mul.Tensor")
-        assert c == "norm.pre_attn"
+        assert c == "attn_norm"
 
     def test_post_attn_norm(self):
         c = _classify_component(
             "model.layers.0.post_attention_layernorm", "aten.mul.Tensor")
-        assert c == "norm.post_attn"
+        assert c == "ffn_norm"
 
     def test_final_norm(self):
         c = _classify_component("model.norm", "aten.mul.Tensor")
-        assert c == "norm.final"
+        assert c == "final_norm"
 
     # ── attention ────────────────────────────────────────────────────────────
     def test_attn_q_proj(self):
@@ -107,7 +107,7 @@ class TestClassifyComponent:
     def test_attn_score_matmul(self):
         c = _classify_component(
             "model.layers.0.self_attn", "aten.matmul.default")
-        assert c == "attn.qk_score"
+        assert c == "attn.score"
 
     # ── MLA (DeepSeek) ───────────────────────────────────────────────────────
     def test_mla_q_a_proj(self):
@@ -124,12 +124,12 @@ class TestClassifyComponent:
     def test_moe_router(self):
         c = _classify_component(
             "model.layers.3.mlp.gate", "aten.mm.default")
-        assert c.startswith("moe.router.")
+        assert c.startswith("moe.gate.")
 
     def test_moe_expert_proj(self):
         c = _classify_component(
             "model.layers.3.mlp.experts.0.gate_proj", "aten.mm.default")
-        assert c == "moe.expert.gate_proj"
+        assert c == "moe.experts.mm"
 
     def test_moe_shared_expert(self):
         c = _classify_component(
@@ -324,7 +324,7 @@ def test_layer_attribution(tmp_path: Path):
     # All attention and FFN records should have a numeric layer index
     block_records = [
         r for r in records
-        if r["component"].startswith(("attn.", "ffn.", "norm.pre", "norm.post"))
+        if r["component"].startswith(("attn.", "ffn.", "attn_norm", "ffn_norm"))
     ]
     assert block_records, "No block-internal records found"
     missing_layer = [r for r in block_records if r["layer"] == ""]

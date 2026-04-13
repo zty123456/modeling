@@ -1,11 +1,22 @@
-"""Capture the operator sequence of DeepSeek-V3 via dispatch-level tracing
-and write the results to an Excel file.
+"""LLM Operator Screenshot — entry point.
 
-Inspired by xpu_simulator/frontend/dispatch_extractor.py — we use
-TorchDispatchMode to intercept every aten op that fires during a forward
-pass on meta tensors, then dump the ordered sequence to Excel.
+Delegates all logic to the screenshot_ops package.
+
+Direct usage (recommended)::
+
+    python screenshot_ops.py <model_id> [--layers N] [--output FILE]
+                             [--batch-size B] [--seq-len S]
+
+    python screenshot_ops.py deepseek-ai/DeepSeek-V3-0324 --layers 4
+    python screenshot_ops.py Qwen/Qwen3-8B --layers 4
+    python screenshot_ops.py ./hf_models/deepseek_v3 --layers 4
+
+Package usage (backward-compatible with remote"s --model flag)::
+
+    python -m screenshot_ops.main --model v3
+    python -m screenshot_ops.main --model v3.2
 """
-from screenshot_ops.main import main
+from screenshot_ops.main import main  # noqa: F401
 
 if __name__ == "__main__":
     main()
