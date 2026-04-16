@@ -2,6 +2,10 @@
   "architectures": [
     "DeepseekV32ForCausalLM"
   ],
+  "auto_map": {
+    "AutoConfig": "configuration_deepseek.DeepseekV32Config",
+    "AutoModelForCausalLM": "modeling_deepseek.DeepseekV32ForCausalLM"
+  },
   "attention_bias": false,
   "attention_dropout": 0.0,
   "bos_token_id": 0,
