@@ -6,7 +6,9 @@ from typing import Any, List
 import torch
 
 SKIP_OPS = {
-    # "aten.detach.default", "aten.alias.default", "aten.t.default",
+    "prim.device.default",
+    "aten.t.default",
+    # "aten.detach.default", "aten.alias.default",
     # "aten.view.default", "aten._unsafe_view.default",
     # "aten.expand.default", "aten.contiguous.default",
     # "aten.slice.Tensor", "aten.select.int",

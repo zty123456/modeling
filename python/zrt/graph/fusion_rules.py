@@ -30,6 +30,7 @@ ALWAYS_TRANSPARENT: Set[str] = {
     "aten.lift_fresh_copy.default",
     "aten.is_same_size.default",
     "aten._version.default",
+    "prim.device.default",
 }
 
 # Shape-only ops: change stride/size metadata but do not move data.

@@ -108,24 +108,135 @@ output_dir, records = run_trace(
 
 ---
 
+## 训练抓图
+
+在推理抓图（prefill / decode）之外，工具同样支持**训练阶段**的算子追踪：捕获前向传播中 `model.train()` 特有的算子（dropout、batch norm 等），并可继续追踪 `loss.backward()` 触发的梯度算子。
+
+### 训练阶段说明
+
+| 阶段 | 含义 | 梯度 | model 模式 |
+|------|------|------|------------|
+| `train_forward` | 训练前向（含 dropout 等训练特有算子）| 开启 | `train()` |
+| `train_backward` | 前向 + backward（包含梯度算子）| 开启 | `train()` |
+| `train` | `train_forward` 的简写别名 | — | — |
+
+训练阶段与推理阶段完全独立，可以在同一次调用中混合使用，各自生成独立的输出文件。
+
+### 命令行
+
+```bash
+# 快捷 flag：同时抓 train_forward + train_backward
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 2 --train
+
+# 等价写法（显式指定阶段列表）
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 2 \
+    --phases train_forward train_backward
+
+# 仅抓训练前向
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 2 \
+    --phases train_forward
+
+# 推理 + 训练混合（四阶段一次完成）
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 \
+    --phases prefill decode train_forward train_backward
+```
+
+输出文件与推理阶段命名规则一致：
+```
+output/graph/Qwen2.5-7B-Instruct/
+├── Qwen2.5-7B-Instruct_train_forward_ops.xlsx
+├── Qwen2.5-7B-Instruct_train_forward_raw_graph.json
+├── Qwen2.5-7B-Instruct_train_forward_raw_graph.onnx
+├── Qwen2.5-7B-Instruct_train_forward_fused_graph.json
+├── Qwen2.5-7B-Instruct_train_backward_ops.xlsx
+└── ...
+```
+
+### Python API
+
+```python
+from python.zrt.graph import run_trace_phases
+
+# 仅训练前向
+result = run_trace_phases(
+    model_id="Qwen/Qwen2.5-7B-Instruct",
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    phases=("train_forward",),
+)
+records = result.phase_records["train_forward"]
+print(f"捕获算子数（训练前向）: {len(records)}")
+
+# 训练前向 + 反向（完整梯度追踪）
+result = run_trace_phases(
+    model_id="Qwen/Qwen2.5-7B-Instruct",
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    phases=("train_forward", "train_backward"),
+    output_dir="output/graph/qwen_train",
+)
+fwd_records = result.phase_records["train_forward"]
+bwd_records = result.phase_records["train_backward"]
+print(f"前向算子数: {len(fwd_records)}")
+print(f"反向算子数（含梯度算子）: {len(bwd_records)}")
+
+# 推理 + 训练混合（各阶段独立输出）
+result = run_trace_phases(
+    model_id="Qwen/Qwen2.5-7B-Instruct",
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    phases=("prefill", "decode", "train_forward", "train_backward"),
+)
+for phase, records in result.phase_records.items():
+    print(f"{phase}: {len(records)} ops")
+
+# 访问 OpGraph IR（训练阶段同样生成完整的原始图和融合图）
+raw_g, fused_g = result.graphs["train_backward"]
+print(f"反向图节点数: {raw_g.num_nodes()}")
+```
+
+### 与推理阶段的关键差异
+
+| 特性 | 推理（prefill/decode） | 训练（train_forward/backward） |
+|------|----------------------|-------------------------------|
+| 梯度计算 | `torch.no_grad()` | 开启（`requires_grad=True`）|
+| 模型模式 | `model.eval()` | `model.train()` |
+| KV Cache | 支持（prefill→decode 传递）| 不使用 |
+| Dropout 算子 | 不出现 | 出现（如有 dropout 配置）|
+| 梯度算子 | — | `train_backward` 额外捕获 |
+
+---
+
 ## 命令行参数
 
-| 参数 | 简写 | 默认值 | 说明 |
-|------|------|--------|------|
-| `model_id` | — | 必填 | HF Hub 模型 ID 或本地路径 |
-| `--layers` | — | `4` | 追踪的 Transformer Block 数量（2–4 即可覆盖所有算子模式） |
-| `--output` | `-o` | 自动命名 | 输出 `.xlsx` 路径 |
-| `--batch-size` | — | `1` | dummy 输入的 batch size |
-| `--seq-len` | — | `128` | dummy 输入的序列长度 |
-| `--model` | — | — | 向后兼容简写：`v3` 或 `v3.2` |
+
+| 参数              | 简写  | 默认值              | 说明                                                                            |
+| ----------------- | ----- | ------------------- | ------------------------------------------------------------------------------- |
+| `model_id`        | —    | 必填                | HF Hub 模型 ID 或本地路径                                                       |
+| `--layers`        | —    | `4`                 | 追踪的 Transformer Block 数量（2–4 即可覆盖所有算子模式）                      |
+| `--output`        | `-o` | 自动命名            | 输出目录路径                                                                    |
+| `--batch-size`    | —    | `1`                 | dummy 输入的 batch size                                                         |
+| `--seq-len`       | —    | `128`               | dummy 输入的序列长度                                                            |
+| `--phases`        | —    | `prefill decode`    | 追踪的阶段列表，可选：`prefill`、`decode`、`train_forward`、`train_backward`    |
+| `--train`         | —    | `False`             | 快捷 flag：等价于 `--phases train_forward train_backward`                       |
+| `--platform`      | —    | `generic`           | 目标平台（`cuda`/`ascend_npu`/`cpu`/`generic`），影响融合 kernel 命名           |
+| `--hw`            | —    | —                  | 硬件规格名称（如 `nvidia_h100_sxm`），用于打印性能报告                          |
+| `--tp`            | —    | `1`                 | 张量并行度（配合 `--hw` 使用）                                                  |
+| `--target-layers` | —    | —                  | 指定追踪的层编号，逗号分隔（如 `0,3`）                                          |
+| `--auto-layers`   | —    | `True`（CLI 默认） | 自动选择第一个密集层和第一个稀疏（MoE）层                                       |
+| `--model`         | —    | —                  | 向后兼容简写：`v3` 或 `v3.2`                                                    |
 
 ### 关于 `--layers` 的选择
 
-| 场景 | 推荐值 |
-|------|--------|
-| 纯密集模型（Llama / Qwen2 / Mistral） | 2 |
-| DeepSeek-V3（前 3 层为密集层，第 4 层起为 MoE） | 4 |
-| Qwen3-MoE / Mixtral（第 1 层即为 MoE） | 2 |
+
+| 场景                                            | 推荐值 |
+| ----------------------------------------------- | ------ |
+| 纯密集模型（Llama / Qwen2 / Mistral）           | 2      |
+| DeepSeek-V3（前 3 层为密集层，第 4 层起为 MoE） | 4      |
+| Qwen3-MoE / Mixtral（第 1 层即为 MoE）          | 2      |
 
 ---
 
@@ -133,22 +244,24 @@ output_dir, records = run_trace(
 
 ### 开箱即用（在 transformers 注册表中）
 
-| 架构 | 示例模型 ID | 注意 |
-|------|------------|------|
-| LLaMA / LLaMA-2 / LLaMA-3 | `meta-llama/Llama-3.1-8B` | 需 HF 授权 |
-| Qwen2 / Qwen2.5 | `Qwen/Qwen2.5-7B-Instruct` | — |
-| Qwen3 (dense) | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-8B` | — |
-| Qwen3 (MoE) | `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-235B-A22B` | — |
-| Mistral | `mistralai/Mistral-7B-v0.1` | — |
-| Mixtral (MoE) | `mistralai/Mixtral-8x7B-v0.1` | — |
-| Gemma / Gemma2 | `google/gemma-2-9b` | — |
-| Phi-3 / Phi-4 | `microsoft/Phi-4` | — |
+
+| 架构                      | 示例模型 ID                                  | 注意       |
+| ------------------------- | -------------------------------------------- | ---------- |
+| LLaMA / LLaMA-2 / LLaMA-3 | `meta-llama/Llama-3.1-8B`                    | 需 HF 授权 |
+| Qwen2 / Qwen2.5           | `Qwen/Qwen2.5-7B-Instruct`                   | —         |
+| Qwen3 (dense)             | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-8B`           | —         |
+| Qwen3 (MoE)               | `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-235B-A22B` | —         |
+| Mistral                   | `mistralai/Mistral-7B-v0.1`                  | —         |
+| Mixtral (MoE)             | `mistralai/Mixtral-8x7B-v0.1`                | —         |
+| Gemma / Gemma2            | `google/gemma-2-9b`                          | —         |
+| Phi-3 / Phi-4             | `microsoft/Phi-4`                            | —         |
 
 ### 需要 `trust_remote_code`（自动处理）
 
-| 架构 | 示例模型 ID | 特殊处理 |
-|------|------------|---------|
-| DeepSeek-V3 | `deepseek-ai/DeepSeek-V3` | MoE meta patch |
+
+| 架构                    | 示例模型 ID                    | 特殊处理                       |
+| ----------------------- | ------------------------------ | ------------------------------ |
+| DeepSeek-V3             | `deepseek-ai/DeepSeek-V3`      | MoE meta patch                 |
 | DeepSeek-V3-0324 (V3.2) | `deepseek-ai/DeepSeek-V3-0324` | MoE meta patch + Indexer patch |
 
 ### 本地目录支持
@@ -217,30 +330,33 @@ _, transformed_graph_tp4 = run_transform(
 
 ### `run_transform()` 参数说明
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `raw_graph` | OpGraph | — | 从 `run_trace_phases()` 获取的原始图 |
-| `output_dir` | Path | — | 输出目录（自动创建） |
-| `parallel_config` | ParallelConfig | `ParallelConfig()` | TP/EP/PP/DP/SP 配置 |
-| `stream_config` | StreamConfig | `StreamConfig(1, 1)` | 计算流数 + 通信流数 |
-| `pipeline` | TransformPipeline | `build_default_pipeline()` | 自定义 transform 管道 |
-| `hw_spec` | HardwareSpec | `A100_40GB` | GPU 规格（用于 FLOPs 估算） |
+
+| 参数              | 类型              | 默认值                     | 说明                                |
+| ----------------- | ----------------- | -------------------------- | ----------------------------------- |
+| `raw_graph`       | OpGraph           | —                         | 从`run_trace_phases()` 获取的原始图 |
+| `output_dir`      | Path              | —                         | 输出目录（自动创建）                |
+| `parallel_config` | ParallelConfig    | `ParallelConfig()`         | TP/EP/PP/DP/SP 配置                 |
+| `stream_config`   | StreamConfig      | `StreamConfig(1, 1)`       | 计算流数 + 通信流数                 |
+| `pipeline`        | TransformPipeline | `build_default_pipeline()` | 自定义 transform 管道               |
+| `hw_spec`         | HardwareSpec      | `A100_40GB`                | GPU 规格（用于 FLOPs 估算）         |
 
 ### 导出文件详解
 
 #### Excel：`*_transformed_ops.xlsx`（5个Sheet）
 
-| Sheet | 内容 |
-|-------|------|
-| **Metadata** | 图的基本信息 + 并行策略 + 流配置 |
+
+| Sheet                     | 内容                                                |
+| ------------------------- | --------------------------------------------------- |
+| **Metadata**              | 图的基本信息 + 并行策略 + 流配置                    |
 | **Transformed Operators** | 所有算子（注入了 FLOPs / 延迟 / bound / stream_id） |
-| **Communication Ops** | 通信算子详情（all-reduce / all-to-all / send-recv） |
-| **Parallelism Summary** | 按层统计计算/通信/内存算子数 + 并行类型 |
-| **Stream Assignment** | 流分配统计（哪些节点在 compute/comm stream） |
+| **Communication Ops**     | 通信算子详情（all-reduce / all-to-all / send-recv） |
+| **Parallelism Summary**   | 按层统计计算/通信/内存算子数 + 并行类型             |
+| **Stream Assignment**     | 流分配统计（哪些节点在 compute/comm stream）        |
 
 #### JSON：`*_transformed_graph.json`
 
 结构化数据（用于自动化分析）：
+
 ```json
 {
   "graph": {
@@ -314,14 +430,15 @@ print(cfg.describe())  # "TP=4, EP=2, PP=2, DP=1, SP=False"
 
 工作簿包含 6 个 Sheet：
 
-| Sheet | 说明 |
-|-------|------|
-| Model Config | 模型配置摘要 |
-| Fused Operators | 融合后的算子序列（主视图，含融合 I/O 映射） |
-| Raw Operator Sequence | 原始 aten 算子完整序列 |
-| Summary | 按融合算子聚合统计 |
-| By Layer | 按层级聚合统计 |
-| Fusion Rules | 自动发现的融合模式（含融合 I/O 映射） |
+
+| Sheet                 | 说明                                        |
+| --------------------- | ------------------------------------------- |
+| Model Config          | 模型配置摘要                                |
+| Fused Operators       | 融合后的算子序列（主视图，含融合 I/O 映射） |
+| Raw Operator Sequence | 原始 aten 算子完整序列                      |
+| Summary               | 按融合算子聚合统计                          |
+| By Layer              | 按层级聚合统计                              |
+| Fusion Rules          | 自动发现的融合模式（含融合 I/O 映射）       |
 
 同时生成 `*_fusion_rules.json`，记录自动发现的算子融合模式。
 
@@ -329,17 +446,18 @@ print(cfg.describe())  # "TP=4, EP=2, PP=2, DP=1, SP=False"
 
 模型关键配置一览，包含（有则展示，无则跳过）：
 
-| 字段 | 说明 |
-|------|------|
-| `model_id` | 模型来源 |
-| `model_type` | 架构类型 |
-| `hidden_size` | 隐藏层维度 |
-| `num_hidden_layers` | 总层数 / 追踪层数 |
-| `num_attention_heads` | 注意力头数 |
-| `vocab_size` | 词表大小 |
-| `n_routed_experts` | MoE 路由专家数（DeepSeek） |
-| `num_local_experts` | MoE 本地专家数（Mixtral） |
-| `q_lora_rank` / `kv_lora_rank` | MLA 低秩维度（DeepSeek） |
+
+| 字段                           | 说明                       |
+| ------------------------------ | -------------------------- |
+| `model_id`                     | 模型来源                   |
+| `model_type`                   | 架构类型                   |
+| `hidden_size`                  | 隐藏层维度                 |
+| `num_hidden_layers`            | 总层数 / 追踪层数          |
+| `num_attention_heads`          | 注意力头数                 |
+| `vocab_size`                   | 词表大小                   |
+| `n_routed_experts`             | MoE 路由专家数（DeepSeek） |
+| `num_local_experts`            | MoE 本地专家数（Mixtral）  |
+| `q_lora_rank` / `kv_lora_rank` | MLA 低秩维度（DeepSeek）   |
 
 ### Sheet：Fused Operators（主视图）
 
@@ -356,34 +474,36 @@ print(cfg.describe())  # "TP=4, EP=2, PP=2, DP=1, SP=False"
 
 `Component` 列的标签由模块路径中的命名模式推断，与具体模型实现无关：
 
-| 标签前缀 | 含义 | 颜色 |
-|---------|------|------|
-| `attn_norm` | Attention 前的 LayerNorm / RMSNorm | 绿 |
-| `ffn_norm` | Attention 后的 LayerNorm / RMSNorm | 绿 |
-| `final_norm` | 最终 Norm 层 | 绿 |
-| `attn.q_proj` / `attn.k_proj` / … | 标准 QKV 及输出投影 | 蓝 |
-| `attn.q_a_proj` / `attn.kv_a_proj` / … | MLA 低秩投影（DeepSeek） | 蓝 |
-| `attn.score` | QK 内积计算 | 蓝 |
-| `attn.softmax` | Softmax | 蓝 |
-| `attn.rope` | RoPE 位置编码 | 蓝 |
-| `moe.gate.*` | MoE 路由 / 门控 | 橙 |
-| `moe.shared.*` | MoE 共享专家（DeepSeek） | 黄 |
-| `moe.experts.*` | MoE 路由专家 MLP | 粉 |
-| `ffn.gate_proj` / `ffn.up_proj` / `ffn.down_proj` | 密集 FFN 投影 | 紫 |
-| `ffn.silu` / `ffn.mul` | 激活函数 | 紫 |
-| `embedding` | Token Embedding | 灰 |
-| `lm_head` | 语言模型输出头 | 灰 |
+
+| 标签前缀                                          | 含义                               | 颜色 |
+| ------------------------------------------------- | ---------------------------------- | ---- |
+| `attn_norm`                                       | Attention 前的 LayerNorm / RMSNorm | 绿   |
+| `ffn_norm`                                        | Attention 后的 LayerNorm / RMSNorm | 绿   |
+| `final_norm`                                      | 最终 Norm 层                       | 绿   |
+| `attn.q_proj` / `attn.k_proj` / …                | 标准 QKV 及输出投影                | 蓝   |
+| `attn.q_a_proj` / `attn.kv_a_proj` / …           | MLA 低秩投影（DeepSeek）           | 蓝   |
+| `attn.score`                                      | QK 内积计算                        | 蓝   |
+| `attn.softmax`                                    | Softmax                            | 蓝   |
+| `attn.rope`                                       | RoPE 位置编码                      | 蓝   |
+| `moe.gate.*`                                      | MoE 路由 / 门控                    | 橙   |
+| `moe.shared.*`                                    | MoE 共享专家（DeepSeek）           | 黄   |
+| `moe.experts.*`                                   | MoE 路由专家 MLP                   | 粉   |
+| `ffn.gate_proj` / `ffn.up_proj` / `ffn.down_proj` | 密集 FFN 投影                      | 紫   |
+| `ffn.silu` / `ffn.mul`                            | 激活函数                           | 紫   |
+| `embedding`                                       | Token Embedding                    | 灰   |
+| `lm_head`                                         | 语言模型输出头                     | 灰   |
 
 ---
 
 ## V3 vs V3.2 对比
 
-| 特性 | V3 | V3.2 |
-|---|---|---|
-| 原始算子数 (4层) | 400 | 468 |
-| 融合后算子数 | 75 | 87 |
-| 融合模式数 | 6 | 7 |
-| Indexer 模块 | 无 | 有 (MLA 注意力中新增) |
+
+| 特性             | V3  | V3.2                  |
+| ---------------- | --- | --------------------- |
+| 原始算子数 (4层) | 400 | 468                   |
+| 融合后算子数     | 75  | 87                    |
+| 融合模式数       | 6   | 7                     |
+| Indexer 模块     | 无  | 有 (MLA 注意力中新增) |
 
 ---
 
@@ -597,29 +717,35 @@ python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --tp 4 --hw 
 ```bash
 # 安装测试依赖
 pip install pytest
-
-# 仅本地测试（不需要网络，秒级完成）
-pytest test_screenshot_ops.py -v -m "not network"
-
-# 包含 HF Hub 测试（只下载 config，不下载权重）
-pytest test_screenshot_ops.py -v
-
-# 运行指定模型
-pytest test_screenshot_ops.py -v -k "deepseek_v3"
-pytest test_screenshot_ops.py -v -k "qwen3"
 ```
 
 ### 测试覆盖
 
-| 测试组 | 内容 |
-|--------|------|
-| `TestExtractLayerIdx` | 层编号提取逻辑 |
-| `TestClassifyComponent` | 组件分类（norm / attn / MLA / MoE / FFN / embedding / lm_head） |
-| `TestMoEDetection` | MoE 模块检测与 patch 替换 |
-| `test_local_model[*]` | 7 个本地模型端到端追踪（无网络） |
-| `test_moe_components_present` | MoE 算子出现验证（DeepSeek-V3、Mixtral） |
-| `test_deepseek_v3_mla_components` | MLA 专属算子出现验证 |
-| `test_layer_attribution` | Block 内算子均有正确层号 |
-| `test_config_summary_fields` | Config 摘要必填字段完整性 |
-| `test_hub_model[*]` | HF Hub 端到端：DeepSeek-V3.2 / Qwen3 / Llama-3.1 |
-| `test_hub_moe_detection` | Hub 模型 MoE/非MoE 检测准确性 |
+
+| 测试组                            | 内容                                                            |
+| --------------------------------- | --------------------------------------------------------------- |
+| `TestExtractLayerIdx`             | 层编号提取逻辑                                                  |
+| `TestCla[tests](tests)ssifyComponent`           | 组件分类（norm / attn / MLA / MoE / FFN / embedding / lm_head） |
+| `TestMoEDetection`                | MoE 模块检测与 patch 替换                                       |
+| `test_local_model[*]`             | 7 个本地模型端到端追踪（无网络）                                |
+| `test_moe_components_present`     | MoE 算子出现验证（DeepSeek-V3、Mixtral）                        |
+| `test_deepseek_v3_mla_components` | MLA 专属算子出现验证                                            |
+| `test_layer_attribution`          | Block 内算子均有正确层号                                        |
+| `test_config_summary_fields`      | Config 摘要必填字段完整性                                       |
+| `test_hub_model[*]`               | HF Hub 端到端：DeepSeek-V3.2 / Qwen3 / Llama-3.1                |
+| `test_hub_moe_detection`          | Hub 模型 MoE/非MoE 检测准确性                                   |
+
+
+### 精度验证
+
+##### 验证 DeepSeek-V3 在 H100 上的精度
+
+```
+python -m validation.cli run \n    --model-id deepseek-ai/DeepSeek-V3-0324 \n    --dataset lambada \n    --device h100 \n    --batch-size 32 \n    --output validation_results/deepseek_v3_h100/
+```
+
+##### 生成对比报告
+
+```
+python -m validation.cli compare \n    --baseline huggingface \n    --traced validation_results/deepseek_v3_h100/ \n    --metric accuracy perplexity latency \n    --report html
+```

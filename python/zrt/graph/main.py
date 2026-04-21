@@ -1,16 +1,25 @@
-"""Entry point: load model, trace forward, write Excel + JSON + computation graph.
+"""Entry point: load model, trace forward/backward, write Excel + JSON + computation graph.
 
 Public API::
 
     from python.zrt.graph import run_trace, run_trace_phases, build_config_summary, load_model
 
-    # Trace both prefill and decode in one call (recommended)
+    # Inference: trace both prefill and decode in one call (recommended)
     output_dir, phase_records = run_trace_phases(
         model_id="deepseek-ai/DeepSeek-V3-0324",
         num_layers=4,
         batch_size=1,
         seq_len=128,
         output_dir="output/graph/DeepSeek-V3-0324",  # optional
+    )
+
+    # Training: trace forward + backward (gradient ops included)
+    output_dir, phase_records = run_trace_phases(
+        model_id="deepseek-ai/DeepSeek-V3-0324",
+        num_layers=4,
+        batch_size=1,
+        seq_len=128,
+        phases=("train_forward", "train_backward"),
     )
 
     # Trace a single phase
@@ -110,8 +119,11 @@ _MODEL_DIRS = {
     "v3.2": "deepseek_v3_2",
 }
 
-# Normalise legacy "forward" phase name
-_PHASE_ALIASES = {"forward": "prefill"}
+# Normalise legacy phase names
+_PHASE_ALIASES = {"forward": "prefill", "train": "train_forward"}
+
+# Phases that run with gradients enabled and model in train() mode
+_TRAINING_PHASES = {"train_forward", "train_backward"}
 
 
 # ── Layer-type inference ───────────────────────────────────────────────────────
@@ -339,6 +351,10 @@ def _trace_phase(
     if past_key_values is not None:
         forward_kwargs["past_key_values"] = past_key_values
 
+    is_training = phase in _TRAINING_PHASES
+    if is_training:
+        model.train()
+
     tensor_tracker = TensorTracker()
     tracker = ModuleTracker(model)
     recorder = RecordingDispatch(
@@ -347,10 +363,28 @@ def _trace_phase(
         skip_reshapes=True,
     )
     try:
-        with recorder, torch.no_grad():
-            output = model(**forward_kwargs)
+        if is_training:
+            with recorder:
+                output = model(**forward_kwargs)
+                if phase == "train_backward":
+                    logits = getattr(output, "logits", None)
+                    if logits is None:
+                        logits = getattr(output, "last_hidden_state", None)
+                    if logits is not None:
+                        loss = logits.sum()
+                        try:
+                            loss.backward()
+                        except Exception as e:
+                            logger.warning("backward() failed (FakeTensor limitation): %s", e)
+                    else:
+                        logger.warning("No logits/last_hidden_state found; skipping backward.")
+        else:
+            with recorder, torch.no_grad():
+                output = model(**forward_kwargs)
     finally:
         tracker.remove()
+        if is_training:
+            model.eval()
 
     return recorder.records, tracker, output
 
@@ -427,13 +461,28 @@ def run_trace_phases(
     the KV cache produced by prefill (fake tensors) can be passed directly
     into the decode forward pass.
 
+    Training phases (``train_forward``, ``train_backward``) run with
+    ``model.train()`` and gradient computation enabled, so dropout and other
+    training-specific ops are captured.  ``train_backward`` additionally
+    triggers a ``loss.backward()`` call (via ``logits.sum()``) to capture
+    all gradient aten ops.  Training phases are independent — they do not
+    participate in KV-cache chaining and can be freely mixed with inference
+    phases in the same call.
+
     Parameters
     ----------
     phases:
-        Ordered sequence of phases to trace.  Each element must be
-        ``"prefill"`` or ``"decode"``.  When both are given, prefill runs
-        first and its ``past_key_values`` are fed to the decode pass so that
-        attention shapes reflect the actual KV-cache layout.
+        Ordered sequence of phases to trace.  Supported values:
+
+        * ``"prefill"`` — full-sequence inference pass (default KV-cache source).
+        * ``"decode"``  — single-token inference pass; uses prefill KV cache
+          when both phases are requested together.
+        * ``"train_forward"`` — training forward pass (``model.train()``,
+          gradients enabled).
+        * ``"train_backward"`` — training forward + backward pass; captures
+          all gradient ops emitted by ``loss.backward()``.
+        * ``"forward"`` / ``"train"`` — aliases for ``"prefill"`` /
+          ``"train_forward"`` respectively.
     target_layers:
         Optional explicit list of layer indices to keep in the output.
         For example ``[0, 3]`` retains only ops from layer 0 and layer 3.
@@ -505,14 +554,14 @@ def run_trace_phases(
         for phase in canonical_phases:
             query_len = 1 if phase == "decode" else seq_len
             logger.info(
-                "Tracing %s phase (batch=%d, query_len=%d) …",
-                phase, batch_size, query_len,
+                "Tracing %s phase (batch=%d, query_len=%d, grad=%s) …",
+                phase, batch_size, query_len, phase in _TRAINING_PHASES,
             )
             records, tracker, output = _trace_phase(
                 model, config, batch_size, seq_len, phase, past_key_values)
             logger.info("  Captured %d ops.", len(records))
 
-            # Pass KV cache from prefill into the subsequent decode pass.
+            # Pass KV cache from prefill into the subsequent decode pass (inference only).
             if phase == "prefill" and "decode" in canonical_phases:
                 past_key_values = getattr(output, "past_key_values", None)
                 if past_key_values is None:
@@ -614,14 +663,20 @@ def main() -> None:
                         help="Output directory (default: output/graph/<model_slug>)")
     parser.add_argument(
         "--phases", nargs="+", default=["prefill", "decode"],
-        choices=["prefill", "decode", "forward"],
+        choices=["prefill", "decode", "forward",
+                 "train_forward", "train_backward", "train"],
         metavar="PHASE",
-        help="Phases to trace: prefill, decode, or both (default: prefill decode). "
-             "'forward' is an alias for 'prefill'.")
+        help="Phases to trace (default: prefill decode). "
+             "Inference: prefill, decode. Training: train_forward, train_backward. "
+             "'forward'/'train' are aliases for 'prefill'/'train_forward'.")
     # Legacy single-phase flag kept for backward compat
     parser.add_argument(
         "--phase", default=None,
         help="(legacy) Trace a single phase. Overrides --phases when set.")
+    parser.add_argument(
+        "--train", action="store_true", default=False,
+        help="Trace training phases (train_forward + train_backward). "
+             "Equivalent to --phases train_forward train_backward.")
 
     parser.add_argument(
         "--platform",
@@ -676,8 +731,10 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) if args.output_dir else None
 
-    # --phase (legacy) overrides --phases
-    if args.phase is not None:
+    # Phase resolution precedence: --train > --phase (legacy) > --phases
+    if args.train:
+        phases = ["train_forward", "train_backward"]
+    elif args.phase is not None:
         phases = [args.phase]
     else:
         phases = args.phases

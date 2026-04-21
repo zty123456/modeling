@@ -1,0 +1,99 @@
+"""Tests for training phase tracing (train_forward / train_backward)."""
+import pytest
+from python.zrt.graph import run_trace_phases
+
+# Uses local config only — no network required
+# MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_ID = "deepseek-ai/DeepSeek-V3"
+_COMMON = dict(model_id=MODEL_ID, num_layers=2, batch_size=1, seq_len=16)
+
+
+def test_train_forward_produces_records():
+    _, phase_records = run_trace_phases(**_COMMON, phases=("train_forward",))
+    records = phase_records["train_forward"]
+    assert len(records) > 0
+
+
+def test_train_alias_equals_train_forward():
+    """'train' is an alias for 'train_forward'."""
+    _, pr_alias = run_trace_phases(**_COMMON, phases=("train",))
+    _, pr_full = run_trace_phases(**_COMMON, phases=("train_forward",))
+    ops_alias = [r["aten_op"] for r in pr_alias["train_forward"]]
+    ops_full = [r["aten_op"] for r in pr_full["train_forward"]]
+    assert ops_alias == ops_full
+
+
+def test_train_backward_has_more_ops_than_forward():
+    """Backward pass appends gradient ops on top of the forward sequence."""
+    _, phase_records = run_trace_phases(
+        **_COMMON, phases=("train_forward", "train_backward")
+    )
+    fwd = phase_records["train_forward"]
+    bwd = phase_records["train_backward"]
+    assert len(bwd) > len(fwd), (
+        f"Expected backward to record more ops than forward "
+        f"({len(bwd)} vs {len(fwd)})"
+    )
+
+
+def test_train_and_inference_phases_coexist():
+    """Training phases and inference phases can be mixed in one call."""
+    _, phase_records = run_trace_phases(
+        **_COMMON, phases=("prefill", "train_forward")
+    )
+    assert "prefill" in phase_records
+    assert "train_forward" in phase_records
+    assert len(phase_records["prefill"]) > 0
+    assert len(phase_records["train_forward"]) > 0
+
+
+def test_train_forward_output_files_created(tmp_path):
+    """Excel / JSON / ONNX files are written for training phases."""
+    run_trace_phases(**_COMMON, phases=("train_forward",), output_dir=tmp_path)
+    xlsx_files = list(tmp_path.glob("*train_forward_ops.xlsx"))
+    assert xlsx_files, "Expected train_forward Excel file to be created"
+
+
+# ── End-to-end tests (forward + backward together) ────────────────────────────
+
+def test_train_e2e_both_phases_files_created(tmp_path):
+    """E2E: train_forward + train_backward both produce records and output files."""
+    result = run_trace_phases(
+        **_COMMON, phases=("train_forward", "train_backward"), output_dir=tmp_path
+    )
+    _, phase_records = result
+
+    for phase in ("train_forward", "train_backward"):
+        assert len(phase_records[phase]) > 0, f"{phase} produced no records"
+        assert list(tmp_path.glob(f"*{phase}_ops.xlsx")), f"Missing xlsx for {phase}"
+        assert list(tmp_path.glob(f"*{phase}_raw_graph.json")), f"Missing raw graph json for {phase}"
+
+
+def test_train_e2e_opgraph_has_nodes(tmp_path):
+    """OpGraph IR built from training phases must have nodes and edges."""
+    result = run_trace_phases(
+        **_COMMON, phases=("train_forward", "train_backward"), output_dir=tmp_path
+    )
+    for phase in ("train_forward", "train_backward"):
+        raw_g, fused_g = result.graphs[phase]
+        assert raw_g.num_nodes() > 0, f"{phase} raw OpGraph is empty"
+        assert fused_g.num_nodes() > 0, f"{phase} fused OpGraph is empty"
+
+
+def test_train_backward_has_backward_only_ops():
+    """Backward phase must contain aten ops absent from the forward-only phase.
+
+    These are gradient ops (e.g. transposed mm, threshold_backward, etc.)
+    that PyTorch autograd emits only during the backward pass.
+    """
+    _, phase_records = run_trace_phases(
+        **_COMMON, phases=("train_forward", "train_backward")
+    )
+    fwd_ops = {r["aten_op"] for r in phase_records["train_forward"]}
+    bwd_ops = {r["aten_op"] for r in phase_records["train_backward"]}
+
+    bwd_only = bwd_ops - fwd_ops
+    assert len(bwd_only) > 0, (
+        "Expected backward-only gradient ops but found none. "
+        f"forward ops: {len(fwd_ops)}, backward ops: {len(bwd_ops)}"
+    )
