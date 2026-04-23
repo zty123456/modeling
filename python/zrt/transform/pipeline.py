@@ -91,3 +91,48 @@ def build_default_pipeline() -> TransformPipeline:
     pipe.add("analyze", StreamAssignPass())
 
     return pipe
+
+
+def build_training_pipeline() -> TransformPipeline:
+    """Build the training pipeline: reuse all inference passes + training analysis passes.
+
+    The inference passes (TP, EP, CommInsert, Fusion, Flops, Roofline, CommLatency,
+    StreamAssign) run unconditionally.  The training-specific passes (TrainingFlops,
+    TrainingMemory, TrainingPipeline) are conditioned on ``ctx.training is not None``.
+    """
+    from python.zrt.transform.parallel import (
+        TensorParallelPass, ExpertParallelPass, CommInserterPass,
+    )
+    from python.zrt.transform.fusion import FusionPass
+    from python.zrt.transform.analysis import (
+        FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass,
+        TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
+    )
+
+    is_train = lambda c: c.training is not None
+
+    pipe = TransformPipeline()
+
+    # ── Stage 1: Split ────────────────────────────────────────────────────────
+    pipe.add("split", TensorParallelPass(),
+             condition=lambda c: c.parallel.tp > 1)
+    pipe.add("split", ExpertParallelPass(),
+             condition=lambda c: c.parallel.ep > 1)
+    pipe.add("split", CommInserterPass(),
+             condition=lambda c: c.parallel.tp > 1 or c.parallel.ep > 1)
+
+    # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
+    pipe.add("fuse", FusionPass())
+
+    # ── Stage 3: Optim ────────────────────────────────────────────────────────
+
+    # ── Stage 4: Analyze ──────────────────────────────────────────────────────
+    pipe.add("analyze", FlopsPass())
+    pipe.add("analyze", RooflinePass())
+    pipe.add("analyze", CommLatencyPass())
+    pipe.add("analyze", StreamAssignPass())
+    pipe.add("analyze", TrainingFlopsPass(),   condition=is_train)
+    pipe.add("analyze", TrainingMemoryPass(),  condition=is_train)
+    pipe.add("analyze", TrainingPipelinePass(), condition=is_train)
+
+    return pipe

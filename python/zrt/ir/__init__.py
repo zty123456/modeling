@@ -45,6 +45,7 @@ from .node import OpNode, infer_category
 from .edge import Edge
 from .graph import OpGraph
 from .hierarchy import HierNode, GraphHierarchy
+from .param_count import count_params, op_short
 
 # ── serialization ─────────────────────────────────────────────────────────────
 from .serde import (
@@ -75,6 +76,7 @@ __all__ = [
     "dtype_from_torch", "dtype_from_str",
     "parse_shape", "split_shape_list", "memory_bytes",
     "infer_category",
+    "count_params", "op_short",
     # serde
     "tensor_meta_to_dict", "tensor_meta_from_dict",
     "op_node_to_dict",     "op_node_from_dict",

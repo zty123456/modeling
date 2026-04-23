@@ -149,22 +149,11 @@ def estimate_training(
     >>> report = estimate_training(graph, ctx)
     >>> print(report.summary())
     """
-    from .training import TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass  # noqa: F401
+    from python.zrt.transform.pipeline import build_training_pipeline
 
-    # Run training analysis passes
-    flops_pass = TrainingFlopsPass()
-    memory_pass = TrainingMemoryPass()
-    pipeline_pass = TrainingPipelinePass()
-
-    g = flops_pass.run(graph, ctx)
-    g = memory_pass.run(g, ctx)
-
-    # Annotate per-node latency before pipeline timing (requires hw_spec)
-    if ctx.hw_spec is not None:
-        from .passes import RooflinePass
-        g = RooflinePass().run(g, ctx)
-
-    g = pipeline_pass.run(g, ctx)
+    # Run the full training pipeline (inference passes + training-specific)
+    pipe = build_training_pipeline()
+    g = pipe.run(graph, ctx)
 
     # Extract metrics from graph metadata
     pipeline_metrics = g.metadata.get("pipeline_metrics")
@@ -270,37 +259,45 @@ def model_training(
     from python.zrt.graph import run_trace_phases
     from python.zrt.transform.context import ParallelConfig, TrainingConfig, TransformContext
 
-    # 1. Capture
+    # 1. Capture both forward and backward phases
     _, phase_records = run_trace_phases(
         model_id=model_id,
         num_layers=num_layers,
         batch_size=batch_size,
         seq_len=seq_len,
-        phases=("train_forward",),
+        phases=("train_forward", "train_backward"),
         output_dir=output_dir,
     )
-    records = phase_records["train_forward"]
 
-    # 2. Build OpGraph with full-model metadata
+    # 2. Build shared metadata
     from python.zrt.ir.adapter import records_to_opgraph
 
     metadata: dict = {
         "seq_len": seq_len,
         "batch_size": batch_size,
         "num_layers": num_layers_full or num_layers,
+        "num_layers_traced": num_layers,
         "hidden": hidden,
     }
     if total_params is not None:
         metadata["total_params"] = int(total_params)
 
-    graph = records_to_opgraph(
-        records=records,
-        name=model_id.replace("/", "_"),
-        phase="train_forward",
-        metadata=metadata,
-    )
+    # 3. Build OpGraphs for each captured phase
+    graphs = {}
+    for phase in ("train_forward", "train_backward"):
+        records = phase_records.get(phase, [])
+        if records:
+            graphs[phase] = records_to_opgraph(
+                records=records,
+                name=f"{model_id.replace('/', '_')}_{phase}",
+                phase=phase,
+                metadata={**metadata},
+            )
 
-    # 3. Estimate
+    if "train_forward" not in graphs:
+        raise ValueError("train_forward phase produced no records")
+
+    # 4. Build context
     ctx = TransformContext(
         hw_spec=hw_spec,
         parallel=ParallelConfig(tp=tp, pp=pp, ep=ep, dp=dp),
@@ -311,4 +308,82 @@ def model_training(
             global_batch=global_batch,
         ),
     )
-    return estimate_training(graph, ctx)
+
+    # 5. Run each phase through the training pipeline
+    from python.zrt.transform.pipeline import build_training_pipeline
+
+    pipe = build_training_pipeline()
+    results = {}
+    for phase, graph in graphs.items():
+        results[phase] = pipe.run(graph, ctx)
+
+    # 6. Aggregate: forward graph carries FLOPs/memory metadata.
+    #    Per-stage time = forward + backward.
+    fwd = results["train_forward"]
+    fwd_metrics = fwd.metadata.get("pipeline_metrics")
+    per_stage_ms = fwd_metrics.per_stage_ms if fwd_metrics else 0.0
+
+    bwd = results.get("train_backward")
+    if bwd:
+        bwd_metrics = bwd.metadata.get("pipeline_metrics")
+        if bwd_metrics:
+            per_stage_ms += bwd_metrics.per_stage_ms
+
+    # 7. Build report
+    memory_breakdown = fwd.metadata.get("memory_breakdown")
+
+    # Recompute step time with combined per-stage time
+    pp_val = ctx.parallel.pp
+    num_microbatches = ctx.training.num_microbatches
+    warmup_steps = max(0, pp_val - 1)
+    cooldown_steps = max(0, pp_val - 1)
+    steady_steps = max(0, num_microbatches - pp_val + 1)
+    total_steps = warmup_steps + num_microbatches + cooldown_steps
+    step_time_ms = per_stage_ms * total_steps
+    bubble_fraction = (warmup_steps + cooldown_steps) / total_steps if total_steps > 0 else 0.0
+
+    # MFU
+    training_flops = fwd.metadata.get("training_flops", 0.0)
+    world_size = ctx.parallel.total_devices
+    step_time_sec = step_time_ms / 1000.0
+    achieved_flops = training_flops / step_time_sec if step_time_sec > 0 else 0.0
+    if hw_spec is not None:
+        from python.zrt.ir.types import DType
+        peak_flops_total = world_size * hw_spec.peak_flops(DType.BF16)
+    else:
+        peak_flops_total = 0.0
+    mfu = achieved_flops / peak_flops_total if peak_flops_total > 0 else 0.0
+
+    # Config summary
+    parallel = ctx.parallel
+    training = ctx.training
+    config_parts = []
+    if parallel.tp > 1:
+        config_parts.append(f"TP{parallel.tp}")
+    if parallel.pp > 1:
+        config_parts.append(f"PP{parallel.pp}")
+    if parallel.ep > 1:
+        config_parts.append(f"EP{parallel.ep}")
+    if parallel.dp > 1:
+        config_parts.append(f"DP{parallel.dp}")
+    if training:
+        config_parts.append(f"ZeRO-{training.zero_stage}")
+        config_parts.append(f"{training.optimizer}")
+        config_parts.append(f"micro{training.micro_batch}")
+    config_summary = "-".join(config_parts) if config_parts else "default"
+
+    return TrainingReport(
+        config_summary=config_summary,
+        step_time_ms=step_time_ms,
+        per_stage_ms=per_stage_ms,
+        mfu=mfu,
+        training_flops=fwd.metadata.get("training_flops", 0.0),
+        forward_flops=fwd.metadata.get("forward_flops", 0.0),
+        backward_flops=fwd.metadata.get("backward_flops", 0.0),
+        memory_breakdown=memory_breakdown.to_dict() if memory_breakdown else {},
+        warmup_steps=warmup_steps,
+        cooldown_steps=cooldown_steps,
+        steady_steps=steady_steps,
+        bubble_fraction=bubble_fraction,
+        total_params=fwd.metadata.get("total_params", 0),
+    )

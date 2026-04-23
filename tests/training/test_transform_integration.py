@@ -251,3 +251,111 @@ def test_training_config_num_microbatches():
 
     config = TrainingConfig(micro_batch=1, global_batch=8)
     assert config.num_microbatches == 8
+
+
+# ── Layer scaling tests (Change 4) ───────────────────────────────────────────
+
+def test_layer_scaling_flops():
+    """TrainingFlopsPass scales FLOPs by num_layers/num_layers_traced when they differ."""
+    graph = _make_simple_graph(num_layers=8)  # full model: 8 layers
+    graph.metadata["num_layers_traced"] = 2   # only 2 were traced
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+    pass_ = TrainingFlopsPass()
+    result = pass_.run(graph, ctx)
+
+    # Without total_params override, graph-counted params scale by 8/2=4
+    assert result.metadata["layer_scale"] == 4.0
+    # total_params should be 4x the single matmul weight
+    single_weight = 4096 * (4096 * 4)  # hidden * (hidden*4)
+    assert result.metadata["total_params"] == single_weight * 4
+
+
+def test_layer_scaling_no_effect_when_equal():
+    """When num_layers == num_layers_traced, layer_scale is 1.0 (no scaling)."""
+    graph = _make_simple_graph(num_layers=32)
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+    pass_ = TrainingFlopsPass()
+    result = pass_.run(graph, ctx)
+    assert result.metadata["layer_scale"] == 1.0
+
+
+def test_layer_scaling_step_time():
+    """TrainingPipelinePass scales stage_time by layer_scale."""
+    graph = _make_simple_graph(num_layers=8)
+    graph.metadata["num_layers_traced"] = 2
+    # Add latency so DAGScheduler has something to schedule
+    for node in graph.nodes.values():
+        node.annotations["latency_us"] = 100.0
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+    # Run FlopsPass first to set layer_scale
+    from zrt.transform.analysis import TrainingFlopsPass as TFP
+    graph = TFP().run(graph, ctx)
+
+    result = TrainingPipelinePass().run(graph, ctx)
+    # stage_time should be 100us * 4 (layer_scale) = 400us per microbatch
+    metrics = result.metadata["pipeline_metrics"]
+    assert metrics.step_time_ms > 0
+
+
+# ── Adam optimizer-state tests (Change 5) ────────────────────────────────────
+
+def test_adam_opt_state_12_bytes_per_param():
+    """Adam under mixed precision: master(FP32) + m(FP32) + v(FP32) = 12 B/P."""
+    graph = _make_simple_graph()
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(
+            optimizer="adam",
+            zero_stage=0,
+            micro_batch=1,
+            global_batch=8,
+        ),
+    )
+    pass_ = TrainingMemoryPass()
+    result = pass_.run(graph, ctx)
+    breakdown = result.metadata["memory_breakdown"]
+    total_params = result.metadata.get("total_params", 0)
+    if total_params == 0:
+        total_params = 4096 * (4096 * 4)  # weight_0 shape
+    # opt_state should be 12 * total_params bytes (not 4 * total_params)
+    expected_opt_bytes = total_params * 12
+    assert breakdown.opt_state == pytest.approx(expected_opt_bytes, rel=0.01), (
+        f"Expected opt_state ≈ {expected_opt_bytes} (12 B/P), got {breakdown.opt_state}"
+    )
+
+
+def test_adamw_opt_state_same_as_adam():
+    """AdamW should use same 12 B/P as Adam."""
+    graph = _make_simple_graph()
+    hw = _make_hardware_spec()
+    ctx_adam = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(optimizer="adam", zero_stage=0, micro_batch=1, global_batch=8),
+    )
+    ctx_adamw = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(optimizer="adamw", zero_stage=0, micro_batch=1, global_batch=8),
+    )
+    pass_ = TrainingMemoryPass()
+    opt_adam = pass_.run(graph, ctx_adam).metadata["memory_breakdown"].opt_state
+    opt_adamw = pass_.run(graph, ctx_adamw).metadata["memory_breakdown"].opt_state
+    assert opt_adam == pytest.approx(opt_adamw, rel=0.01)

@@ -228,3 +228,163 @@ def test_estimate_training_parallel_config():
     assert "ZeRO-1" in report.config_summary
     assert report.total_params > 0
     assert report.step_time_ms > 0
+
+
+def test_pipeline_routing_runs_roofline_and_stream_assign():
+    """estimate_training() via build_training_pipeline must run RooflinePass + StreamAssignPass.
+
+    Verifies that nodes carry latency_us (from RooflinePass) and stream_id
+    (from StreamAssignPass), proving the full pipeline ran, not just training passes.
+    """
+    g = _captured_style_graph()
+    hw = _hw()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+
+    from python.zrt.transform.pipeline import build_training_pipeline
+    pipe = build_training_pipeline()
+    result = pipe.run(g, ctx)
+
+    # All compute nodes must have latency_us (from RooflinePass)
+    for nid, node in result.nodes.items():
+        assert "latency_us" in node.annotations, (
+            f"Node {nid} missing latency_us — RooflinePass did not run"
+        )
+        assert "stream_id" in node.annotations, (
+            f"Node {nid} missing stream_id — StreamAssignPass did not run"
+        )
+
+    # Graph must have training_flops metadata (from TrainingFlopsPass)
+    assert "training_flops" in result.metadata
+    assert result.metadata["training_flops"] > 0
+
+
+def test_backward_fusion_rules_fire_on_backward_graph():
+    """Verify that backward fusion rules from fusion_rules.py:195-311 match
+    on a synthetic backward graph when run through build_training_pipeline().
+
+    Creates a backward OpGraph with ops matching norm_backward and
+    gated_mlp_backward sub-patterns, then asserts at least one node gets
+    relabeled with a backward fusion label.
+    """
+    import math
+    from python.zrt.transform.pipeline import build_training_pipeline
+
+    # Build a synthetic backward graph with backward-style ops in matching scopes
+    nodes: dict[str, OpNode] = {}
+    edges: list[Edge] = []
+    tid = 0
+
+    def _tm(shape, dtype=DType.BF16):
+        nonlocal tid
+        t = TensorMeta(
+            id=f"t{tid}", shape=shape, dtype=dtype,
+            mem_bytes=int(math.prod(shape) * 2),
+        )
+        tid += 1
+        return t
+
+    # Group 1: norm_backward — native_layer_norm_backward in RMSNorm scope
+    t_norm_in = _tm((2048, 4096))
+    t_norm_out = _tm((2048, 4096))
+    n_norm = OpNode(
+        id="bwd_layernorm",
+        op_type="aten.native_layer_norm_backward.default",
+        inputs=[t_norm_in],
+        outputs=[t_norm_out],
+        scope="model.layers.0.input_layernorm",
+        module_class="RMSNorm",
+        category="compute",
+    )
+    nodes[n_norm.id] = n_norm
+
+    # Group 2: gated_mlp_backward — silu_backward + mul + mm in MLP scope
+    t_mlp_in = _tm((2048, 4096))
+    t_silu_out = _tm((2048, 4096))
+    n_silu = OpNode(
+        id="bwd_silu",
+        op_type="aten.silu_backward.default",
+        inputs=[t_mlp_in],
+        outputs=[t_silu_out],
+        scope="model.layers.0.mlp",
+        module_class="MLP",
+        category="compute",
+    )
+    nodes[n_silu.id] = n_silu
+
+    t_mul_out = _tm((2048, 4096))
+    n_mul = OpNode(
+        id="bwd_mul",
+        op_type="aten.mul.default",
+        inputs=[t_silu_out],
+        outputs=[t_mul_out],
+        scope="model.layers.0.mlp",
+        module_class="MLP",
+        category="compute",
+    )
+    nodes[n_mul.id] = n_mul
+
+    t_w = _tm((4096, 4096))
+    t_mm_out = _tm((2048, 4096))
+    n_mm = OpNode(
+        id="bwd_mm",
+        op_type="aten.mm.default",
+        inputs=[t_mul_out, t_w],
+        outputs=[t_mm_out],
+        scope="model.layers.0.mlp",
+        module_class="MLP",
+        category="compute",
+    )
+    nodes[n_mm.id] = n_mm
+
+    edges.append(Edge(src=n_silu.id, dst=n_mul.id, tensor=t_silu_out, src_idx=0, dst_idx=0))
+    edges.append(Edge(src=n_mul.id, dst=n_mm.id, tensor=t_mul_out, src_idx=0, dst_idx=0))
+
+    graph = OpGraph(
+        name="synthetic_backward",
+        phase="train_backward",
+        nodes=nodes,
+        edges=edges,
+        metadata={
+            "seq_len": 2048,
+            "hidden": 4096,
+            "num_layers": 32,
+            "batch_size": 1,
+        },
+    )
+
+    from zrt.hardware.spec import HardwareSpec, ComputeSpec, MemorySpec, InterconnectSpec, LinkSpec
+    hw_nvidia = HardwareSpec(
+        name="nvidia_gpu", vendor="nvidia", device_type="gpu",
+        compute=ComputeSpec(bf16_tflops=312),
+        memory=MemorySpec(capacity_gb=80, hbm_bandwidth_gbps=2000),
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="nvlink", num_devices=8, bandwidth_gbps=600, latency_us=1.0),
+            inter_node=LinkSpec(type="ib",     num_devices=128, bandwidth_gbps=400, latency_us=5.0),
+        ),
+    )
+    ctx = TransformContext(
+        hw_spec=hw_nvidia,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+
+    pipe = build_training_pipeline()
+    result = pipe.run(graph, ctx)
+
+    # Collect all op_types (including fused nodes)
+    all_op_types = {n.op_type for n in result.nodes.values()}
+
+    # At least one backward fusion label must be present
+    backward_labels = {
+        "norm_backward", "gated_mlp_backward", "mlp_backward",
+        "sdpa_backward", "attn_grad", "embedding_backward",
+    }
+    matched = all_op_types & backward_labels
+    assert matched, (
+        f"No backward fusion labels found. Got op_types: {all_op_types}. "
+        f"Expected one of: {backward_labels}"
+    )

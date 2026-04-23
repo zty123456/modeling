@@ -1,85 +1,15 @@
 """Training analysis passes: FLOPs (6P rule), Memory (ZeRO), Pipeline (1F1B)."""
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from python.zrt.ir.param_count import count_params
 from python.zrt.transform.base import GraphPass
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
     from python.zrt.transform.context import TransformContext
-
-# Short op-name tokens (from "aten.<token>.default") that consume weight matrices.
-# Mapped to the first input index that is a weight (inputs before it are activations/bias).
-# addmm: (bias, input, weight) → weight starts at index 2
-# mm/matmul/linear/bmm: (input, weight) → weight starts at index 1
-_MATMUL_WEIGHT_START: dict[str, int] = {
-    "mm": 1, "matmul": 1, "linear": 1, "bmm": 1, "baddbmm": 2, "addmm": 2,
-}
-# Embedding ops: input[0] is the weight table, input[1] is the index tensor
-_EMBED_OPS: frozenset[str] = frozenset({"embedding"})
-
-
-def _op_short(op_type: str) -> str:
-    """Extract the short token from a qualified op name like 'aten.mm.default' → 'mm'."""
-    parts = op_type.split(".")
-    return parts[1] if len(parts) >= 2 else parts[0]
-
-
-def _count_params(graph: "OpGraph") -> int:
-    """Count model parameters from an OpGraph.
-
-    Three-tier strategy, tried in order:
-    1. graph.metadata["total_params"] — authoritative when set by a model loader
-    2. Name heuristic — tensor IDs containing "weight" or "param" (synthetic graphs)
-    3. Structural fallback — external 2-D inputs to matmul/embedding ops, skipping
-       activation positions that differ per op type (captured graphs use opaque IDs)
-    """
-    if graph.metadata.get("total_params", 0) > 0:
-        return int(graph.metadata["total_params"])
-
-    counted_ids: set[str] = set()
-    name_total = 0
-    for node in graph.nodes.values():
-        if node.category == "compute":
-            for inp in node.inputs:
-                if inp.id in counted_ids:
-                    continue
-                if ("weight" in inp.id or "param" in inp.id) and inp.shape:
-                    counted_ids.add(inp.id)
-                    name_total += math.prod(inp.shape)
-    if name_total > 0:
-        return name_total
-
-    produced_ids: set[str] = set()
-    for node in graph.nodes.values():
-        for out in node.outputs:
-            produced_ids.add(out.id)
-
-    counted_ids = set()
-    struct_total = 0
-    for node in graph.nodes.values():
-        if node.category != "compute":
-            continue
-        short = _op_short(node.op_type)
-        weight_start = _MATMUL_WEIGHT_START.get(short)
-        is_embed = short in _EMBED_OPS
-        if weight_start is None and not is_embed:
-            continue
-
-        for i, inp in enumerate(node.inputs):
-            if inp.id in produced_ids or inp.id in counted_ids:
-                continue
-            if weight_start is not None and i < weight_start:
-                continue
-            if is_embed and i > 0:
-                continue  # only input[0] is the embedding table
-            if inp.shape and len(inp.shape) == 2:
-                counted_ids.add(inp.id)
-                struct_total += math.prod(inp.shape)
-    return struct_total
 
 
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
@@ -102,7 +32,20 @@ class TrainingFlopsPass(GraphPass):
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         g = graph.clone()
 
-        total_params = _count_params(g)
+        # Check if total_params was provided as metadata override (Tier-1)
+        has_param_override = g.metadata.get("total_params", 0) > 0
+
+        total_params = count_params(g)
+
+        # Layer scaling: when only a subset of layers is traced, scale
+        # graph-counted params to full model. Tier-1 override is already
+        # the full-model count, so it does NOT need scaling.
+        num_layers = g.metadata.get("num_layers", 0)
+        num_layers_traced = g.metadata.get("num_layers_traced", num_layers)
+        layer_scale = num_layers / num_layers_traced if num_layers_traced > 0 and num_layers != num_layers_traced else 1.0
+
+        if not has_param_override and layer_scale != 1.0:
+            total_params = int(total_params * layer_scale)
 
         # Get sequence length and batch size from metadata
         seq_len = g.metadata.get("seq_len", 2048)
@@ -118,6 +61,7 @@ class TrainingFlopsPass(GraphPass):
         g.metadata["forward_flops"] = forward_flops
         g.metadata["backward_flops"] = backward_flops
         g.metadata["total_params"] = total_params
+        g.metadata["layer_scale"] = layer_scale
 
         return g
 
@@ -166,10 +110,10 @@ class TrainingMemoryPass(GraphPass):
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         g = graph.clone()
 
-        # Get dtype bytes
-        param_dtype = 2 if ctx.quant and ctx.quant.weight == "bf16" else 4  # BF16 or FP32
+        # Training always uses BF16 parameters; mixed-precision keeps FP32 master copy
+        param_dtype = 2  # BF16
 
-        total_params = _count_params(g)
+        total_params = count_params(g)
 
         # Get parallel config
         dp = ctx.parallel.dp if ctx.parallel else 1
@@ -188,12 +132,13 @@ class TrainingMemoryPass(GraphPass):
             grads_sharding = dp  # ZeRO-2 shards grads but not weights
         grads_bytes = (total_params * param_dtype) / grads_sharding
 
-        # Optimizer state: Adam uses 2 states per param (momentum + variance)
-        # Sharded by ZeRO-1/2/3
+        # Optimizer state: Adam/AdamW under mixed precision uses FP32 master + m + v = 12 B/P
+        optimizer = ctx.training.optimizer if ctx.training else "adam"
+        opt_bytes_per_param = 12 if optimizer in ("adam", "adamw") else 8  # Muon: master + momentum
         opt_sharding = 1
         if zero_stage >= 1:
             opt_sharding = dp
-        opt_bytes = (total_params * param_dtype * 2) / opt_sharding
+        opt_bytes = (total_params * opt_bytes_per_param) / opt_sharding
 
         # Activations: estimate using Korthikanti formula
         seq_len = g.metadata.get("seq_len", 2048)
@@ -270,9 +215,17 @@ class TrainingPipelinePass(GraphPass):
         num_microbatches = ctx.training.num_microbatches if ctx.training else 1
         hw = ctx.hw_spec
 
-        stage_time_us = sum(
-            n.annotations.get("latency_us", 0.0) for n in g.nodes.values()
-        )
+        from python.zrt.executor.scheduler import DAGScheduler
+
+        sched = DAGScheduler(hw)
+        timeline = sched.schedule(g)
+        stage_time_us = timeline.total_latency_us
+
+        # Scale traced-subset latency to full model
+        layer_scale = g.metadata.get("layer_scale", 1.0)
+        if layer_scale != 1.0:
+            stage_time_us *= layer_scale
+
         per_stage_us = stage_time_us / pp if pp > 0 else stage_time_us
 
         warmup_steps = max(0, pp - 1)

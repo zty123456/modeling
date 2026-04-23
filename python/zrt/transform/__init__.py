@@ -3,7 +3,7 @@ from python.zrt.transform.base import GraphPass
 from python.zrt.transform.context import (
     ParallelConfig, StreamConfig, QuantConfig, TrainingConfig, TransformContext,
 )
-from python.zrt.transform.pipeline import TransformPipeline, build_default_pipeline
+from python.zrt.transform.pipeline import TransformPipeline, build_default_pipeline, build_training_pipeline
 from python.zrt.transform.parallel import (
     TensorParallelPass, ExpertParallelPass, CommInserterPass,
 )
@@ -25,7 +25,7 @@ __all__ = [
     # context
     "ParallelConfig", "StreamConfig", "QuantConfig", "TrainingConfig", "TransformContext",
     # pipeline
-    "TransformPipeline", "build_default_pipeline",
+    "TransformPipeline", "build_default_pipeline", "build_training_pipeline",
     # passes
     "TensorParallelPass", "ExpertParallelPass", "CommInserterPass",
     "FusionPass",
