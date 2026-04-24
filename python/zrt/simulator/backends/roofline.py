@@ -346,7 +346,7 @@ def _scaled_dot_product_attention(node: "OpNode") -> FMR:
 
     Input layout assumed: Q=(N,H,Sq,D), K=(N,H,Sk,D), V=(N,H,Sk,Dv)
     FLOPs = 4·N·H·Sq·Sk·D        (QK + AV matmuls)
-          + 5·N·H·Sq·Sk           (softmax: max+sub+exp+sum+div)
+          + 4·N·H·Sq·Sk           (softmax: max+sub+exp+sum+div)
     R = (Q+K+V)·b    W = output·b
     """
     if len(node.inputs) < 3:
@@ -361,7 +361,7 @@ def _scaled_dot_product_attention(node: "OpNode") -> FMR:
     # QK matmul: 2*N*H*Sq*Sk*D,  AV matmul: 2*N*H*Sq*Sk*D
     flops = 4.0 * N * H * Sq * Sk * D
     # Softmax ops ~ 5*N*H*Sq*Sk (sub-dominant, included for completeness)
-    flops += 5.0 * N * H * Sq * Sk
+    flops += 4.0 * N * H * Sq * Sk
     read  = (N*H*Sq*D + N*H*Sk*D + N*H*Sk*D) * it   # Q + K + V
     write = (N*H*Sq*D) * it                           # output
     return flops, read, write
@@ -482,7 +482,7 @@ def _sparse_flash_attention(node: "OpNode") -> FMR:
 
 def _layer_norm(node: "OpNode") -> FMR:
     """aten.layer_norm.default / aten.native_layer_norm.default
-    FLOPs ≈ 5·N  (mean + variance + normalize + scale + shift)
+    FLOPs ≈ 7·N  (mean + variance + normalize + scale + shift)
     R=(N + 2·|weight|)·b    W=N·b
     """
     if not node.inputs:
@@ -491,7 +491,7 @@ def _layer_norm(node: "OpNode") -> FMR:
     n = _numel(inp.shape)
     it = inp.dtype.itemsize
     # mean(N) + var(2N) + norm(N) + scale(N) + shift(N) ≈ 5N flops
-    flops = 5.0 * n
+    flops = 7.0 * n
     # read: input + weight + bias (last dim)
     weight_size = inp.shape[-1] if inp.shape else 1
     read  = (n + 2 * weight_size) * it
@@ -599,7 +599,7 @@ def _softmax(node: "OpNode") -> FMR:
     n = _numel(inp.shape)
     it = inp.dtype.itemsize
     # max(N) + sub(N) + exp(N) + sum(N) + div(N) ≈ 5N
-    flops = 5.0 * n
+    flops = 4.0 * n
     read  = n * it
     write = n * it
     return flops, read, write
@@ -1338,8 +1338,8 @@ def _fs_sdpa(node: "OpNode") -> dict:
     if len(q.shape) < 4: return _fs_default(node)
     N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
     Sk, bw = (k.shape[2] if len(k.shape) >= 3 else Sq), _bw(node)
-    return _mk("4·N·H·Sq·Sk·D+5·N·H·Sq·Sk",
-               f"4·{N}·{H}·{Sq}·{Sk}·{D}+5·{N}·{H}·{Sq}·{Sk}",
+    return _mk("4·N·H·Sq·Sk·D+4·N·H·Sq·Sk",
+               f"4·{N}·{H}·{Sq}·{Sk}·{D}+4·{N}·{H}·{Sq}·{Sk}",
                "(Q+K+V)·b",
                f"({N}·{H}·{Sq}·{D}+{N}·{H}·{Sk}·{D}+{N}·{H}·{Sk}·{D})·{bw}",
                "N·H·Sq·D·b", f"{N}·{H}·{Sq}·{D}·{bw}")
@@ -1452,7 +1452,7 @@ def _fs_layer_norm(node: "OpNode") -> dict:
     if not node.inputs: return _fs_default(node)
     inp = node.inputs[0]
     N, W, bw = _numel(inp.shape), (inp.shape[-1] if inp.shape else 1), _bw(node)
-    return _mk("5·N", f"5·{N}", "(N+2·|W|)·b", f"({N}+2·{W})·{bw}", "N·b", f"{N}·{bw}")
+    return _mk("7·N", f"7·{N}", "(N+2·|W|)·b", f"({N}+2·{W})·{bw}", "N·b", f"{N}·{bw}")
 
 
 def _fs_add_norm(node: "OpNode") -> dict:
@@ -1466,7 +1466,7 @@ def _fs_softmax(node: "OpNode") -> dict:
     if not node.inputs: return _fs_default(node)
     inp = node.inputs[0]
     N, bw = _numel(inp.shape), _bw(node)
-    return _mk("5·N", f"5·{N}", "N·b", f"{N}·{bw}", "N·b", f"{N}·{bw}")
+    return _mk("4·N", f"4·{N}", "N·b", f"{N}·{bw}", "N·b", f"{N}·{bw}")
 
 
 def _fs_sort(node: "OpNode") -> dict:
