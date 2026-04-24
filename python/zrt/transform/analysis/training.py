@@ -292,7 +292,7 @@ class TrainingPipelinePass(GraphPass):
                     + (pp - 1) * t_bwd_last
                 )
                 t_stage_avg = sum(stage_fwd[s] + stage_bwd[s] for s in range(pp)) / pp
-                bubble_us = 2 * (pp - 1) * t_stage_avg
+                bubble_us = (pp - 1) * t_stage_avg
                 bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
                 per_stage_us = t_stage
             else:
@@ -319,8 +319,6 @@ class TrainingPipelinePass(GraphPass):
         steady_steps = max(0, num_microbatches - pp + 1)
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
-
-        bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
 
         # DP-in-bubble: if DP AR fits inside the bubble window, it is free;
         # otherwise the exposed portion adds to step time.
