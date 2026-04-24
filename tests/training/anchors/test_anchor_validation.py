@@ -190,9 +190,9 @@ def test_anchor_vpp_reduces_bubble(gpt3_175b):
     r_1f1b = estimate(gpt3_175b, system, s_1f1b)
     r_vpp = estimate(gpt3_175b, system, s_vpp)
 
-    assert r_vpp.per_stage[0].bubble_fraction < r_1f1b.per_stage[0].bubble_fraction, (
-        f"VPP bubble {r_vpp.per_stage[0].bubble_fraction:.2%} should be < "
-        f"1F1B bubble {r_1f1b.per_stage[0].bubble_fraction:.2%}"
+    assert r_vpp.bubble_fraction < r_1f1b.bubble_fraction, (
+        f"VPP bubble {r_vpp.bubble_fraction:.2%} should be < "
+        f"1F1B bubble {r_1f1b.bubble_fraction:.2%}"
     )
 
 
@@ -214,9 +214,9 @@ def test_anchor_dualpipe_bubble(deepseek_v3):
     r_1f1b = estimate(deepseek_v3, system, s_1f1b)
     r_dp = estimate(deepseek_v3, system, s_dp)
 
-    assert r_dp.per_stage[0].bubble_fraction <= r_1f1b.per_stage[0].bubble_fraction * 0.6, (
-        f"DualPipe bubble {r_dp.per_stage[0].bubble_fraction:.2%} should be "
-        f"~half of 1F1B {r_1f1b.per_stage[0].bubble_fraction:.2%}"
+    assert r_dp.bubble_fraction <= r_1f1b.bubble_fraction * 0.6, (
+        f"DualPipe bubble {r_dp.bubble_fraction:.2%} should be "
+        f"~half of 1F1B {r_1f1b.bubble_fraction:.2%}"
     )
 
 
