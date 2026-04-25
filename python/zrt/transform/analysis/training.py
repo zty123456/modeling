@@ -1,6 +1,7 @@
-"""Training analysis passes: FLOPs (6P rule), Memory (ZeRO), Pipeline (1F1B)."""
+"""Training analysis passes: FLOPs, Memory, and pipeline scheduling."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,8 @@ from python.zrt.transform.base import GraphPass
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
     from python.zrt.transform.context import TransformContext
+
+logger = logging.getLogger(__name__)
 
 
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
@@ -262,7 +265,7 @@ class TrainingMemoryPass(GraphPass):
 
 @dataclass
 class PipelineStepMetrics:
-    """Pipeline step metrics for 1F1B schedule."""
+    """Pipeline step metrics for the selected PP schedule."""
     step_time_ms: float = 0.0
     per_stage_ms: float = 0.0
     warmup_steps: int = 0
@@ -284,9 +287,10 @@ class PipelineStepMetrics:
 
 
 class TrainingPipelinePass(GraphPass):
-    """Annotate graph with pipeline schedule metrics (1F1B).
+    """Annotate graph with pipeline schedule metrics.
 
-    Correct 1F1B schedule (homogeneous stages):
+    Supported schedules include 1F1B, interleaved 1F1B, DualPipe,
+    DualPipeV, and ZeroBubble. Correct 1F1B schedule (homogeneous stages):
       step_time = (M + pp - 1) * t_stage
       bubble_fraction = (pp - 1) / (M + pp - 1)
 
@@ -339,12 +343,27 @@ class TrainingPipelinePass(GraphPass):
 
             g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
             g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
+            stage_bwd_dw = {
+                s_id: self._estimate_stage_dw_us(
+                    g, node_ids, stage_bwd.get(s_id, 0.0),
+                    warn_on_missing=False,
+                )
+                for s_id, node_ids in stage_node_sets.items()
+            }
+            for s_id in range(pp):
+                stage_bwd_dw.setdefault(s_id, 0.0)
+            g.metadata["stage_timelines_bwd_dw"] = dict(stage_bwd_dw)
 
             # Heterogeneous 1F1B when both fwd and bwd are populated
             if pp > 1 and stage_fwd and stage_bwd and any(v > 0 for v in stage_bwd.values()):
                 t_fwd_0 = stage_fwd.get(0, 0.0)
                 t_bwd_last = stage_bwd.get(pp - 1, 0.0)
-                t_stage = max(stage_fwd[s] + stage_bwd[s] for s in range(pp))
+                bottleneck_stage = max(
+                    range(pp),
+                    key=lambda s: stage_fwd.get(s, 0.0) + stage_bwd.get(s, 0.0),
+                )
+                t_stage = stage_fwd.get(bottleneck_stage, 0.0) + stage_bwd.get(bottleneck_stage, 0.0)
+                t_w = stage_bwd_dw.get(bottleneck_stage, 0.0)
 
                 # Apply VPP/DualPipe schedule-type adjustments to per-stage path
                 pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
@@ -360,6 +379,15 @@ class TrainingPipelinePass(GraphPass):
                 elif pp_schedule == "dualpipe":
                     # DualPipe: warmup=cooldown, reduced by 2
                     warmup = cooldown = (pp - 1) * t_stage / 2.0
+                elif pp_schedule in {"zb", "zero_bubble"}:
+                    if t_w <= 0.0:
+                        logger.debug(
+                            "ZeroBubble selected but no flops_dw annotations were "
+                            "available for the bottleneck stage; using no dW bubble fill."
+                        )
+                    # ZeroBubble: dW work fills the remaining pipeline bubble.
+                    bubble = (pp - 1) * max(t_stage - t_w, 0.0)
+                    warmup = cooldown = bubble / 2.0
                 else:
                     # Standard 1F1B
                     warmup = (pp - 1) * t_fwd_0
@@ -381,6 +409,18 @@ class TrainingPipelinePass(GraphPass):
                     bubble_us = (pp - 1) * per_stage_us / (2.0 * V)
                 elif pp_schedule == "dualpipe":
                     bubble_us = (pp - 1) * per_stage_us / 2.0
+                elif pp_schedule in {"zb", "zero_bubble"}:
+                    bottleneck_stage = max(
+                        range(pp),
+                        key=lambda s: stage_fwd.get(s, 0.0) + stage_bwd.get(s, 0.0),
+                    )
+                    t_w = stage_bwd_dw.get(bottleneck_stage, 0.0)
+                    if t_w <= 0.0:
+                        logger.debug(
+                            "ZeroBubble selected but no flops_dw annotations were "
+                            "available for the bottleneck stage; using no dW bubble fill."
+                        )
+                    bubble_us = (pp - 1) * max(per_stage_us - t_w, 0.0)
                 else:
                     bubble_us = (pp - 1) * per_stage_us
 
@@ -407,6 +447,12 @@ class TrainingPipelinePass(GraphPass):
                 bubble_us = (pp - 1) * per_stage_us / (2.0 * max(1, V))
             elif pp_schedule == "dualpipe" and pp > 1:
                 bubble_us = (pp - 1) * per_stage_us / 2.0
+            elif pp_schedule in {"zb", "zero_bubble"} and pp > 1:
+                logger.debug(
+                    "ZeroBubble selected without stage/phase or flops_dw annotations; "
+                    "using no dW bubble fill."
+                )
+                bubble_us = (pp - 1) * per_stage_us
             else:  # "1f1b" or pp == 1
                 bubble_us = (pp - 1) * per_stage_us
 
@@ -437,7 +483,6 @@ class TrainingPipelinePass(GraphPass):
                     dp_bw_bytes_per_us = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
                     ring_factor = 2.0 * (dp - 1) / dp
                     t_dp_ar_us = ring_factor * bucket_bytes / dp_bw_bytes_per_us if dp_bw_bytes_per_us > 0 else 0.0
-                bubble_us = (pp - 1) * per_stage_us
                 t_exposed_dp_us = max(0.0, t_dp_ar_us - bubble_us)
                 step_time_us += t_exposed_dp_us
                 step_time_ms = step_time_us / 1000.0
@@ -511,6 +556,40 @@ class TrainingPipelinePass(GraphPass):
 
         g.metadata["pipeline_metrics"] = metrics
         return g
+
+    @staticmethod
+    def _estimate_stage_dw_us(
+        g: "OpGraph",
+        node_ids: set[str],
+        bwd_us: float,
+        warn_on_missing: bool = True,
+    ) -> float:
+        """Estimate stage dW time from backward FLOPs annotations.
+
+        Graph scheduling currently exposes aggregate backward latency by stage.
+        Training FLOPs annotations carry the dX/dW split, so we apportion the
+        scheduled backward time by the dW FLOPs ratio for ZeroBubble.
+        """
+        if bwd_us <= 0.0:
+            return 0.0
+
+        dx_flops = 0.0
+        dw_flops = 0.0
+        for node_id in node_ids:
+            node = g.nodes[node_id]
+            dx_flops += float(node.annotations.get("flops_dx", 0.0))
+            dw_flops += float(node.annotations.get("flops_dw", 0.0))
+
+        total_bwd_flops = dx_flops + dw_flops
+        if total_bwd_flops <= 0.0 or dw_flops <= 0.0:
+            if warn_on_missing:
+                logger.debug(
+                    "Unable to estimate ZeroBubble dW time: missing flops_dw "
+                    "annotations for %d stage nodes.",
+                    len(node_ids),
+                )
+            return 0.0
+        return bwd_us * dw_flops / total_bwd_flops
 
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────

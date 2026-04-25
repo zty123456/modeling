@@ -1,4 +1,4 @@
-"""Pipeline composer — 1F1B schedule → step time.
+"""Pipeline composers for training step-time schedules.
 
 Reference: Megatron-LM (Narayanan et al. 2021) §3.2.
 """
@@ -260,9 +260,59 @@ class DualPipeVComposer(PipelineComposer):
         )
 
 
+class ZeroBubbleComposer(PipelineComposer):
+    """ZeroBubble schedule with backward split into dX and dW phases.
+
+    The critical path is the per-stage F+B time.  Weight-gradient work can
+    be delayed to fill pipeline bubbles, so the exposed bubble is reduced by
+    the bottleneck stage's dW time:
+
+        step = M * t_stage + (pp - 1) * max(t_stage - t_w, 0)
+    """
+
+    def compose(
+        self,
+        stage_times: list[StageTime],
+        M: int,
+        pp: int,
+        dp_ar_time: float,
+        strategy: Strategy,
+    ) -> StepResult:
+        if pp <= 1:
+            return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
+
+        bottleneck = max(stage_times, key=lambda st: st.fwd + st.bwd) if stage_times else StageTime()
+        t_stage = bottleneck.fwd + bottleneck.bwd
+        t_w = bottleneck.bwd_dw
+
+        bubble = (pp - 1) * max(t_stage - t_w, 0.0)
+        warmup = bubble / 2.0
+        steady = M * t_stage
+        cooldown = bubble / 2.0
+
+        dp_exposed = dp_ar_time
+        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
+            hidden = min(bubble, dp_ar_time)
+            dp_exposed = dp_ar_time - hidden
+
+        step = warmup + steady + cooldown + dp_exposed
+        bubble_frac = bubble / step if step > 0 else 0.0
+
+        return StepResult(
+            step_time=step,
+            bubble_fraction=bubble_frac,
+            warmup=warmup,
+            steady=steady,
+            cooldown=cooldown,
+            dp_ar_exposed=dp_exposed,
+            schedule_name="zb",
+        )
+
+
 _COMPOSERS: dict[PPSched, PipelineComposer] = {
     PPSched.ONE_F_ONE_B: OneF1BComposer(),
     PPSched.INTERLEAVED: Interleaved1F1BComposer(),
+    PPSched.ZERO_BUBBLE: ZeroBubbleComposer(),
     PPSched.DUALPIPE: DualPipeComposer(),
     PPSched.DUALPIPE_V: DualPipeVComposer(),
 }

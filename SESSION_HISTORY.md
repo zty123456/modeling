@@ -716,3 +716,46 @@ Archived at: 2026-04-24
 - `PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -q`：16 passed
 - `PYTHONPATH=python pytest tests/training/test_graph_schedule.py tests/training/test_cli_modeller_wiring.py -q`：6 passed
 - `PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q`：12 passed, 1 failed（既有 GPT-3 strict MFU calibration gap：estimated=0.2264 vs anchor=0.5200）
+
+---
+## 2026-04-25 P1 ZeroBubble Composer
+
+### 本轮完成
+
+- 在 spec 训练路径新增 `ZeroBubbleComposer` 并注册到 `PPSched.ZERO_BUBBLE`。
+- `StageTime` 增加 `bwd_dx` / `bwd_dw`，`stage_time()` 从 `OpCost.dx_flops` / `dw_flops` 分离 backward critical path 与 weight-gradient work，同时保持既有 `bwd` 聚合字段兼容。
+- graph-native `TrainingPipelinePass` 新增 `pp_schedule in {"zb", "zero_bubble"}` 分派，按 per-stage `flops_dw` 比例估算 `stage_timelines_bwd_dw`，用 dW work 缩减 ZeroBubble 暴露 bubble。
+- DP-in-bubble 逻辑改为复用当前 schedule 计算出的 `bubble_us`，避免 ZeroBubble/VPP/DualPipe 后续又退回 1F1B bubble window。
+- `python/zrt/training/compose/__init__.py` 导出 ZeroBubble 与现有 Composer 类。
+
+### 验证
+
+- `python -m py_compile python/zrt/training/compose/__init__.py python/zrt/training/compose/stage.py python/zrt/training/compose/pipeline.py python/zrt/transform/analysis/training.py tests/training/test_dualpipe.py tests/training/test_graph_schedule.py`
+- `PYTHONPATH=python pytest tests/training/test_dualpipe.py tests/training/test_graph_schedule.py tests/training/test_search.py tests/training/test_interleaved_1f1b.py tests/training/test_pipeline_parallel.py -q`：41 passed
+- `PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py tests/training/test_cli_modeller_wiring.py -q`：17 passed
+- `PYTHONPATH=python pytest tests/training -q --ignore=tests/training/anchors`：172 passed
+
+已知剩余风险：anchor suite 仍保留上一轮记录的 GPT-3 strict MFU calibration gap，未在 P1 中处理。
+
+---
+## 2026-04-25 P1 ZeroBubble 公式修正
+
+### 本轮完成
+
+- 修正 `ZeroBubbleComposer` 的 ZB-H bubble 公式：`bubble = (pp - 1) * max(t_stage - t_w, 0)`，去掉原先 `/ 2.0` 的 DualPipe-like 保守近似。
+- `t_w` 改为取自同一个 bottleneck stage，而不是全局最大 `bwd_dw`，避免异构 stage 下跨 stage 抵扣。
+- graph-native `TrainingPipelinePass` 同步修正 ZB-H 公式与 bottleneck-stage dW 选择。
+- graph-native 路径在缺少 stage/phase 或 `flops_dw` 信息时写 debug log，并退化为无 dW bubble fill。
+- 更新 `TrainingPipelinePass` 与 composer module stale docstring，不再标注为 1F1B-only。
+- 增加 spec 与 graph-native 异构 stage 回归测试，并覆盖缺失 `flops_dw` 的 debug log。
+
+### 验证
+
+- `python -m py_compile python/zrt/training/compose/pipeline.py python/zrt/transform/analysis/training.py tests/training/test_dualpipe.py tests/training/test_graph_schedule.py`
+- `PYTHONPATH=python pytest tests/training/test_dualpipe.py tests/training/test_graph_schedule.py -q`：17 passed
+- `PYTHONPATH=python pytest tests/training/test_dualpipe.py tests/training/test_graph_schedule.py tests/training/test_search.py tests/training/test_interleaved_1f1b.py tests/training/test_pipeline_parallel.py -q`：44 passed
+- `PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py tests/training/test_cli_modeller_wiring.py -q`：17 passed
+- `PYTHONPATH=python pytest tests/training -q --ignore=tests/training/anchors`：175 passed
+- `git diff --check`：passed
+
+已知剩余风险：anchor suite 仍保留 GPT-3 strict MFU calibration gap，未在 P1 公式修正中处理。
