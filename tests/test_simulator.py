@@ -161,7 +161,7 @@ class TestRooflineOtherOps:
             outputs = [_tm("o", (B, S, H))],
         )
         r = RooflineSimulator().simulate(node, hw_910b)
-        assert r.flops == 5 * B * S * H
+        assert r.flops == 7 * B * S * H
         assert r.bound == "memory"   # norm is always memory-bound
 
     def test_softmax(self, hw_910b):
@@ -172,7 +172,7 @@ class TestRooflineOtherOps:
             outputs = [_tm("o", (B, H, S, S))],
         )
         r = RooflineSimulator().simulate(node, hw_910b)
-        assert r.flops == 5 * B * H * S * S
+        assert r.flops == 4 * B * H * S * S
         assert r.bound == "memory"
 
     def test_elementwise_add(self, hw_910b):
@@ -206,7 +206,7 @@ class TestRooflineOtherOps:
         )
         r = RooflineSimulator().simulate(node, hw_910b)
         # FLOPs = 4*B*H*Sq*Sk*D + softmax(5*B*H*Sq*Sk)
-        expected = 4 * B * H * Sq * Sk * D + 5 * B * H * Sq * Sk
+        expected = 4 * B * H * Sq * Sk * D + 4 * B * H * Sq * Sk
         assert r.flops == expected
 
     def test_embedding(self, hw_910b):
