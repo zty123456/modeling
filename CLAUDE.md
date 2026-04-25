@@ -29,6 +29,8 @@ pytest tests/test_transform.py tests/test_executor.py tests/test_simulator.py -v
 # Run training-specific tests
 pytest tests/training/test_captured_graph_modelling.py -v
 pytest tests/training/test_1f1b.py -v
+pytest tests/training/test_graph_schedule.py -v     # PP schedule dispatch (VPP/DualPipe)
+pytest tests/training/anchors/test_anchors.py -v    # MFU anchor regression
 
 # Skip network tests
 pytest tests/test_screenshot_ops.py -v -m "not network"
@@ -40,6 +42,8 @@ python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sx
 # Training modeling (captures train_forward + train_backward + estimates performance)
 python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --pp 2
 PYTHONPATH=python python -m zrt.training estimate --config python/zrt/training/configs/llama3_70b_3d.yaml
+# Export Chrome Trace alongside training estimate
+PYTHONPATH=python python -m zrt.training estimate --config python/zrt/training/configs/llama3_70b_3d.yaml --trace out.json
 
 # End-to-end validation
 python e2e_check.py
@@ -86,8 +90,29 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 - `python/zrt/ir/`: `OpGraph`, `OpNode`, `OpEdge`, `DType`, `TensorMeta`, `GraphHierarchy` — core IR types
 - `python/zrt/hardware/`: `HardwareSpec`, `hw_registry.load("nvidia_h100_sxm")` — YAML-based configs in `configs/`
 - `python/zrt/memory/`: memory feasibility + peak estimation
-- `python/zrt/report/summary.py`: Excel/HTML report generation (6 sheets original, 5 sheets + JSON after transform)
-- `python/zrt/training/`: training performance estimation, YAML configs in `configs/`
+- `python/zrt/report/summary.py`: Excel/HTML report generation; `chrome_trace.py` builds Chrome Trace JSON from a `Timeline`
+- `python/zrt/training/`: training performance estimation — see **Training Module** section below
+
+## Training Module (`python/zrt/training/`)
+
+The training module is self-contained and substantially larger than the rest; it has its own IR, spec types, and pipeline composers.
+
+**Sub-packages:**
+- `spec/` — `ModelSpec` (geometry + layer list), `Strategy` (TP/CP/PP/EP/DP + ZeRO + recompute), `SystemSpec` (cluster hardware), `Dtype`, and enums:
+  - `PPSched`: `ONE_F_ONE_B` / `INTERLEAVED` / `ZERO_BUBBLE` / `DUALPIPE` / `DUALPIPE_V`
+  - `CPKind`: `ULYSSES` / `RING` / `HYBRID`
+  - `TPOverlap`: `COC` / `MC2`
+- `ir/` — training-side `Graph` (layer shards + stage assignment), `builders`, `validate`
+- `models/` — `comm.py` (collective time), `flops.py`, `memory.py` (`MemBreakdown`)
+- `compose/` — `PipelineComposer` ABC + four concrete composers: `OneF1BComposer`, `InterleavedComposer` (VPP), `DualPipeComposer`, `DualPipeVComposer`. Each returns a `StepResult` (step_time, bubble_fraction, mfu, memory).
+- `search/` — `SearchSpace` (grid over TP/CP/PP/EP/DP/ZeRO/PPSched/vpp_chunks) + `SearchEstimator` → Pareto-front `SearchReport`
+- `anchor/` — `AnchorValidator` reads YAML fixtures from `tests/training/anchors/` and checks MFU within tolerance; used for regression testing
+- `trace/` — `ChromeTraceExporter` converts a `Timeline` into Chrome Trace JSON (loaded via `chrome://tracing`)
+- `io/` — `config_loader.py` (YAML → `ModelSpec`/`Strategy`/`SystemSpec`), `perf_tables.py`
+
+**PP schedule dispatch** (`transform/analysis/training.py:285-298`): `ctx.training.pp_schedule` selects among interleaved/dualpipev/dualpipe/1f1b. The unified path in `modeller.py:307-343` reads `pipeline_metrics.step_time_ms` directly from the chosen composer instead of recomputing.
+
+**Anchor YAML fixtures** (`tests/training/anchors/*.yaml`): GPT-3 175B, LLaMA-3 70B, DeepSeek-V3 — each pins expected MFU and step time to guard against regressions. Run with `pytest tests/training/anchors/test_anchors.py`.
 
 ## Key Rules (from .clauderules)
 
