@@ -158,9 +158,9 @@ class PipelineParallelPass(GraphPass):
                           stages: List[LayerGroup]) -> None:
         """Insert comm.send_recv at stage boundaries and rewire receiver edges.
 
-        Detects edges that cross stage boundaries (both fwd s→s+1 and bwd
-        s+1→s), inserts one comm node per crossing edge, and rewires
-        receiver-side edges so the comm node is on the real dependency path.
+        Detects edges that cross stage boundaries, inserts one comm node per
+        crossing edge, and rewires receiver-side edges so the comm node is on
+        the real dependency path.
         """
         node_stage = {nid: node.annotations.get("stage_id", 0)
                       for nid, node in graph.nodes.items()}
@@ -177,7 +177,9 @@ class PipelineParallelPass(GraphPass):
         for edge in crossing_edges:
             ss = node_stage[edge.src]
             ds = node_stage[edge.dst]
-            direction = "fwd" if ds > ss else "bwd"
+            src_phase = graph.nodes[edge.src].annotations.get("phase", "")
+            dst_phase = graph.nodes[edge.dst].annotations.get("phase", "")
+            direction = "bwd" if "bwd" in (src_phase, dst_phase) else "fwd"
 
             tensor = edge.tensor
             act_bytes = tensor.mem_bytes if tensor else 4
@@ -209,7 +211,9 @@ class PipelineParallelPass(GraphPass):
                 scope=f"pipeline.p2p.{direction}.stage{ss}_to_{ds}",
                 category="communication",
             )
-            p2p_node.annotations["stage_id"] = ss
+            # Attribute boundary comm to the receiving stage so per-stage
+            # subgraphs retain the comm predecessor for receiver-side nodes.
+            p2p_node.annotations["stage_id"] = ds
             p2p_node.annotations["phase"] = direction
 
             # Insert after source node

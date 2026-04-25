@@ -372,9 +372,20 @@ class TrainingPipelinePass(GraphPass):
             else:
                 # Homogeneous fallback
                 per_stage_us = max(stage_fwd.values(), default=0.0)
-                effective_steps = num_microbatches + pp - 1
-                step_time_us = per_stage_us * effective_steps
-                bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
+                pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
+                V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
+
+                if pp_schedule == "interleaved" and V > 1:
+                    bubble_us = (pp - 1) * per_stage_us / V
+                elif pp_schedule == "dualpipev" and V > 1:
+                    bubble_us = (pp - 1) * per_stage_us / (2.0 * V)
+                elif pp_schedule == "dualpipe":
+                    bubble_us = (pp - 1) * per_stage_us / 2.0
+                else:
+                    bubble_us = (pp - 1) * per_stage_us
+
+                step_time_us = num_microbatches * per_stage_us + bubble_us
+                bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
         else:
             # pp=1 (or stage_id not yet annotated): whole graph is scheduled as one
             # unit. total_latency_us covers all pp stages linearly, so divide by pp.

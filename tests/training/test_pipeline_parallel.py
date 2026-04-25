@@ -154,14 +154,14 @@ class TestPipelineParallelPass:
         assert stage0_layers == {0, 1}
         assert stage1_layers == {2, 3}
 
-    def test_p2p_node_belongs_to_sender_stage(self):
-        """P2P node is annotated with the sending (lower) stage_id."""
+    def test_p2p_node_belongs_to_receiver_stage(self):
+        """P2P node is annotated with the receiving stage_id."""
         graph = _make_linear_graph(num_layers=4)
         ctx = _make_ctx(pp=2)
         result = PipelineParallelPass().run(graph, ctx)
 
         p2p = next(n for n in result.nodes.values() if n.op_type == "comm.send_recv")
-        assert p2p.annotations["stage_id"] == 0  # sender is stage 0
+        assert p2p.annotations["stage_id"] == 1  # receiver is stage 1
 
     def test_p2p_node_has_positive_message_size(self):
         """P2P node attrs contain a positive message_size_bytes."""
