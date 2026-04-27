@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Phase aliases for backward-pass nodes in stitched graphs
+_BWD_PHASES = {"bwd", "backward", "train_backward"}
+
 
 # ── TrainingFlopsPass ───────────────────────────────────────────────────────────
 
@@ -50,13 +53,28 @@ class TrainingFlopsPass(GraphPass):
             total_params = int(total_params * layer_scale)
 
         # ── Try per-node annotation path ────────────────────────────────────
-        forward_flops = sum(
-            n.annotations.get("flops_fwd", 0) for n in g.nodes.values()
-        )
-        backward_flops = sum(
-            n.annotations.get("flops_dx", 0) + n.annotations.get("flops_dw", 0)
-            for n in g.nodes.values()
-        )
+        is_stitched = g.metadata.get("fwd_bwd_stitched", False)
+
+        if is_stitched:
+            # Graph-native path: each node's flops_fwd = cost of that op (fwd OR bwd)
+            # Filter by phase to correctly split forward/backward FLOPs
+            forward_flops = sum(
+                n.annotations.get("flops_fwd", 0) for n in g.nodes.values()
+                if n.annotations.get("phase", "fwd") not in _BWD_PHASES
+            )
+            backward_flops = sum(
+                n.annotations.get("flops_fwd", 0) for n in g.nodes.values()
+                if n.annotations.get("phase", "") in _BWD_PHASES
+            )
+        else:
+            # Non-stitched (fwd graph only): estimate backward via dx/dw ratios
+            forward_flops = sum(
+                n.annotations.get("flops_fwd", 0) for n in g.nodes.values()
+            )
+            backward_flops = sum(
+                n.annotations.get("flops_dx", 0) + n.annotations.get("flops_dw", 0)
+                for n in g.nodes.values()
+            )
 
         if forward_flops > 0 or backward_flops > 0:
             # Per-node annotations available — scale to full model
@@ -81,10 +99,12 @@ class TrainingFlopsPass(GraphPass):
 
         # Recompute overhead: for nodes with recompute annotation, flops_fwd
         # already includes 2x multiplier (flops_train.py:37), so base fwd = flops_fwd / 2
+        # Only fwd-phase nodes can be recomputed (bwd-phase nodes are not recomputed)
         recompute_flops = sum(
             n.annotations.get("flops_fwd", 0) // 2
             for n in g.nodes.values()
             if n.annotations.get("recompute")
+            and n.annotations.get("phase", "fwd") not in _BWD_PHASES
         )
         if layer_scale != 1.0:
             recompute_flops = int(recompute_flops * layer_scale)
@@ -252,7 +272,7 @@ class TrainingMemoryPass(GraphPass):
         bwd_nodes = set()
         for nid, node in g.nodes.items():
             phase = node.annotations.get("phase", "")
-            if phase in {"bwd", "backward", "train_backward"}:
+            if phase in _BWD_PHASES:
                 bwd_nodes.add(nid)
             else:
                 fwd_nodes.add(nid)

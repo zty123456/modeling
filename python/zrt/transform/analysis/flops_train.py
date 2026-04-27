@@ -27,14 +27,29 @@ class TrainFlopsPass(GraphPass):
         g = graph.clone()
         
         for node in g.nodes.values():
-            # Calculate forward FLOPs and memory
-            fwd_flops, read_bytes, write_bytes = self._calculate_fwd_flops(node, g)
-            
+            # Check node phase for stitched graphs
+            phase = node.annotations.get("phase", "fwd")
+            is_bwd = phase in {"bwd", "backward", "train_backward"}
+
+            # Read FlopsPass/Roofline annotations when available (graph-native path),
+            # fall back to _calculate_fwd_flops() only when absent
+            fwd_flops = node.annotations.get("flops", 0)
+            read_bytes = node.annotations.get("read_bytes", 0)
+            write_bytes = node.annotations.get("write_bytes", 0)
+            if fwd_flops == 0 and read_bytes == 0:
+                fwd_flops, read_bytes, write_bytes = self._calculate_fwd_flops(node, g)
+
             # Calculate gradient FLOPs (dx and dw)
-            dx_flops, dw_flops = self._calculate_grad_flops(node, fwd_flops)
-            
-            # Apply recompute multiplier if needed
-            rec_mult = 2.0 if node.annotations.get("recompute") else 1.0
+            # For bwd-phase nodes in stitched graphs: these nodes ARE the actual
+            # dx/dw computations captured by loss.backward(). Applying ratio-based
+            # flops_dx/dw on top creates phantom FLOPs that don't exist.
+            if is_bwd:
+                dx_flops, dw_flops = 0.0, 0.0
+            else:
+                dx_flops, dw_flops = self._calculate_grad_flops(node, fwd_flops)
+
+            # Apply recompute multiplier only for forward-phase nodes
+            rec_mult = 2.0 if node.annotations.get("recompute") and not is_bwd else 1.0
             
             # Update node annotations
             node.annotations.update({
@@ -77,7 +92,8 @@ class TrainFlopsPass(GraphPass):
             write_bytes += out.mem_bytes
         
         # Calculate FLOPs based on op type
-        if op_type in ("aten.mm", "aten.linear", "aten.addmm"):
+        # Handle op_type suffixes like .default by checking the base operation
+        if op_type.startswith("aten.mm") or op_type in ("aten.linear", "aten.addmm"):
             # Matmul: FLOPs = 2 * M * N * K
             if len(inputs) >= 2:
                 # Assuming inputs[0] is (M, K), inputs[1] is (K, N)
@@ -217,12 +233,12 @@ class TrainFlopsPass(GraphPass):
             Tuple of (dx_flops, dw_flops)
         """
         op_type = node.op_type
-        
+
         # Default values
         dx_flops = 0.0
         dw_flops = 0.0
-        
-        if op_type in ("aten.mm", "aten.linear", "aten.addmm"):
+
+        if op_type.startswith("aten.mm") or op_type in ("aten.linear", "aten.addmm"):
             # Matmul: dx = 2 * M * N * K, dw = 2 * M * N * K
             dx_flops = fwd_flops
             dw_flops = fwd_flops
