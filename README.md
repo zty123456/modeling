@@ -243,9 +243,21 @@ python -m python.zrt hf_models/llama3_8b --train --layers 2
 
 ```bash
 # 基于捕获图的训练建模
-PYTHONPATH=python python -m zrt.training model-training \
-    hf_models/llama3_8b --num-layers 2 \
-    --hw nvidia_h100_sxm --tp 2 --dp 4
+source ~/Ascend/ascend-toolkit/set_env.sh && \
+PYTHONPATH={PATH_TO}/modeling/python
+python -m python.zrt hf_models/deepseek_v3 \
+    --layers 4 \
+    --train \
+    --hw nvidia_h100_sxm \
+    --tp 8 \
+    --pp 2 \
+    --dp 1 \
+    --micro-batch 1 \
+    --global-batch 32 \
+    --zero-stage 1 \
+    --total-params 671e9 \
+    --num-layers-full 61 \
+    --hidden 7168
 
 # 基于 YAML 配置的训练估算（引用 model + hw registry）
 PYTHONPATH=python python -m zrt.training estimate \
