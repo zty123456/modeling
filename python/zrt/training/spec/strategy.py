@@ -55,19 +55,22 @@ _MUON_NS_STEPS_DEFAULTS: dict[str, int] = {
 
 @dataclass
 class MuonConfig:
-    ns_steps: int | None = None
-    rotation: tuple[int, int] = (5, 2)
+    ns_steps: int = 5
+    ns_variant: str = "zolo_pd"
+    rotation: bool = True
     adam_param_types: set[str] = field(
         default_factory=lambda: {"embed", "lm_head", "router", "bias"}
     )
-    muon_param_fraction: float | None = None
+    muon_param_fraction: float = 0.85
 
 
 def resolve_muon_ns_steps(
     muon_config: MuonConfig | None,
     model: "ModelSpec",
 ) -> int:
-    if muon_config is not None and muon_config.ns_steps is not None:
+    if muon_config is None:
+        muon_config = MuonConfig()
+    if muon_config.ns_steps != MuonConfig.__dataclass_fields__["ns_steps"].default:
         return muon_config.ns_steps
     if hasattr(model, "muon_ns_steps") and model.muon_ns_steps is not None:
         return model.muon_ns_steps

@@ -43,13 +43,7 @@ def adam_step_flops(P: int) -> int:
       4. v̂ = v / (1 - β₂ᵗ)                   → 1 FLOP
       5. update = lr × m̂ / (√v̂ + ε)         → 3 FLOPs
       6. w = w - update                       → 1 FLOP
-      Total: ~11 FLOPs per parameter
-
-    Including weight decay and gradient clipping:
-      - Weight decay: w -= lr × wd × w       → 2 FLOPs
-      - Gradient clipping (optional): norm calc + scale
-
-    Conservative estimate: 16 FLOPs/param including overhead.
+      Total: ~12 FLOPs per parameter
 
     Args:
         P: Number of parameters
@@ -57,7 +51,7 @@ def adam_step_flops(P: int) -> int:
     Returns:
         Total FLOPs for Adam optimizer step
     """
-    return P * 16
+    return P * 12
 
 
 def muon_step_flops(P: int, K: int, hidden: int) -> int:
@@ -75,9 +69,10 @@ def muon_step_flops(P: int, K: int, hidden: int) -> int:
       - NS operates on momentum matrix M of shape (m, n)
       - Total NS FLOPs: K × 4 × max(m, n) × min(m, n)²
 
-    For simplicity, we estimate:
-      - Per weight: NS contributes ≈ K × 4 × hidden FLOPs
-      - Other ops: 4 FLOPs per param
+    For P params distributed across roughly square matrices of size hidden×hidden:
+      - Number of matrices ≈ P / (hidden × hidden)
+      - NS FLOPs per matrix = K × 4 × hidden³
+      - Total NS FLOPs = num_matrices × K × 4 × hidden³
 
     Args:
         P: Number of parameters
@@ -87,9 +82,13 @@ def muon_step_flops(P: int, K: int, hidden: int) -> int:
     Returns:
         Total FLOPs for Muon optimizer step
     """
-    ns_total = ns_flops(hidden, hidden, K)
-    num_matrices = P // (hidden * hidden) if hidden > 0 else 1
-    ns_flops_total = ns_total * num_matrices
+    if hidden <= 0:
+        return P * 4
+
+    hidden_sq = hidden * hidden
+    num_matrices = max(1, P // hidden_sq) if P >= hidden_sq else 1
+    ns_total_per_matrix = ns_flops(hidden, hidden, K)
+    ns_flops_total = ns_total_per_matrix * num_matrices
     other_flops = P * 4
     return ns_flops_total + other_flops
 

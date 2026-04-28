@@ -111,6 +111,8 @@ def _parse_model(d: dict) -> ModelSpec:
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
         act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        model_type=d.get("model_type", "default"),
+        muon_ns_steps=d.get("muon_ns_steps"),
     )
 
 
@@ -172,10 +174,10 @@ def _parse_strategy(d: dict) -> Strategy:
     if "muon_config" in d:
         mc = d["muon_config"]
         muon_config = MuonConfig(
-            ns_steps=mc.get("ns_steps"),
-            rotation=tuple(mc.get("rotation", [5, 2])),
+            ns_steps=mc.get("ns_steps", 5),
+            rotation=mc.get("rotation", True),
             adam_param_types=set(mc.get("adam_param_types", ["embed", "lm_head", "router", "bias"])),
-            muon_param_fraction=mc.get("muon_param_fraction"),
+            muon_param_fraction=mc.get("muon_param_fraction", 0.85),
         )
 
     return Strategy(

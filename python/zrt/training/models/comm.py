@@ -148,14 +148,23 @@ def optimizer_comm_time(
         name="muon_ag", kind="AG", group="DP", bytes_=comm_bytes,
         inserted_after="backward_end",
     )
-    rs_c = Collective(
-        name="muon_rs", kind="RS", group="DP", bytes_=comm_bytes,
-        inserted_after="optimizer_step",
-    )
+    ag_time = collective_time(ag_c, group_size, tier)
+
+    # ReduceScatter only if rotation=True (Moonshot optimization)
+    # When rotation=False, each rank independently computes and slices, no RS needed
+    rotation = muon_config.rotation if muon_config else True
+    if rotation:
+        rs_c = Collective(
+            name="muon_rs", kind="RS", group="DP", bytes_=comm_bytes,
+            inserted_after="optimizer_step",
+        )
+        rs_time = collective_time(rs_c, group_size, tier)
+    else:
+        rs_time = 0.0
 
     return {
-        "muon_ag": collective_time(ag_c, group_size, tier),
-        "muon_rs": collective_time(rs_c, group_size, tier),
+        "muon_ag": ag_time,
+        "muon_rs": rs_time,
     }
 
 

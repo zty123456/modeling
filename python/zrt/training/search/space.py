@@ -36,6 +36,7 @@ class SearchSpace:
     recompute_policies: list[str] = field(default_factory=lambda: ["none", "selective", "full"])
     vpp_chunks_values: list[int] = field(default_factory=lambda: [1, 2, 4])
     optimizer_values: list[OptKind] = field(default_factory=lambda: [OptKind.ADAM, OptKind.MUON])
+    muon_rotation_values: list[bool] = field(default_factory=lambda: [True, False])
 
     micro_batch: int = 1
     global_batch: int = 0
@@ -72,36 +73,62 @@ class SearchSpace:
                             for sched in self.pp_schedules:
                                 for rc in self.recompute_policies:
                                     for opt in self.optimizer_values:
-                                        if sched == PPSched.INTERLEAVED:
-                                            for vc in self.vpp_chunks_values:
+                                        if opt == OptKind.MUON:
+                                            for rot in self.muon_rotation_values:
+                                                if sched == PPSched.INTERLEAVED:
+                                                    for vc in self.vpp_chunks_values:
+                                                        s = self._make_strategy(
+                                                            tp, cp, pp, ep, dp, zero_stage,
+                                                            sched, rc, vc, opt, rot,
+                                                        )
+                                                        key = (tp, cp, pp, ep, dp, zero_stage, sched, rc, vc, opt, rot)
+                                                        if key not in seen:
+                                                            seen.add(key)
+                                                            results.append(s)
+                                                else:
+                                                    s = self._make_strategy(
+                                                        tp, cp, pp, ep, dp, zero_stage,
+                                                        sched, rc, 1, opt, rot,
+                                                    )
+                                                    key = (tp, cp, pp, ep, dp, zero_stage, sched, rc, 1, opt, rot)
+                                                    if key not in seen:
+                                                        seen.add(key)
+                                                        results.append(s)
+                                        else:
+                                            if sched == PPSched.INTERLEAVED:
+                                                for vc in self.vpp_chunks_values:
+                                                    s = self._make_strategy(
+                                                        tp, cp, pp, ep, dp, zero_stage,
+                                                        sched, rc, vc, opt, True,
+                                                    )
+                                                    key = (tp, cp, pp, ep, dp, zero_stage, sched, rc, vc, opt, True)
+                                                    if key not in seen:
+                                                        seen.add(key)
+                                                        results.append(s)
+                                            else:
                                                 s = self._make_strategy(
                                                     tp, cp, pp, ep, dp, zero_stage,
-                                                    sched, rc, vc, opt,
+                                                    sched, rc, 1, opt, True,
                                                 )
-                                                key = (tp, cp, pp, ep, dp, zero_stage, sched, rc, vc, opt)
+                                                key = (tp, cp, pp, ep, dp, zero_stage, sched, rc, 1, opt, True)
                                                 if key not in seen:
                                                     seen.add(key)
                                                     results.append(s)
-                                        else:
-                                            s = self._make_strategy(
-                                                tp, cp, pp, ep, dp, zero_stage,
-                                                sched, rc, 1, opt,
-                                            )
-                                            key = (tp, cp, pp, ep, dp, zero_stage, sched, rc, 1, opt)
-                                            if key not in seen:
-                                                seen.add(key)
-                                                results.append(s)
 
         return results
 
-    def _make_strategy(self, tp, cp, pp, ep, dp, zero_stage, sched, rc, vpp_chunks, opt):
-        from zrt.training.spec.strategy import Strategy, RecomputePolicy
+    def _make_strategy(self, tp, cp, pp, ep, dp, zero_stage, sched, rc, vpp_chunks, opt, rotation):
+        from zrt.training.spec.strategy import Strategy, RecomputePolicy, MuonConfig
 
         rc_policy = RecomputePolicy()
         if rc == "selective":
             rc_policy.per_layer = {"moe": {"attn"}, "dense": {"attn"}}
         elif rc == "full":
             rc_policy.per_layer = {"moe": {"full"}, "dense": {"full"}}
+
+        muon_config = None
+        if opt == OptKind.MUON:
+            muon_config = MuonConfig(rotation=rotation)
 
         return Strategy(
             tp=tp, cp=cp, pp=pp, ep=ep, dp=dp,
@@ -112,4 +139,5 @@ class SearchSpace:
             vpp_chunks=vpp_chunks,
             recompute=rc_policy,
             optimizer=opt,
+            muon_config=muon_config,
         )

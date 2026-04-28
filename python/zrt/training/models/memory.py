@@ -179,10 +179,13 @@ def _shared_expert_params(model: ModelSpec) -> int:
 
 
 def _optimizer_state_bytes(P: int, model: ModelSpec, strategy: Strategy) -> int:
-    """Optimizer state memory in bytes for P parameters."""
-    master_bytes = model.master_dtype.bytes
+    """Optimizer state memory in bytes for P parameters.
+
+    Adam: P × 12B (master + m + v, each 4B)
+    Muon: P × (12 - f_muon × 4)B = P_muon × 8B + P_adam × 12B
+    """
     if strategy.optimizer.value == "adam":
-        return P * master_bytes * 3
+        return P * 12
     elif strategy.optimizer.value == "muon":
         muon_config = strategy.muon_config
         f_muon = (
@@ -190,8 +193,8 @@ def _optimizer_state_bytes(P: int, model: ModelSpec, strategy: Strategy) -> int:
             if muon_config and muon_config.muon_param_fraction is not None
             else 0.85
         )
-        return int(P * master_bytes * (12 - f_muon * 4))
-    return P * master_bytes * 3
+        return int(P * (12 - f_muon * 4))
+    return P * 12
 
 
 def _activation_memory(

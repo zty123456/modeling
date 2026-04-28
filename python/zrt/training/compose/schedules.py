@@ -14,6 +14,8 @@ from zrt.training.models.comm import total_comm_time, optimizer_comm_time
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
 from zrt.training.models.optimizer import muon_optimizer_step_flops, adam_step_flops
+from zrt.training.io.perf_tables import achieved_flops_efficiency
+from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import PPSched, Strategy, resolve_muon_ns_steps
 from zrt.training.spec.system import SystemSpec
@@ -408,7 +410,7 @@ def pipeline_step_time(
     # Memory breakdown
     step.memory = memory_breakdown(graph, model, system, strategy)
 
-    # MFU
+    # MFU (before adding optimizer time, per design doc §5.5.2)
     step.mfu = compute_mfu(model, strategy, system, step.step_time)
 
     # HFU
@@ -446,7 +448,7 @@ def _assign_stages(model: ModelSpec, strategy: Strategy) -> list[list[int]]:
 def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
     """Compute optimizer step time in seconds.
 
-    Uses roofline model to convert FLOPs to time.
+    Uses roofline model with achieved efficiency from perf_tables.
     """
     P = model.total_params()
     if strategy.tp > 1:
@@ -473,12 +475,12 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
             else 0.85
         )
         flops = muon_optimizer_step_flops(P, K, model.hidden, f_muon)
-        eff = 0.5
-        return flops / (peak_flops * eff)
+        eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
+        return flops / (peak_flops * eff) if eff > 0 else 0.0
     else:
         flops = adam_step_flops(P)
-        eff = 0.8
-        return flops / (peak_flops * eff)
+        eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
+        return flops / (peak_flops * eff) if eff > 0 else 0.0
 
 
 def _compute_optimizer_comm_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
