@@ -139,7 +139,9 @@ def optimizer_comm_time(
     P_muon = int(P * f_muon)
     param_bytes = 4  # FP32 master copy
 
-    comm_bytes = int((strategy.dp - 1) / strategy.dp * P_muon * param_bytes)
+    # Total bytes to gather = P_muon × 4B
+    # Ring algorithm factor applied in collective_time(), not pre-scaled here
+    comm_bytes = int(P_muon * param_bytes)
 
     group_size = strategy.dp
     tier = tier_for_group("DP", group_size, system)

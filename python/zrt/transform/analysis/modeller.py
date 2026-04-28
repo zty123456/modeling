@@ -38,6 +38,7 @@ def estimate_training_from_graphs(
     optimizer: str = "adam",
     muon_rotation: bool = True,
     muon_ns_steps: int | None = None,
+    model_type: str | None = None,
     micro_batch: int = 1,
     global_batch: int = 32,
     pp_schedule: str = "1f1b",
@@ -61,6 +62,8 @@ def estimate_training_from_graphs(
     }
     if total_params is not None:
         metadata["total_params"] = int(total_params)
+    if model_type is not None:
+        metadata["model_type"] = model_type
 
     for key, val in metadata.items():
         if key not in forward_graph.metadata:

@@ -105,9 +105,10 @@ class OptimizerPass(GraphPass):
                 ns_steps_resolved = ctx.training.effective_ns_steps(model_type)
             else:
                 ns_steps_resolved = 5
-            # Muon AG bytes: (DP-1)/DP × P_muon × 4B
+            # Muon AG bytes: total bytes to gather = P_muon × 4B
+            # Ring factor applied in timing calculation, not pre-scaled here
             if dp > 1:
-                muon_ag_bytes = int((dp - 1) / dp * params_muon * 4)
+                muon_ag_bytes = int(params_muon * 4)
 
         # Create optimizer step node
         step_node = OpNode(

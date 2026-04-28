@@ -211,10 +211,11 @@ class TestOptimizerCommTime:
         strategy = Strategy(optimizer=OptKind.MUON, dp=64, zero_stage=1)
         comm = optimizer_comm_time(model, system, strategy)
 
-        # Theory: (DP-1)/DP × P_muon × 4B
+        # Theory: Ring AG time = (dp-1) × (P_muon × 4B / dp) × beta
+        # Per-rank bandwidth cost = (dp-1)/dp × P_muon × 4B / bw
+        # collective_time() correctly applies ring factor from total bytes
         P = model.total_params()
         P_muon = int(P * 0.85)
-        expected_bytes = int((64 - 1) / 64 * P_muon * 4)
 
         # The comm time is derived from bytes, so we verify time > 0
         assert comm["muon_ag"] > 0
