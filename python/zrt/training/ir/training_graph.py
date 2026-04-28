@@ -45,7 +45,8 @@ class Collective:
     kind: str       # "AG" | "RS" | "AR" | "A2A" | "P2P"
     group: str      # "TP" | "CP" | "EP" | "DP" | "PP"
     bytes_: int     # per-rank payload in bytes
-    inserted_after: str  # op name it follows
+    inserted_after: str | None = None  # op name it follows
+    inserted_before: str | None = None  # op name it precedes
 
     @property
     def payload_mb(self) -> float:

@@ -280,6 +280,320 @@ def _hc_expand_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
     )
 
 
+def _moe_block(
+    hidden: int,
+    ffn: int,
+    moe_ffn: int,
+    num_experts: int,
+    top_k: int,
+    n_shared_experts: int,
+    seq: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    layer_id: int,
+    act_dtype: Dtype = Dtype.BF16,
+    hc_mult: int = 1,
+    hc_sinkhorn_iters: int = 20,
+) -> list[Op]:
+    """Build ops for one MoE (Mixture-of-Experts) transformer block.
+
+    MoE block structure:
+      - Attention (same as dense)
+      - Router: h -> num_experts (gating logits)
+      - Shared expert FFN: runs on all tokens (if n_shared_experts > 0)
+      - Routed expert FFN: top-k experts per token
+      - Expert output aggregation
+
+    Without HC (hc_mult <= 1): ~18 ops
+      LN, QKV_proj, RoPE, attn_core, O_proj, add(residual),
+      LN, router, shared FFN (if n_shared > 0),
+      routed expert FFN (num_experts × top_k),
+      expert aggregation, add(residual)
+
+    With HC (hc_mult > 1): residual adds are replaced by (mhc_pre, mhc_post)
+    pairs, similar to dense_block.
+    """
+    use_hc = hc_mult > 1
+    ops: list[Op] = []
+    b = 1  # batch handled at tensor level
+    h = hidden
+    h_attn = num_heads * head_dim
+    h_kv = num_kv_heads * head_dim
+    prefix = f"L{layer_id}"
+
+    # ── HC pre-attn (hc_mult > 1 only) ─────────────────────────────────────
+    if use_hc:
+        ops.append(_mhc_pre_op(
+            seq, h, hc_mult, hc_sinkhorn_iters,
+            layer_id, LayerKind.MOE, prefix, "attn", act_dtype,
+        ))
+        ln1_in = _tensor(f"x_pre_attn", (seq, h), act_dtype)
+    else:
+        ln1_in = _tensor("x", (seq, h), act_dtype)
+
+    # ── Pre-attention RMSNorm ──────────────────────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.ln1", kind="ln",
+        inputs=[ln1_in],
+        outputs=[_tensor("x_ln1", (seq, h), act_dtype)],
+        meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── QKV projection ────────────────────────────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.qkv_proj", kind="matmul",
+        inputs=[_tensor("x_ln1", (seq, h), act_dtype)],
+        outputs=[_tensor("qkv", (seq, h_attn + 2 * h_kv), act_dtype)],
+        meta={"m": seq, "n": h_attn + 2 * h_kv, "k": h},
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── RoPE ───────────────────────────────────────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.rope", kind="rope",
+        inputs=[_tensor("q", (seq, h_attn), act_dtype),
+                _tensor("k", (seq, h_kv), act_dtype)],
+        outputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
+                 _tensor("k_rope", (seq, h_kv), act_dtype)],
+        meta={"bytes_fwd": seq * (h_attn + h_kv) * act_dtype.bytes * 2},
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── Attention core ─────────────────────────────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.attn_core", kind="attn_core",
+        inputs=[_tensor("q_rope", (seq, h_attn), act_dtype),
+                _tensor("k_rope", (seq, h_kv), act_dtype),
+                _tensor("v", (seq, h_kv), act_dtype)],
+        outputs=[_tensor("attn_out", (seq, h_attn), act_dtype)],
+        meta={
+            "b": b, "s": seq,
+            "heads": num_heads, "head_dim": head_dim,
+            "causal": True,
+            "h_kv": h_kv,
+        },
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── O projection ──────────────────────────────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.o_proj", kind="matmul",
+        inputs=[_tensor("attn_out", (seq, h_attn), act_dtype)],
+        outputs=[_tensor("attn_proj", (seq, h), act_dtype)],
+        meta={"m": seq, "n": h, "k": h_attn},
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── Residual add OR mhc_post_attn ─────────────────────────────────────
+    if use_hc:
+        ops.append(_mhc_post_op(
+            seq, h, hc_mult, layer_id, LayerKind.MOE, prefix, "attn", act_dtype,
+        ))
+        ops.append(_mhc_pre_op(
+            seq, h, hc_mult, hc_sinkhorn_iters,
+            layer_id, LayerKind.MOE, prefix, "ffn", act_dtype,
+        ))
+        ln2_in = _tensor(f"x_pre_ffn", (seq, h), act_dtype)
+    else:
+        ops.append(Op(
+            name=f"{prefix}.residual1", kind="add",
+            inputs=[_tensor("attn_proj", (seq, h), act_dtype),
+                    _tensor("x", (seq, h), act_dtype)],
+            outputs=[_tensor("x_attn", (seq, h), act_dtype)],
+            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+        ln2_in = _tensor("x_attn", (seq, h), act_dtype)
+
+    # ── Post-attention RMSNorm ────────────────────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.ln2", kind="ln",
+        inputs=[ln2_in],
+        outputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+        meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── Router: h -> num_experts (gating logits) ─────────────────────────────
+    ops.append(Op(
+        name=f"{prefix}.router", kind="matmul",
+        inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+        outputs=[_tensor("router_logits", (seq, num_experts), act_dtype)],
+        meta={"m": seq, "n": num_experts, "k": h},
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── Top-k selection (modeled as memory-bound op) ───────────────────────
+    ops.append(Op(
+        name=f"{prefix}.topk_select", kind="softmax",
+        inputs=[_tensor("router_logits", (seq, num_experts), act_dtype)],
+        outputs=[_tensor("topk_weights", (seq, top_k), act_dtype),
+                 _tensor("topk_indices", (seq, top_k), act_dtype)],
+        meta={
+            "bytes_fwd": seq * num_experts * act_dtype.bytes * 2,
+            "num_experts": num_experts,
+            "top_k": top_k,
+        },
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── Shared expert FFN (if n_shared_experts > 0) ────────────────────────
+    if n_shared_experts > 0:
+        ops.append(Op(
+            name=f"{prefix}.shared_up_proj", kind="matmul",
+            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+            outputs=[_tensor("shared_up", (seq, moe_ffn), act_dtype)],
+            meta={"m": seq, "n": moe_ffn, "k": h},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+        ops.append(Op(
+            name=f"{prefix}.shared_gate_proj", kind="matmul",
+            inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+            outputs=[_tensor("shared_gate", (seq, moe_ffn), act_dtype)],
+            meta={"m": seq, "n": moe_ffn, "k": h},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+        ops.append(Op(
+            name=f"{prefix}.shared_swiGLU", kind="swiglu",
+            inputs=[_tensor("shared_up", (seq, moe_ffn), act_dtype),
+                    _tensor("shared_gate", (seq, moe_ffn), act_dtype)],
+            outputs=[_tensor("shared_swiglu_out", (seq, moe_ffn), act_dtype)],
+            meta={"bytes_fwd": seq * moe_ffn * act_dtype.bytes * 3},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+        ops.append(Op(
+            name=f"{prefix}.shared_down_proj", kind="matmul",
+            inputs=[_tensor("shared_swiglu_out", (seq, moe_ffn), act_dtype)],
+            outputs=[_tensor("shared_ffn_out", (seq, h), act_dtype)],
+            meta={"m": seq, "n": h, "k": moe_ffn},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+
+    # ── Routed expert FFN (modeled as single op with fwd_multiplier) ─────────────
+    # Each token is routed to top_k experts, each expert runs a full FFN.
+    # Total FLOPs = top_k × (up + gate + down) expert FFNs
+    # We model this as a single matmul with fwd_multiplier = 3 * top_k
+    # (3 for up_proj + gate_proj + down_proj per expert)
+    ops.append(Op(
+        name=f"{prefix}.routed_expert_ffn", kind="matmul",
+        inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
+        outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+        meta={
+            "m": seq,
+            "n": h,
+            "k": moe_ffn,
+            "fwd_multiplier": 3 * top_k,  # 3 matmuls per active expert
+        },
+        layer_id=layer_id, layer_kind=LayerKind.MOE,
+    ))
+
+    # ── Expert aggregation (combine shared + routed outputs) ─────────────────
+    if n_shared_experts > 0:
+        ops.append(Op(
+            name=f"{prefix}.expert_agg", kind="add",
+            inputs=[_tensor("shared_ffn_out", (seq, h), act_dtype),
+                    _tensor("routed_ffn_out", (seq, h), act_dtype)],
+            outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
+            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+    else:
+        # No shared experts: routed output is the FFN output
+        ops.append(Op(
+            name=f"{prefix}.expert_agg", kind="add",
+            inputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
+            outputs=[_tensor("ffn_out", (seq, h), act_dtype)],
+            meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+
+    # ── Residual add OR mhc_post_ffn ──────────────────────────────────────
+    if use_hc:
+        ops.append(_mhc_post_op(
+            seq, h, hc_mult, layer_id, LayerKind.MOE, prefix, "ffn", act_dtype,
+        ))
+    else:
+        ops.append(Op(
+            name=f"{prefix}.residual2", kind="add",
+            inputs=[_tensor("ffn_out", (seq, h), act_dtype),
+                    _tensor("x_attn", (seq, h), act_dtype)],
+            outputs=[_tensor("y", (seq, h), act_dtype)],
+            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            layer_id=layer_id, layer_kind=LayerKind.MOE,
+        ))
+
+    return ops
+
+
+def _mtp_block(
+    hidden: int,
+    ffn: int,
+    seq: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    layer_id: int,
+    act_dtype: Dtype = Dtype.BF16,
+    hc_mult: int = 1,
+    hc_sinkhorn_iters: int = 20,
+) -> list[Op]:
+    """Build ops for one MTP (Multimodal Projection) transformer block.
+
+    MTP block structure:
+      - Dense transformer block (same as dense_block)
+      - Plus an additional embedding projection layer
+
+    This is used for multimodal models that need to project embeddings
+    between different modalities (e.g., vision-language models).
+
+    Without HC (hc_mult <= 1): ~15 ops
+      Embedding projection, LN, QKV_proj, RoPE, attn_core, O_proj, add,
+      LN, up_proj, gate_proj, swiglu, down_proj, add
+
+    With HC (hc_mult > 1): residual adds replaced by mhc_pre/mhc_post.
+    """
+    # MTP is essentially a dense block with an extra embedding projection
+    dense_ops = dense_block(
+        hidden=hidden,
+        ffn=ffn,
+        seq=seq,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        layer_id=layer_id,
+        act_dtype=act_dtype,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+    )
+
+    # Prepend embedding projection for MTP
+    prefix = f"L{layer_id}"
+    h = hidden
+
+    # Embedding projection: h -> h (modal fusion)
+    embed_proj = Op(
+        name=f"{prefix}.mtp_embed_proj", kind="matmul",
+        inputs=[_tensor("x_mtp_in", (seq, h), act_dtype)],
+        outputs=[_tensor("x_proj", (seq, h), act_dtype)],
+        meta={"m": seq, "n": h, "k": h},
+        layer_id=layer_id, layer_kind=LayerKind.MTP,
+    )
+
+    return [embed_proj] + dense_ops
+
+
+def _embed_op(vocab: int, hidden: int, seq: int, act_dtype: Dtype) -> Op:
+    return Op(
+        name="embed", kind="embed",
+        inputs=[_tensor("input_ids", (seq,), act_dtype)],
+        outputs=[_tensor("x_embed", (seq, hidden), act_dtype)],
+        meta={"m": seq, "n": hidden, "k": vocab},
+        layer_id=-1, layer_kind=LayerKind.DENSE,
+    )
+
+
 def _mhc_head_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
     """Final HC mix-down before final_ln + lm_head.
 
@@ -343,12 +657,25 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
         if lk == LayerKind.DENSE:
             block_ops = dense_block(layer_id=i, **block_kwargs)
         elif lk == LayerKind.MOE:
-            # Phase 2: moe_block() — currently uses dense_block for op shape;
-            # FLOPs / memory differ but op kinds are similar enough for capture.
-            block_ops = dense_block(layer_id=i, **block_kwargs)
+            block_ops = _moe_block(
+                hidden=h, ffn=model.ffn, moe_ffn=model.moe_ffn,
+                num_experts=model.num_experts, top_k=model.top_k,
+                n_shared_experts=model.n_shared_experts,
+                seq=s, num_heads=model.num_heads,
+                num_kv_heads=model.num_kv_heads,
+                head_dim=model.head_dim,
+                layer_id=i, act_dtype=act_dtype,
+                hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
+            )
         elif lk == LayerKind.MTP:
-            # Phase 2: mtp_block() — same placeholder.
-            block_ops = dense_block(layer_id=i, **block_kwargs)
+            block_ops = _mtp_block(
+                hidden=h, ffn=model.ffn, seq=s,
+                num_heads=model.num_heads,
+                num_kv_heads=model.num_kv_heads,
+                head_dim=model.head_dim,
+                layer_id=i, act_dtype=act_dtype,
+                hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
+            )
         else:
             raise ValueError(f"Unknown LayerKind: {lk}")
 

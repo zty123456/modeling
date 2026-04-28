@@ -51,6 +51,11 @@ def _matmul_cost(op: Op) -> OpCost:
     n = op.meta.get("n_local", op.meta.get("n", 0))
     k = op.meta.get("k_local", op.meta.get("k", 0))
     fwd = 2.0 * m * n * k
+
+    # Apply fwd_multiplier if present (e.g., for MoE routed expert FFNs)
+    fwd_multiplier = op.meta.get("fwd_multiplier", 1.0)
+    fwd = fwd * fwd_multiplier
+
     return OpCost(
         fwd_flops=fwd,
         dx_flops=fwd,     # dX: 2*m*n*k

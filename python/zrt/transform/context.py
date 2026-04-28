@@ -62,6 +62,15 @@ class QuantConfig:
 
 
 @dataclass
+class OffloadConfig:
+    """Host-device memory offloading configuration."""
+    pct: float = 0.0          # Fraction of each component to offload [0.0, 1.0]
+    opt_state: bool = False   # Offload optimizer state (Adam momentum/variance)
+    grads: bool = False       # Offload gradients after reduction
+    params: bool = False      # Offload parameters (requires CPU-GPU sync)
+
+
+@dataclass
 class TrainingConfig:
     """Training-specific configuration for performance modelling."""
 
@@ -89,6 +98,9 @@ class TrainingConfig:
 
     # Overlap DP allreduce with PP bubble window
     dp_overlap_in_bubble: bool = True
+
+    # Memory offloading (optional, disabled by default)
+    offload: OffloadConfig | None = None
 
     @property
     def num_microbatches(self) -> int:

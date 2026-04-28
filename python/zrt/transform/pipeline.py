@@ -76,6 +76,7 @@ def build_pipeline() -> TransformPipeline:
     from python.zrt.transform.training.zero_fsdp import ZeroFSDPPass
     from python.zrt.transform.training.recompute import RecomputePass
     from python.zrt.transform.training.optimizer import OptimizerPass
+    from python.zrt.transform.training.offload import OffloadPass
 
     is_train = lambda c: c.is_training
 
@@ -112,6 +113,9 @@ def build_pipeline() -> TransformPipeline:
     pipe.add("optim", ZeroFSDPPass(),         condition=is_train)
     # OptimizerPass adds optimizer step node after all backward ops
     pipe.add("optim", OptimizerPass(),        condition=is_train)
+    # OffloadPass inserts CPU-GPU transfer nodes for memory offloading
+    pipe.add("optim", OffloadPass(),
+             condition=lambda c: c.is_training and c.training.offload is not None and c.training.offload.pct > 0)
 
     # ── Stage 4: Analyze ──────────────────────────────────────────────────────
     pipe.add("analyze", FlopsPass())
