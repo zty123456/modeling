@@ -41,6 +41,7 @@ def estimate_training_from_graphs(
     pp_schedule: str = "1f1b",
     vpp_chunks: int = 1,
     return_transformed: bool = False,
+    quant: str | None = None,
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -55,7 +56,7 @@ def estimate_training_from_graphs(
         where transformed_graphs contains the pipeline-processed graphs.
         This enables downstream Excel export via ``export_training_graphs``.
     """
-    from python.zrt.transform.context import ParallelConfig, TrainingConfig, TransformContext
+    from python.zrt.transform.context import ParallelConfig, QuantConfig, TrainingConfig, TransformContext
     from python.zrt.transform.pipeline import build_default_pipeline
 
     metadata: dict = {
@@ -76,6 +77,7 @@ def estimate_training_from_graphs(
             if key not in backward_graph.metadata:
                 backward_graph.metadata[key] = val
 
+    quant_cfg = QuantConfig(weight=quant, activation=quant) if quant else None
     ctx = TransformContext(
         hw_spec=hw_spec,
         parallel=ParallelConfig(tp=tp, pp=pp, ep=ep, dp=dp, cp=cp),
@@ -87,6 +89,7 @@ def estimate_training_from_graphs(
             pp_schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
         ),
+        quant=quant_cfg,
     )
 
     pipe = build_default_pipeline()
