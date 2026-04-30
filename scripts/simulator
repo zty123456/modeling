@@ -4,7 +4,6 @@
  Source Server         : costmodel_database
  Source Server Type    : MySQL
  Source Server Version : 80029 (8.0.29)
- Source Host           : 141.61.77.53:3308
  Source Schema         : simulator
 
  Target Server Type    : MySQL
