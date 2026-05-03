@@ -207,19 +207,21 @@ class SubPattern:
 
 
 def match_subsequence(op_names: List[str], pattern: List[str]) -> bool:
-    """Return True if *pattern* appears as an ordered subsequence in *op_names*.
+    """Return True if *pattern* appears as a *contiguous* subsequence.
 
-    Ops in PATTERN_SKIP are excluded from *op_names* before matching, so the
-    result is independent of whether shape/transparent ops are present.
-    The filter is applied here (not at the caller), so changing PATTERN_SKIP
-    never invalidates pattern definitions.
+    Ops in PATTERN_SKIP are excluded from *op_names* before matching, so
+    shape/transparent ops between pattern elements do not break contiguity.
+    However, real compute ops (NOT in PATTERN_SKIP) MUST appear consecutively
+    — a pattern like ``[mm, softmax, mm]`` will NOT match across unrelated
+    ops (e.g. rope, residual-add) that sit between them.
     """
     effective = [op for op in op_names if op not in PATTERN_SKIP]
-    pi = 0
-    for op in effective:
-        if pi < len(pattern) and re.search(pattern[pi], op, re.IGNORECASE):
-            pi += 1
-        if pi == len(pattern):
+    # Slide a window of len(pattern) over effective
+    for start in range(len(effective) - len(pattern) + 1):
+        if all(
+            re.search(pattern[i], effective[start + i], re.IGNORECASE)
+            for i in range(len(pattern))
+        ):
             return True
     return False
 
@@ -334,10 +336,7 @@ _ASCEND_PATTERNS: List[SubPattern] = [
     SubPattern("v4_sparse_attn", _ATTN_RE,
                [r"\bgather\b", r"\b(mm|bmm|matmul)\b", r"softmax", r"\b(mm|bmm|matmul)\b"],
                priority=45),
-    # 同 CUDA 平台: SDPA aten 级展开 (非真实 NPU 融合核)
-    SubPattern("npu_sdpa_decomposed", _ATTN_RE,
-               [r"\b(mm|bmm|matmul)\b", r"softmax", r"\b(mm|bmm|matmul)\b"],
-               priority=40),
+    # 同 CUDA 平台: SDPA aten 级展开 → 不映射到 NPU 融合核，只匹配直达 sdpa 调用
     SubPattern("sdpa", _ATTN_RE,
                [r"scaled_dot_product_attention"],
                priority=35),
