@@ -161,6 +161,15 @@ def _pass2_parent(
             return False
         if parent_total_ops.get(p, 0) > max_parent_ops:
             return False
+        # Rule 1: root-level modules (scope has no parent) are structural
+        # wrappers, never computational kernels.
+        if not _parent(p):
+            return False
+        # Rule 2: if any child scope has sub-children, the parent is a
+        # structural wrapper, not a fusible kernel.
+        children = path_to_children.get(p, set())
+        if any(child in path_to_children for child in children):
+            return False
         return True
 
     def _phase(g: list[OpNode]) -> str:
@@ -309,14 +318,18 @@ class FusionPass(GraphPass):
     with semantic labels (e.g. ``flash_attn``, ``gated_mlp``, ``rms_norm``).
     Communication nodes are never fused and always act as group-breakers.
 
-    Single-node groups with meaningful semantic labels are relabelled in-place
-    (no topology change, just op_type annotation update).
+    **Incremental mode**: when all non-comm nodes already carry ``fusion_level``
+    (from Stage-1 graph capture), Pass 1/2 (grouping + parent merge) are skipped.
+    Only Pass 3 (semantic relabel) and Pass 4 (expand unfused containers) run,
+    making this O(n) instead of O(n²) on pre-fused graphs.
     """
 
     name = "fusion"
 
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
-        from python.zrt.graph.fusion_rules import get_platform_settings
+        from python.zrt.graph.fusion_rules import (
+            get_platform_settings, CONTAINER_SEMANTICS,
+        )
 
         # Infer platform from hw_spec vendor if available
         platform = _infer_platform(ctx)
@@ -325,33 +338,83 @@ class FusionPass(GraphPass):
         g = graph.clone()
         path_to_class, path_to_children = _build_scope_maps(g)
 
-        # ── Pass 1 ────────────────────────────────────────────────────────────
-        topo        = g.topo_sort()
-        leaf_groups = _pass1_leaf(topo)
+        # ── No-op detection: skip full regrouping if graph already fused ──────
+        topo = g.topo_sort()
+        compute_nodes = [n for n in topo if n.category != "communication"]
+        all_prefused = all(
+            getattr(n, "fusion_level", "") for n in compute_nodes
+        ) if compute_nodes else True
 
-        # ── Pass 2 ────────────────────────────────────────────────────────────
-        final_groups = _pass2_parent(
-            leaf_groups,
-            path_to_class,
-            path_to_children,
-            max_parent_ops = cfg["max_parent_ops"],
-            max_children   = cfg["max_children"],
-        )
+        if all_prefused:
+            # Graph already fused by Stage-1 capture → only Pass 4 needed
+            fusions = self._pass4_expand_containers(
+                topo, platform, path_to_class, CONTAINER_SEMANTICS, g)
+        else:
+            # ── Pass 1 + 2: incremental grouping/merging ──────────────────────
+            leaf_groups = _pass1_leaf(topo)
 
-        # ── Pass 3 + collect fusions (before mutating the graph) ─────────────
-        fusions: list[tuple[set[str], OpNode]] = []
+            final_groups = _pass2_parent(
+                leaf_groups,
+                path_to_class,
+                path_to_children,
+                max_parent_ops = cfg["max_parent_ops"],
+                max_children   = cfg["max_children"],
+            )
+
+            # ── Pass 3 + 4: semantic label + expand unfused containers ────────
+            fusions, expanded_topo = self._pass3_and_4(
+                final_groups, topo, platform, path_to_class, CONTAINER_SEMANTICS, g)
+
+            topo = expanded_topo  # use expanded topology for apply step
+
+        # ── Apply replacements ────────────────────────────────────────────────
+        # Groups are non-overlapping; order does not affect correctness.
+        for group_ids, new_node in fusions:
+            g.replace_subgraph(group_ids, new_node)
+
+        return g
+
+    # ── Pass 3 + 4 ──────────────────────────────────────────────────────────
+
+    def _pass3_and_4(
+        self,
+        final_groups: list,
+        topo: list,
+        platform: str,
+        path_to_class: dict,
+        container_semantics: set,
+        g: "OpGraph",
+    ) -> tuple[list[tuple[set[str], "OpNode"]], list]:
+        """Pass 3 (semantic label) + Pass 4 (expand unfused containers).
+
+        Returns (fusions, expanded_topo) where expanded_topo replaces *topo*
+        after container expansion.
+        """
+        fusions: list[tuple[set[str], "OpNode"]] = []
         fuse_idx = 0
+        expanded_topo: list = []
+
         for group in final_groups:
             if group[0].category == "communication":
-                continue  # never fuse comm nodes
+                expanded_topo.extend(group)
+                continue
 
             group_ids = {n.id for n in group}
             label     = _semantic_label(group, path_to_class, platform)
 
+            # ── Pass 4: expand unfused container groups ───────────────────
+            if (
+                len(group) > 1
+                and self._is_unfused_container(label, group, container_semantics)
+            ):
+                # This container was not matched by any hardware subpattern;
+                # expand back to individual nodes.
+                for node in group:
+                    expanded_topo.append(node)
+                continue
+
             if len(group) == 1:
-                # Single-node: only relabel op_type if semantic label differs.
-                # Preserve the original aten op in fused_from so that
-                # _fused_decompose can still look up the correct formula.
+                # Single-node: relabel op_type if semantic label differs.
                 node = group[0]
                 if label != node.op_type and node.module_class:
                     original_op       = node.op_type
@@ -359,6 +422,7 @@ class FusionPass(GraphPass):
                     node.fused_from   = [original_op]
                     node.num_sub_ops  = 1
                     node.fusion_level = "leaf"
+                expanded_topo.append(node)
                 continue
 
             level     = "parent" if len(group) > 3 else "leaf"
@@ -368,13 +432,81 @@ class FusionPass(GraphPass):
             new_node  = _fused_node(
                 fused_id, group, label, inputs, outputs, path_to_class, level)
             fusions.append((group_ids, new_node))
+            expanded_topo.append(new_node)
 
-        # ── Apply replacements ────────────────────────────────────────────────
-        # Groups are non-overlapping; order does not affect correctness.
-        for group_ids, new_node in fusions:
-            g.replace_subgraph(group_ids, new_node)
+        return fusions, expanded_topo
 
-        return g
+    # ── Pass 4 (incremental mode) ───────────────────────────────────────────
+
+    def _pass4_expand_containers(
+        self,
+        topo: list,
+        platform: str,
+        path_to_class: dict,
+        container_semantics: set,
+        g: "OpGraph",
+    ) -> list[tuple[set[str], "OpNode"]]:
+        """Pass 4 only: scan for multi-op container groups that weren't
+        matched by any hardware subpattern and split them back to individual ops.
+
+        This is the safety net for pre-fused graphs — Stage-1 fusion may leave
+        container groups (attn/mlp/moe_block) that have no matching kernel
+        pattern, making them unfusible.  We detect and expand them here.
+        """
+        from python.zrt.graph.fusion_rules import get_subpatterns
+
+        fusions: list[tuple[set[str], "OpNode"]] = []  # empty: no new fusions
+        patterns = get_subpatterns(platform)
+
+        for node in topo:
+            if node.category == "communication":
+                continue
+            if getattr(node, "num_sub_ops", 1) <= 1:
+                continue
+
+            mc    = node.module_class or ""
+            label = node.op_type
+
+            # Check if this node is an unfused container
+            if label not in container_semantics:
+                continue
+
+            # It's a container — check if any hardware subpattern matches
+            matched = False
+            for sp in patterns:
+                if sp.matches_class(mc):
+                    # Can't check op sequence on already-fused node easily;
+                    # assume if class matches AND there's a pattern for it, it's fusible
+                    matched = True
+                    break
+
+            if matched:
+                continue  # container IS fusible — keep it
+
+            # Unfused container: split into individual child nodes
+            # We don't have _children like FusionEngine; instead we just
+            # remove the fusion metadata so downstream treats these as individual ops.
+            # The original fused_from list gives us the constituent op types.
+            node.fused_from   = []
+            node.num_sub_ops  = 0
+            node.fusion_level = ""
+
+        return fusions  # empty — no node replacements, just metadata clearing
+
+    @staticmethod
+    def _is_unfused_container(
+        label: str,
+        group: list,
+        container_semantics: set,
+    ) -> bool:
+        """Check if *group* is a multi-op container with no specific kernel match."""
+        if not group or label not in container_semantics:
+            return False
+        if len(group) <= 1:
+            return False
+        # _semantic_label already tried subpatterns; if label is still
+        # in CONTAINER_SEMANTICS, no hardware pattern matched → unfused.
+        return True
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

@@ -230,6 +230,7 @@ def _make_fused_entry(
         "input_dtypes":  first["input_dtypes"],
         "output_shapes": last["output_shapes"],
         "output_dtypes": last["output_dtypes"],
+        "component":     first.get("component", ""),
         **io,
         "_children":     ops,
     }
@@ -323,6 +324,7 @@ def _merge_add_norm(
         "input_dtypes":  g_add["input_dtypes"],
         "output_shapes": g_norm["output_shapes"],
         "output_dtypes": g_norm["output_dtypes"],
+        "component":     g_add.get("component", ""),
         **io,
         "_children":     all_ops,
     }
@@ -369,6 +371,7 @@ def _make_individual_entry(op: Dict[str, Any]) -> Dict[str, Any]:
         "input_dtypes":  op["input_dtypes"],
         "output_shapes": op["output_shapes"],
         "output_dtypes": op["output_dtypes"],
+        "component":     op.get("component", ""),
         **io,
         "_children":     [op],
     }
@@ -605,6 +608,19 @@ class FusionEngine:
                 return False
             if parent_total_ops.get(parent, 0) > self._max_parent_ops:
                 return False
+            # Rule 1: root-level modules (scope has no parent) are structural
+            # wrappers (the model itself), never computational kernels.
+            if not _parent_path(parent):
+                return False
+            # Rule 2: if any child scope is itself a container with
+            # sub-children, the parent is a structural wrapper
+            # (e.g. DeepseekV3DecoderLayer wraps self_attn + mlp + norms),
+            # not a fusible kernel.
+            if any(
+                child in self._tracker.path_to_children
+                for child in children
+            ):
+                return False
             return True
 
         result: List[Dict[str, Any]] = []
@@ -656,6 +672,7 @@ class FusionEngine:
                         "input_dtypes":  merged_ops[0]["input_dtypes"],
                         "output_shapes": merged_ops[-1]["output_shapes"],
                         "output_dtypes": merged_ops[-1]["output_dtypes"],
+                        "component":     merged_ops[0].get("component", groups[i].get("component", "")),
                         **io,
                         "_children":     merged_ops,
                     })
