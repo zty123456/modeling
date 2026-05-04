@@ -359,6 +359,28 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     if raw_bwd is None:
         logger.warning("No train_backward graph captured; backward metrics will use forward-only fallback.")
 
+    # Load model config for MoE sizing (active experts, total experts)
+    _moe_active = 1
+    _moe_total = 0
+    try:
+        import json as _json3
+        _cfg_path = Path(model_id) / "config.json"
+        if not _cfg_path.is_absolute():
+            _cfg_path = Path.cwd() / _cfg_path
+        if _cfg_path.exists():
+            with open(_cfg_path) as _f:
+                _raw_cfg = _json3.load(_f)
+            _moe_active = _raw_cfg.get("num_experts_per_tok", 0) or _raw_cfg.get(
+                "moe_topk", 0) or _raw_cfg.get("top_k", 0) or 1
+            _moe_total = _raw_cfg.get("n_routed_experts", 0) or _raw_cfg.get(
+                "num_local_experts", 0) or 0
+            if _moe_active > 1:
+                logger.info(
+                    "MoE config: %d total experts, %d active per token",
+                    _moe_total, _moe_active)
+    except Exception as _exc:
+        logger.warning("Could not read MoE config: %s", _exc)
+
     report, ctx, transformed = estimate_training_from_graphs(
         forward_graph=raw_fwd,
         backward_graph=raw_bwd,
@@ -382,6 +404,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         global_batch=args.global_batch,
         return_transformed=True,
         quant=args.quant,
+        moe_total_experts=_moe_total,
+        moe_active_experts=_moe_active,
     )
 
     try:

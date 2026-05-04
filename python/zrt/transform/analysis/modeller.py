@@ -45,6 +45,8 @@ def estimate_training_from_graphs(
     vpp_chunks: int = 1,
     return_transformed: bool = False,
     quant: str | None = None,
+    moe_total_experts: int = 0,
+    moe_active_experts: int = 1,
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -69,6 +71,10 @@ def estimate_training_from_graphs(
         "num_layers_traced": num_layers,
         "hidden": hidden,
     }
+    if moe_total_experts > 0:
+        metadata["moe_total_experts"] = moe_total_experts
+    if moe_active_experts > 1:
+        metadata["moe_active_experts"] = moe_active_experts
     if total_params is not None:
         metadata["total_params"] = int(total_params)
     if model_type is not None:
@@ -98,6 +104,15 @@ def estimate_training_from_graphs(
         ),
         quant=quant_cfg,
     )
+
+    # Attach MoE profile to ctx so ExpertParallelPass and other MoE-aware
+    # passes can read expert counts.
+    if moe_total_experts > 0:
+        from types import SimpleNamespace
+        ctx.profile = SimpleNamespace(
+            num_experts=moe_total_experts,
+            moe_active=moe_active_experts,
+        )
 
     pipe = build_default_pipeline()
     results: dict[str, "OpGraph"] = {}

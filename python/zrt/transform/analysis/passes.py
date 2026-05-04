@@ -32,15 +32,32 @@ class FlopsPass(GraphPass):
 
     name = "flops"
 
+    # Scope substrings that identify individual expert computation.
+    _EXPERT_KEYWORDS = ("experts.", "expert_", ".experts[")
+
+    @staticmethod
+    def _is_expert_scope(scope: str) -> bool:
+        s = scope.lower()
+        return any(k in s for k in FlopsPass._EXPERT_KEYWORDS)
+
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         from python.zrt.simulator.backends.roofline import RooflineSimulator
         sim = RooflineSimulator()
         g = graph.clone()
 
         is_train = ctx.training is not None
+        moe_scale = graph.metadata.get("moe_active_experts", 1)
 
         for node in g.nodes.values():
             flops, read_b, write_b = sim._fmr(node)
+
+            # MoE expert scaling: captured graph has only 1 expert's ops,
+            # but real model activates moe_active_experts per token.
+            if moe_scale > 1 and node.scope and self._is_expert_scope(node.scope):
+                flops = int(flops * moe_scale)
+                read_b = int(read_b * moe_scale)
+                write_b = int(write_b * moe_scale)
+
             node.annotations["flops"]       = int(flops)
             node.annotations["read_bytes"]  = int(read_b)
             node.annotations["write_bytes"] = int(write_b)
