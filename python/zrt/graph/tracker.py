@@ -21,6 +21,7 @@ class ModuleTracker:
         self.path_to_children: Dict[str, List[str]] = {}
         self._forward_depth: int = 0       # >0 while inside a module forward
         self._in_backward_phase: bool = False  # set externally before loss.backward()
+        self._pre_backward_module: str = ""    # module path at backward entry
         self._bwd_expected_pop: int = 0    # pending backward post-hook pops
         self._install(root, "")
 

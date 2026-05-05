@@ -103,6 +103,28 @@ def build_report_context(
         rc.blocks_bwd = _build_phase_filtered_blocks(
             graph, sim_results, "bwd", phase, profile)
 
+    # ── KPI correction for partial-trace layer scaling ───────────────────────
+    # When only N layers were traced but the full model has M > N layers,
+    # _build_blocks scales block.total_ms by real_repeat to represent the full
+    # model.  The timeline-derived tpot_ms / prefill_ms still reflects the N-layer
+    # traced graph, causing the header KPI to disagree with the block breakdown.
+    # Bring them into sync: use full_model_total_ms (sum of scaled blocks) as
+    # the canonical latency estimate.
+    _layer_scale = graph.metadata.get("layer_scale", 1.0)
+    if _layer_scale > 1.0 and rc.blocks:
+        _full_model_total_ms = sum(bd.total_ms for bd in rc.blocks)
+        if _full_model_total_ms > 0:
+            _latency_s = _full_model_total_ms * 1e-3
+            if rc.tpot_ms is not None:
+                rc.tpot_ms = _full_model_total_ms
+                rc.tokens_per_sec = rc.batch_size / _latency_s if _latency_s > 0 else 0.0
+            elif rc.prefill_ms is not None:
+                rc.prefill_ms = _full_model_total_ms
+                rc.tokens_per_sec = (
+                    rc.batch_size * (rc.seq_len or 1) / _latency_s
+                    if _latency_s > 0 else 0.0
+                )
+
     # ── Phase 4: calibration / references / warnings ──────────────────────────
     _build_calibration(rc, graph, sim_results, profile)
     _build_references(rc, model, hardware, hw_spec)
@@ -745,21 +767,31 @@ def _block_display_name(
 
     # Layer blocks (numeric)
     if hn.name.isdigit():
-        # Check if it's MoE by looking for expert scopes in children
+        layer_idx = int(hn.name)
+
+        # Architecture-aware: profile's per-layer indices take precedence over
+        # all heuristics (prevents first_k_dense layers from being mis-labelled
+        # as MoEBlock in mixed-architecture models like DeepSeek-V3).
+        if profile:
+            _sparse = getattr(profile, "sparse_layer_indices", None)
+            _dense = getattr(profile, "dense_layer_indices", None)
+            if _sparse is not None or _dense is not None:
+                if _sparse and layer_idx in _sparse:
+                    return "MoEBlock"
+                return "TransformerBlock"
+
+        # Fallback heuristics (used when profile has no per-layer info)
         for child in hn.children:
             if "expert" in child.name.lower() or "moe" in child.name.lower():
                 return "MoEBlock"
-        # Check scope itself for MoE indicators
         if "moe" in scope:
             return "MoEBlock"
-        # Check leaf node module_classes for MoE/expert patterns
         for nid in hn.all_leaf_ids()[:10]:
             node = graph.nodes.get(nid)
             if node and node.module_class:
                 mc = node.module_class.lower()
                 if any(kw in mc for kw in ("moe", "expert", "sparse", "gate", "router")):
                     return "MoEBlock"
-        # Check profile
         if profile and getattr(profile, "is_moe", False):
             return "MoEBlock"
         return "TransformerBlock"

@@ -391,6 +391,7 @@ def _trace_phase(
                 output = model(**forward_kwargs)
                 if phase == "train_backward":
                     tracker._forward_depth = 0       # reset any accumulated state
+                    tracker._pre_backward_module = tracker.current_module  # snapshot stale module
                     tracker._in_backward_phase = True
                     recorder.active = True  # start capturing backward ops
                     logits = getattr(output, "logits", None)
@@ -728,7 +729,13 @@ def _save_phase_outputs(
     graph_name = f"{slug}_{phase}"
     raw_opgraph = records_to_opgraph(records, name=graph_name, phase=phase)
 
-    fusion_engine = FusionEngine(tracker, platform=platform, debug=fusion_debug)
+    # Limit leaf fusion for backward graphs where module_path attribution
+    # is unreliable (forward hooks don't fire during backward()).
+    _is_bwd = phase in ("train_backward", "backward")
+    _max_leaf = 15 if _is_bwd else 0  # 0 = unlimited for forward
+    fusion_engine = FusionEngine(
+        tracker, platform=platform, debug=fusion_debug,
+        max_leaf_ops=_max_leaf)
     fused_with_children = fusion_engine.fuse_keep_children(records)
     fused_opgraph = fused_records_to_opgraph(
         fused_with_children, name=f"{graph_name}_fused", phase=phase

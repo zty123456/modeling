@@ -884,3 +884,93 @@ def test_pp_routing_basic():
     assert any_bwd_with_preds, (
         "No bwd node in any stage has an intra-stage predecessor — cross-graph edges lost"
     )
+
+
+# ── run_trace_phases auto-stitch tests ───────────────────────────────────────
+
+def _make_trace_phase_result(fwd_graph, bwd_graph):
+    """Build a TracePhaseResult as run_trace_phases would for training phases."""
+    import tempfile, json
+    from pathlib import Path
+    from python.zrt.graph.main import TracePhaseResult, _save_stitched_graph
+    from python.zrt.ir.adapter import stitch_fwd_bwd
+
+    stitched_raw   = stitch_fwd_bwd(fwd_graph, fwd_graph, name="test_train_raw")
+    stitched_fused = stitch_fwd_bwd(fwd_graph, bwd_graph, name="test_train_fused")
+    all_graphs = {
+        "train_forward":  (fwd_graph, fwd_graph),
+        "train_backward": (bwd_graph, bwd_graph),
+        "train":          (stitched_raw, stitched_fused),
+    }
+    return all_graphs, stitched_fused
+
+
+def test_auto_stitch_graphs_key_present():
+    """TracePhaseResult must expose result.graphs['train'] when both training phases captured."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    all_graphs, stitched = _make_trace_phase_result(fwd, bwd)
+
+    assert "train" in all_graphs, "Auto-stitch must create graphs['train']"
+    _, fused = all_graphs["train"]
+    assert fused.phase == "train"
+
+
+def test_auto_stitch_node_count():
+    """Stitched graph must contain all forward + backward nodes."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    _, stitched = _make_trace_phase_result(fwd, bwd)
+
+    fwd_count = len(fwd.nodes)
+    bwd_count = len(bwd.nodes)
+    assert len(stitched.nodes) == fwd_count + bwd_count, (
+        f"Expected {fwd_count + bwd_count} nodes, got {len(stitched.nodes)}"
+    )
+
+
+def test_auto_stitch_phase_annotations_complete():
+    """Every node in the stitched graph must carry annotations['phase']."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    _, stitched = _make_trace_phase_result(fwd, bwd)
+
+    for nid, node in stitched.nodes.items():
+        phase = node.annotations.get("phase")
+        assert phase in ("fwd", "bwd"), (
+            f"Node {nid} has unexpected phase annotation: {phase!r}"
+        )
+
+
+def test_auto_stitch_separates_fwd_and_bwd():
+    """Separate forward/backward graphs must still be accessible after stitch."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    all_graphs, _ = _make_trace_phase_result(fwd, bwd)
+
+    assert "train_forward"  in all_graphs
+    assert "train_backward" in all_graphs
+    raw_fwd, fused_fwd = all_graphs["train_forward"]
+    raw_bwd, fused_bwd = all_graphs["train_backward"]
+    assert raw_fwd.phase == "train_forward" or raw_fwd is fwd
+    assert raw_bwd.phase == "train_backward" or raw_bwd is bwd
+
+
+def test_save_stitched_graph_writes_json(tmp_path):
+    """_save_stitched_graph must write a valid JSON file."""
+    import json
+    from python.zrt.graph.main import _save_stitched_graph
+    from python.zrt.ir.adapter import stitch_fwd_bwd
+
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    stitched = stitch_fwd_bwd(fwd, bwd, name="test_stitch")
+
+    _save_stitched_graph(stitched, slug="testmodel", output_dir=tmp_path)
+
+    json_path = tmp_path / "testmodel_train_stitched_graph.json"
+    assert json_path.exists(), f"Expected {json_path} to be created"
+
+    data = json.loads(json_path.read_text())
+    assert data["phase"] == "train"
+    assert len(data["nodes"]) == len(fwd.nodes) + len(bwd.nodes)

@@ -423,7 +423,7 @@ class FusionEngine:
     """
 
     def __init__(self, tracker: ModuleTracker, platform: str = "generic",
-                 debug: bool = False):
+                 debug: bool = False, max_leaf_ops: int = 0):
         self._tracker  = tracker
         self._platform = platform
         self._debug    = debug
@@ -431,6 +431,7 @@ class FusionEngine:
         self._max_parent_ops  = cfg["max_parent_ops"]
         self._max_children    = cfg["max_children"]
         self._add_norm_fusion = cfg["add_norm_fusion"]
+        self._max_leaf_ops    = max_leaf_ops  # 0 = unlimited
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -565,16 +566,25 @@ class FusionEngine:
     def _pass1_leaf(
         self, records: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Group consecutive records with the same module_path + layer."""
+        """Group consecutive records with the same module_path + layer.
+
+        For backward-pass records where module_path attribution may be
+        unreliable, leaf groups are capped at ``_max_leaf_ops`` to prevent
+        unrelated ops (e.g. attention backward, RoPE, reshapes) from being
+        fused into a single mis-labelled kernel (e.g. everything tagged as
+        ``moe_gate``).
+        """
         if not records:
             return []
+        max_leaf = getattr(self, '_max_leaf_ops', 0) or 60
         groups       = []
         current_group = [records[0]]
         for rec in records[1:]:
             same_path  = rec["module_path"] == current_group[0]["module_path"]
             same_layer = rec["layer"]       == current_group[0]["layer"]
             has_path   = rec["module_path"] != ""
-            if same_path and same_layer and has_path:
+            would_exceed = len(current_group) >= max_leaf
+            if same_path and same_layer and has_path and not would_exceed:
                 current_group.append(rec)
             else:
                 groups.append(

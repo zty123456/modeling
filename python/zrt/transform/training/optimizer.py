@@ -58,8 +58,15 @@ class OptimizerPass(GraphPass):
         if not has_backward and not graph_phase:
             return g
 
-        # Calculate total parameters on rank using graph parameter count
+        # Calculate total parameters on rank using graph parameter count.
+        # If total_params is not in metadata (no explicit override), apply layer_scale
+        # from num_layers/num_layers_traced so state_bytes reflects the full model.
         total_params = count_params(g)
+        if g.metadata.get("total_params", 0) == 0:
+            _nl = g.metadata.get("num_layers", 0)
+            _nlt = g.metadata.get("num_layers_traced", _nl)
+            if _nlt > 0 and _nl != _nlt:
+                total_params = int(total_params * (_nl / _nlt))
         tp = ctx.parallel.tp if ctx.parallel else 1
         dp = ctx.parallel.dp if ctx.parallel else 1
         pp = ctx.parallel.pp if ctx.parallel else 1

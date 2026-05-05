@@ -645,17 +645,27 @@ def _elementwise(node: "OpNode", ops_per_elem: float = 1.0) -> FMR:
 
 def _embedding(node: "OpNode") -> FMR:
     """aten.embedding.default / embedding / embedding_backward
-    FLOPs = 0  (纯查表, 无算术运算)
-    R=|output|·b   W=|output|·b   (cache-miss dominated random reads)
+    FLOPs = 0  (pure table lookup, no arithmetic)
+    R = weight_bytes + index_bytes + output_bytes
+    W = output_bytes
     """
     if not node.outputs:
         return _default(node)
     out = node.outputs[0]
-    n = _numel(out.shape)
     it = out.dtype.itemsize
     flops = 0.0
-    read  = n * it
-    write = n * it
+    # Weight read (input 0 is the embedding weight): full table load
+    weight_read = 0.0
+    if len(node.inputs) >= 1:
+        weight_read = _numel(node.inputs[0].shape) * node.inputs[0].dtype.itemsize
+    # Index read (input 1): negligible but accounted
+    index_read = 0.0
+    if len(node.inputs) >= 2:
+        index_read = _numel(node.inputs[1].shape) * node.inputs[1].dtype.itemsize
+    # Output write: indexed rows only
+    write = _numel(out.shape) * it
+    # Total read: weight + indices + output
+    read = weight_read + index_read + write
     return flops, read, write
 
 

@@ -175,20 +175,22 @@ class TrainingMemoryPass(GraphPass):
         pp = ctx.parallel.pp if ctx.parallel else 1
 
         # ── Weight / grad / opt-state sharding ──────────────────────────────
-        # All three buckets shrink by tp (TP splits weight matrices).
-        # DP sharding is read from metadata (set by ZeroFSDPPass) or derived
-        # from zero_stage for standalone calls.
+        # Weight and grad buckets shrink by pp (each stage holds 1/pp layers),
+        # tp (tensor parallel splits matrices), and DP for ZeRO-2/3.
+        # opt_shard is kept pp-free because the fallback formula handles pp
+        # separately via total_params_for_opt, and opt_state_from_graph path
+        # uses dp_for_opt directly (not opt_shard).
         zero_meta = g.metadata.get("zero")
         if zero_meta is not None:
-            weight_shard = zero_meta["weight_shard"] * tp
-            grad_shard = zero_meta["grad_shard"] * tp
-            opt_shard = zero_meta["optstate_shard"] * tp
+            weight_shard = zero_meta["weight_shard"] * tp * pp
+            grad_shard = zero_meta["grad_shard"] * tp * pp
+            opt_shard = zero_meta["optstate_shard"] * tp  # pp handled by total_params_for_opt
         else:
             zero_stage = ctx.training.zero_stage if ctx.training else 0
             dp_factor = dp if zero_stage >= 1 else 1
-            weight_shard = tp * (dp if zero_stage >= 3 else 1)
-            grad_shard = tp * (dp if zero_stage >= 2 else 1)
-            opt_shard = tp * dp_factor
+            weight_shard = pp * tp * (dp if zero_stage >= 3 else 1)
+            grad_shard = pp * tp * (dp if zero_stage >= 2 else 1)
+            opt_shard = tp * dp_factor  # pp handled by total_params_for_opt
 
         weights_bytes = (total_params * param_dtype) / weight_shard
         grads_bytes = (total_params * param_dtype) / grad_shard
@@ -202,9 +204,11 @@ class TrainingMemoryPass(GraphPass):
                 break
 
         if opt_state_from_graph is not None:
-            # Use OptimizerPass annotation (already has TP/PP/DP sharding applied)
-            # Only need to apply ZeRO opt-state sharding
-            opt_bytes = opt_state_from_graph / opt_shard
+            # state_bytes from OptimizerPass already accounts for TP, PP, and
+            # (for ZeRO-3) DP sharding.  Only apply the ZeRO-1/2 DP sharding.
+            zero_stage = ctx.training.zero_stage if ctx.training else 0
+            dp_for_opt = dp if (1 <= zero_stage < 3) else 1
+            opt_bytes = opt_state_from_graph / dp_for_opt
         else:
             # Fallback: independent calculation (backward compatibility)
             optimizer = ctx.training.optimizer if ctx.training else "adam"
@@ -608,14 +612,14 @@ class TrainingPipelinePass(GraphPass):
         step_time_sec = step_time_us / 1e6
         peak_flops_total = world_size * peak_flops_per_gpu
 
-        # MFU: model FLOPs only (excludes recompute overhead)
+        # MFU/HFU: per-GPU utilization = (FLOPs per GPU per step) / (peak_per_gpu × step_time)
+        # training_flops is per micro-batch; multiply by num_microbatches for full step.
+        # Use per-GPU peak (not cluster total) so result is per-device utilization.
         from python.zrt.training.compose.schedules import util_from_flops
         recompute_flops = float(g.metadata.get("recompute_flops", 0))
         model_flops = training_flops - recompute_flops
-        mfu = util_from_flops(model_flops, peak_flops_total, step_time_sec)
-
-        # HFU: all executed FLOPs including recompute
-        hfu = util_from_flops(training_flops, peak_flops_total, step_time_sec)
+        mfu = util_from_flops(model_flops * num_microbatches, peak_flops_per_gpu, step_time_sec)
+        hfu = util_from_flops(training_flops * num_microbatches, peak_flops_per_gpu, step_time_sec)
 
         metrics = PipelineStepMetrics(
             step_time_ms=step_time_ms,

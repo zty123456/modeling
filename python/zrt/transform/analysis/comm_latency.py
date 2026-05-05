@@ -124,7 +124,8 @@ class CommLatencyPass(GraphPass):
             else:
                 link = hw_spec.interconnect.intra_node
 
-            # Compute bandwidth in bytes/second
+            # bandwidth_gbps is aggregate GB/s; divide by 8 to convert to per-GPU
+            # B/s (matching ring-algorithm effective per-GPU bandwidth)
             bandwidth_bps = link.bandwidth_gbps * 1e9 / 8.0
 
             # Estimate latency
