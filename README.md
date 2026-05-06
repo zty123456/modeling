@@ -25,6 +25,8 @@ HF config.json (几 KB)
 
 ## 安装
 
+### 核心依赖
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -33,12 +35,25 @@ pip install -r requirements.txt
 
 ```
 torch>=2.0.0
-transformers>=4.36.0,<5.0.0
+transformers>=4.36.0
 openpyxl>=3.1.0
 onnx>=1.14.0
 ```
 
-> **Python 版本**：已在 Python 3.14 + torch 2.11.0 + transformers 4.57.6 上验证。
+> **Python 版本**：已在 Python 3.14 + torch 2.11.0 + transformers 5.4.0 上验证。
+
+### HTTP 服务额外依赖
+
+```bash
+pip install -r server/requirements.txt
+```
+
+`server/requirements.txt` 内容：
+
+```
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+```
 
 ---
 
@@ -149,6 +164,242 @@ output_dir, records = run_trace(
     num_layers=4,
     phase="prefill",
 )
+```
+
+---
+
+## HTTP 服务接口
+
+将 CLI 的三种运行模式封装为 RESTful 服务，所有耗时任务（图捕获、性能建模、网格搜索）均以**异步后台任务**运行，提交后立即返回 `job_id`，通过轮询获取结果。
+
+### 启动服务
+
+```bash
+# 从项目根目录启动（默认 8000 端口）
+uvicorn server.main:app --host 0.0.0.0 --port 8000
+
+# 开发模式（自动重载）
+uvicorn server.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+启动后访问交互式 API 文档：`http://localhost:8000/docs`
+
+### 接口总览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/health` | 服务状态检查 |
+| `GET` | `/hardware` | 可用硬件规格列表 |
+| `GET` | `/models` | 本地模型简写列表（可用于 `local:<name>`） |
+| `GET` | `/jobs` | 全部任务列表 |
+| `GET` | `/jobs/{job_id}` | 轮询任务状态与结果 |
+| `POST` | `/trace` | 提交图捕获任务（可选接性能建模） |
+| `POST` | `/estimate` | 提交 Spec-based 训练估算任务 |
+| `POST` | `/search` | 提交并行策略网格搜索任务 |
+
+所有 `POST` 接口返回 HTTP 202，响应体包含 `job_id`。任务完成后 `status` 字段由 `"running"` 变为 `"done"` 或 `"error"`。
+
+### `/trace` — 图捕获 + 性能建模
+
+等价 CLI：`python -m python.zrt --model-id ... --layers ... [--hw ...]`
+
+**请求参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model_id` | string | **必填** | HF Hub ID、本地路径，或 `local:<name>`（如 `local:v3`） |
+| `layers` | int | `4` | 追踪的 Transformer Block 数 |
+| `batch_size` | int | `1` | 批次大小 |
+| `seq_len` | int | `128` | prefill 序列长度 |
+| `phases` | list[str] | `["prefill","decode"]` | `prefill`/`decode`/`train_forward`/`train_backward` |
+| `train` | bool | `false` | 等价于 `phases=["train_forward","train_backward"]` |
+| `hw` | string | — | 硬件规格（触发性能报告，如 `nvidia_h100_sxm`） |
+| `tp/pp/ep/dp/cp` | int | `1` | 各维并行度 |
+| `quant` | string | — | `int4`/`int8`/`fp8` |
+| `platform` | string | `generic` | `cuda`/`ascend_npu`/`cpu`/`generic` |
+| `graph_mode` | bool | `false` | 使用 `torch.compile` 图模式 |
+| `gradient_checkpointing` | bool | `false` | 启用激活重计算 |
+| `output_dir` | string | — | 输出目录（默认 `output/<slug>`） |
+| `target_layers` | string | — | 指定层号，逗号分隔（如 `"0,3"`） |
+| `auto_layers` | bool | `true` | 自动选取首个密集层和首个 MoE 层 |
+| `zero_stage` | int | `1` | ZeRO 阶段 0–3（训练建模用） |
+| `optimizer` | string | `adam` | `adam`/`adamw`/`muon` |
+| `micro_batch` | int | `1` | 每 GPU micro-batch 大小 |
+| `global_batch` | int | `32` | 全局 batch 大小 |
+| `total_params` | float | — | 完整模型参数量（如 `671e9`） |
+| `hidden` | int | `7168` | 隐藏层维度（内存估算） |
+| `num_layers_full` | int | — | 完整模型总层数 |
+
+**示例：**
+
+```bash
+# 推理抓图（prefill + decode）
+curl -X POST http://localhost:8000/trace \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_id": "Qwen/Qwen2.5-7B-Instruct",
+    "layers": 4
+  }'
+
+# 推理抓图 + 性能建模（TP=8）
+curl -X POST http://localhost:8000/trace \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_id": "deepseek-ai/DeepSeek-V3-0324",
+    "layers": 4,
+    "hw": "nvidia_h100_sxm",
+    "tp": 8
+  }'
+
+# 训练建模（3D 并行）
+curl -X POST http://localhost:8000/trace \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_id": "local:v3",
+    "layers": 4,
+    "train": true,
+    "hw": "nvidia_h100_sxm",
+    "tp": 8,
+    "pp": 4,
+    "ep": 2,
+    "dp": 2,
+    "total_params": 671e9,
+    "num_layers_full": 61
+  }'
+```
+
+**响应体（提交时）：**
+
+```json
+{
+  "id": "3f8a2c1d-...",
+  "status": "pending",
+  "result": null,
+  "error": null,
+  "created_at": "2025-05-06T10:00:00+00:00",
+  "finished_at": null
+}
+```
+
+**结果体（完成时 `result` 字段）：**
+
+```json
+{
+  "output_dir": "output/Qwen2.5_7B_Instruct",
+  "phases": ["prefill", "decode"],
+  "summary": "..."
+}
+```
+
+### `/estimate` — Spec-based 训练估算
+
+等价 CLI：`python -m python.zrt --estimate-config <yaml>`
+
+提供 `config_path`（服务端文件路径）或 `config_content`（YAML 字符串）之一。
+
+```bash
+# 通过文件路径
+curl -X POST http://localhost:8000/estimate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "config_path": "python/zrt/training/configs/llama3_70b_3d.yaml"
+  }'
+
+# 通过内联 YAML（适合跨机器调用）
+curl -X POST http://localhost:8000/estimate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "config_content": "model:\n  name: llama3_70b\n..."
+  }'
+```
+
+**结果体：**
+
+```json
+{
+  "summary": "====================\nTraining Estimation...",
+  "data": {
+    "step_time_ms": 1234.5,
+    "mfu": 0.512,
+    "hfu": 0.538,
+    "memory": { "weights_gb": 140.0, "total_gb": 312.0 }
+  }
+}
+```
+
+### `/search` — 并行策略网格搜索
+
+等价 CLI：`python -m python.zrt --search-config <yaml>`
+
+```bash
+curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "config_path": "python/zrt/training/configs/llama3_70b_3d.yaml",
+    "output": "output/pareto_frontier.json"
+  }'
+```
+
+**结果体：**
+
+```json
+{
+  "total_configs": 128,
+  "pareto_count": 5,
+  "pareto_frontier": [
+    { "step_time_ms": 980.0, "mfu": 0.53, "hfu": 0.56, ... },
+    ...
+  ]
+}
+```
+
+### 轮询任务状态
+
+```bash
+# 轮询（替换为实际 job_id）
+curl http://localhost:8000/jobs/3f8a2c1d-...
+
+# 查询所有任务
+curl http://localhost:8000/jobs
+```
+
+**`status` 字段取值：**
+
+| 值 | 含义 |
+|----|------|
+| `pending` | 已提交，等待执行 |
+| `running` | 正在执行 |
+| `done` | 执行完成，`result` 有效 |
+| `error` | 执行失败，`error` 字段包含错误信息 |
+
+### Python 客户端示例
+
+```python
+import time
+import requests
+
+BASE = "http://localhost:8000"
+
+# 提交任务
+resp = requests.post(f"{BASE}/trace", json={
+    "model_id": "Qwen/Qwen2.5-7B-Instruct",
+    "layers": 4,
+    "hw": "nvidia_h100_sxm",
+    "tp": 4,
+})
+job_id = resp.json()["id"]
+
+# 轮询直到完成
+while True:
+    job = requests.get(f"{BASE}/jobs/{job_id}").json()
+    if job["status"] in ("done", "error"):
+        break
+    time.sleep(5)
+
+if job["status"] == "done":
+    print(job["result"]["summary"])
+else:
+    print("Failed:", job["error"])
 ```
 
 ---
@@ -606,8 +857,11 @@ transformers 4.50+ 的 RoPE 实现会将 tensor 的 device type 直接传给 `to
 
 ```
 modeling/
-├── test_shape_ops.py                # pytest 自验用例
-├── requirements.txt                 # 依赖声明
+├── requirements.txt                 # 核心依赖
+├── server/                          # HTTP 服务（FastAPI）
+│   ├── main.py                      # FastAPI 应用 + 路由 + 后台任务
+│   ├── schemas.py                   # Pydantic 请求/响应模型
+│   └── requirements.txt             # 服务依赖（fastapi + uvicorn）
 │
 ├── python/zrt/
 │   ├── __main__.py                  # CLI 入口: python -m python.zrt

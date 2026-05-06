@@ -2,6 +2,86 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+
+---
+
+## 核心原则（必读）
+
+1. **`hf_models/` 目录只读**：其中所有 `.py` 和 `.json` 文件必须完全来自 HF 官网下载，禁止在此目录内修改任何代码。
+   - 唯一例外：`config.json` 可添加 `auto_map` 字段（用于本地加载自定义架构），但需标注原因。
+   - 所有运行时兼容性修复必须写在 `python/zrt/graph/patches.py`，通过 monkey-patch 注入。
+
+2. **所有 patch 逻辑集中在 `patches.py`**：不得在 `model_loader.py`、`main.py` 或测试文件中散落 patch 代码。
+
+3. **FakeTensorMode 生命周期**：`load_model()` 返回 3-tuple `(model, config, fake_mode)`，
+   `fake_mode` 必须在 forward pass 期间保持激活，finally 块中调用 `fake_mode.__exit__(None, None, None)`。
+
+---
+
 ## Project Overview
 
 **ZRT-Sim** — an LLM performance modeling and simulation system. Captures the operator sequence of any HuggingFace causal LM using `TorchDispatchMode` inside `FakeTensorMode` (no weights or real memory needed), then applies parallelization transforms and simulates performance across hardware configurations.
@@ -181,6 +261,166 @@ Local model configs (no weights) live in `hf_models/` (deepseek_v3, llama3_8b, e
 **Training Memory Estimation**: Training memory calculation uses per-component formulas (weights, gradients, optimizer states, activations) with ZeRO staging (0-3) and gradient checkpointing support.
 
 **Recompute annotation flow**: `RecomputePass` (in `transform/training/recompute.py`) annotates forward-graph nodes with `node.annotations["recompute"] = True` scoped by `layer_kind`. Downstream, `TrainingFlopsPass` extracts `recompute_flops` from these annotations and `compose/pipeline.py::compute_hfu()` uses it to separate MFU from HFU.
+
+
+## 环境
+
+- Python 3.14, torch 2.11.0, transformers 5.4.0
+- 主工作目录：`D:\workspace\claude\modeling`
+- 运行时使用 `python -m pytest` 或直接 `pytest`
+- CLI 入口：`python -m python.zrt.graph.main <model_id> --layers 4`
+
+
+## 执行要求
+- 每次执行记得查看.clauderules的要求
+## 关键文件速查
+
+```
+python/zrt/graph/
+├── compat.py         # transformers 版本 shim + 本地模型注册表（新）
+├── patches.py        # 运行时 patch（MoE、Indexer、legacy 属性）
+├── model_loader.py   # 分层加载器：load_model() -> (model, config, fake_mode)
+├── main.py           # run_trace() 入口 + CLI
+├── dispatch.py       # RecordingDispatch + TensorTracker（aten 拦截）
+├── tracker.py        # ModuleTracker（forward hooks，模块路径）
+├── fusion.py         # FusionEngine（两阶段算子融合）
+├── classifier.py     # 组件分类 + 颜色映射
+├── excel_writer.py   # Excel + JSON 输出
+├── graph_builder.py  # build_op_graph / build_fused_op_graph
+├── graph_exporter.py # export_all() -> JSON/ONNX
+└── __init__.py       # 公开 API 导出
+
+hf_models/            # 只读！来自 HF 官网
+├── deepseek_v3/      # config.json + modeling_deepseek.py + configuration_deepseek.py
+├── deepseek_v3_2/    # 同上（V3.2，含 Indexer 模块；config.json 加了 auto_map）
+├── llama3_8b/        # 仅 config.json（标准架构无需 modeling 文件）
+├── llama3_70b/
+├── qwen2_7b/
+├── qwen2_72b/
+├── mistral_7b/
+└── mixtral_8x7b/
+
+test_screenshot_ops.py   # 全量 pytest 测试
+```
+
+---
+
+## 核心 API
+
+### `load_model(model_id, num_hidden_layers=4)`
+```python
+from python.zrt.graph import load_model
+model, config, fake_mode = load_model("deepseek-ai/DeepSeek-V3-0324", num_hidden_layers=4)
+# fake_mode 已 __enter__，forward 结束后需手动 __exit__
+fake_mode.__exit__(None, None, None)
+```
+
+### `run_trace_phases(...)` ← 推荐：prefill + decode 一次完成
+```python
+from python.zrt.graph import run_trace_phases
+output_dir, phase_records = run_trace_phases(
+    model_id="deepseek-ai/DeepSeek-V3-0324",
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    output_dir="output/graph/DeepSeek-V3-0324",  # 可选
+    phases=("prefill", "decode"),                 # 默认同时抓两阶段
+)
+# phase_records["prefill"] / phase_records["decode"] → op-record 列表
+# 输出文件：
+#   DeepSeek_V3_0324_prefill_ops.xlsx / _prefill_raw_graph.json / .onnx / _prefill_fused_graph.*
+#   DeepSeek_V3_0324_decode_ops.xlsx  / _decode_raw_graph.json  / .onnx / _decode_fused_graph.*
+```
+
+### `run_trace(...)` ← 单阶段（向后兼容）
+```python
+from python.zrt.graph import run_trace
+output_dir, records = run_trace(
+    model_id="deepseek-ai/DeepSeek-V3-0324",
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    output_dir="output/graph/DeepSeek-V3-0324",  # 可选，默认 output/graph/<slug>
+    phase="prefill",   # "prefill"（默认）/ "decode" / "forward"（"prefill" 的别名）
+)
+```
+
+### Prefill vs Decode 输入差异
+
+| 参数 | Prefill | Decode |
+|------|---------|--------|
+| `input_ids` shape | `(B, seq_len)` | `(B, 1)` |
+| `position_ids` | `[[0..seq_len-1]]` | `[[seq_len]]` |
+| `attention_mask` | `(1,1,seq_len,seq_len)` causal | `(1,1,1,seq_len+1)` 全零 |
+| `past_key_values` | None | prefill 输出的 KV cache |
+| `use_cache` | True | True |
+
+两阶段在**同一 FakeTensorMode 上下文**内运行，prefill 的 FakeTensor KV cache 直接传给 decode。
+
+---
+
+## 版本自适应机制（compat.py）
+
+### 问题背景
+
+不同模型的 `modeling_*.py` 依赖写入时的 transformers 版本，升级后会出现：
+- `ImportError: cannot import name 'xxx' from 'transformers.utils'`（API 被移除）
+- `ValueError: does not recognize this architecture`（新架构未注册）
+
+### 解决方案（参考 vLLM/SGLang 设计）
+
+| 机制 | 作用 |
+|------|------|
+| **版本 shim**（`apply_version_shims()`）| 在模型文件 import 之前，向 `transformers.*` 注入被移除的符号 |
+| **本地注册表**（`_LOCAL_REGISTRY`）| `model_type` / Hub ID → `hf_models/` 目录映射 |
+| **分层加载**（`model_loader.py`）| Hub 加载失败时自动 fallback 到本地注册表 |
+
+### 已知 shim 清单
+
+| 符号 | 模块/类 | 变更版本 | 替代方案 |
+|------|---------|---------|---------|
+| `is_flash_attn_greater_or_equal_2_10` | `transformers.utils` | 5.x 移除 | `is_flash_attn_greater_or_equal("2.1.0")` |
+| `is_torch_fx_available` | `transformers.utils` | 部分 5.x 移除 | 返回 `True` |
+| `DynamicCache.from_legacy_cache` | `transformers.DynamicCache` | 5.x 移除 | 用 `update()` 逐层填充 |
+| `DynamicCache.to_legacy_cache` | `transformers.DynamicCache` | 5.x 移除 | 迭代 `layers[i].keys/values` |
+| `DynamicCache.get_usable_length` | `transformers.DynamicCache` | 5.x 重命名 | `get_seq_length(layer_idx)` |
+| `DynamicCache.seen_tokens` | `transformers.DynamicCache` | 5.x 移除 | `get_seq_length()` |
+| `DynamicCache.get_max_length` | `transformers.DynamicCache` | 5.x 移除 | 返回 `None`（无界缓存）|
+
+### 新增自定义架构
+
+1. 将模型文件放入 `hf_models/<name>/`（含 `auto_map` 的 `config.json`）
+2. 在 `compat._LOCAL_REGISTRY` 添加两条映射：`model_type` + Hub ID
+3. 如有 transformers API 兼容问题，在 `compat.apply_version_shims()` 添加 shim
+
+## patches.py 清单
+
+| 函数 | 作用 |
+|------|------|
+| `apply_compat_patches()` | 先调 `apply_version_shims()`，再补 legacy 属性 |
+| `patch_moe_for_fake(model)` | 替换 MoE forward，绕过 `.cpu().numpy()` / `torch.bincount()` |
+| `patch_indexer_for_fake(model)` | 修正 DeepSeek-V3.2 Indexer 的 3D tensor 错误 transpose |
+| `is_moe_module(module)` | 检测 MoE（有 `experts: nn.ModuleList` 且未被 patch）|
+| `patch_moe_for_meta` | 向后兼容别名 → `patch_moe_for_fake` |
+
+**Indexer patch 背景**：原始 `modeling_deepseek.py`（deepseek_v3_2）中
+`k_nope.transpose(1,2).transpose(2,3)` 对 3D tensor 非法，
+patch 在运行时替换 `Indexer.forward`，模型文件保持不变。
+
+---
+
+## 模型支持说明
+
+| 本地路径 | HF Hub ID | 备注 |
+|---------|-----------|------|
+| `hf_models/deepseek_v3` | `deepseek-ai/DeepSeek-V3` | MoE patch 必需 |
+| `hf_models/deepseek_v3_2` | `deepseek-ai/DeepSeek-V3.2` | MoE + Indexer patch|
+| — | `deepseek-ai/DeepSeek-V3-0324` | V3 的 3 月 24 日更新版，**不是** V3.2 |
+| `hf_models/llama3_8b` | `meta-llama/Llama-3.1-8B` | 需 HF 授权 |
+| `hf_models/qwen2_7b` | `Qwen/Qwen2.5-7B-Instruct` | — |
+| `hf_models/mixtral_8x7b` | `mistralai/Mixtral-8x7B-v0.1` | MoE patch |
+
+---
 
 ## Design Documentation
 
