@@ -892,7 +892,7 @@ def _make_trace_phase_result(fwd_graph, bwd_graph):
     """Build a TracePhaseResult as run_trace_phases would for training phases."""
     import tempfile, json
     from pathlib import Path
-    from python.zrt.graph.main import TracePhaseResult, _save_stitched_graph
+    from python.zrt.pipeline import TracePhaseResult, _save_stitched_graph
     from python.zrt.ir.adapter import stitch_fwd_bwd
 
     stitched_raw   = stitch_fwd_bwd(fwd_graph, fwd_graph, name="test_train_raw")
@@ -959,7 +959,7 @@ def test_auto_stitch_separates_fwd_and_bwd():
 def test_save_stitched_graph_writes_json(tmp_path):
     """_save_stitched_graph must write a valid JSON file."""
     import json
-    from python.zrt.graph.main import _save_stitched_graph
+    from python.zrt.pipeline import _save_stitched_graph
     from python.zrt.ir.adapter import stitch_fwd_bwd
 
     fwd = _captured_style_graph()

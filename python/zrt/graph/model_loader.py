@@ -37,7 +37,7 @@ Supports:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -50,6 +50,7 @@ from python.zrt.graph.patches import (
     patch_indexer_for_fake,
     patch_moe_for_fake,
     patch_moe_for_meta,  # backward-compat alias
+    patch_v4_inference_stubs,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,77 @@ def _normalize_config(config: Any) -> None:
     if isinstance(rs, dict) and "rope_type" in rs and "type" not in rs:
         rs["type"] = rs["rope_type"]
     config._attn_implementation = "eager"
+
+
+# ── Layer-type inference ─────────────────────────────────────────────────────
+
+def infer_layer_types(config: Any) -> Dict[str, List[int]]:
+    """Infer which transformer layers are dense vs. sparse (MoE) from config.
+
+    Handles three architectures without hard-coding model names:
+
+    * **DeepSeek-V3 / V3.2 style** — config has ``first_k_dense_replace`` and
+      (optionally) ``moe_layer_freq``:
+      layers ``[0, first_k_dense_replace)`` are dense; the remaining layers are
+      MoE when ``layer_idx % moe_layer_freq == 0``, otherwise dense.
+    * **Mixtral style** — config has ``num_local_experts`` (but no
+      ``first_k_dense_replace``): all layers are treated as MoE.
+    * **Standard dense models** — no MoE fields: all layers are dense.
+
+    The layer count is taken from ``config._full_num_hidden_layers`` when
+    available (set by :func:`load_model`), falling back to
+    ``config.num_hidden_layers``.
+
+    Returns
+    -------
+    {"dense": [layer_idx, ...], "sparse": [layer_idx, ...]}
+        Each list is sorted; together they cover every layer index.
+    """
+    total: int = (
+        getattr(config, "_full_num_hidden_layers", None)
+        or getattr(config, "num_hidden_layers", 0)
+    )
+
+    first_k_dense: Optional[int] = getattr(config, "first_k_dense_replace", None)
+    moe_layer_freq: int = getattr(config, "moe_layer_freq", 1) or 1
+    has_local_experts: bool = getattr(config, "num_local_experts", None) is not None
+    has_routed_experts: bool = getattr(config, "n_routed_experts", None) is not None
+
+    dense: List[int] = []
+    sparse: List[int] = []
+
+    if first_k_dense is not None:
+        for i in range(total):
+            if i < first_k_dense:
+                dense.append(i)
+            elif i % moe_layer_freq == 0:
+                sparse.append(i)
+            else:
+                dense.append(i)
+    elif has_local_experts or has_routed_experts:
+        sparse = list(range(total))
+    else:
+        dense = list(range(total))
+
+    return {"dense": dense, "sparse": sparse}
+
+
+def auto_target_layers(config: Any) -> List[int]:
+    """Return the representative layer indices to trace for this config.
+
+    Selects the **first dense layer** and the **first sparse (MoE) layer**
+    (when the model has MoE layers).  For purely dense models returns ``[0]``.
+    For all-MoE models returns ``[0]``.
+
+    The returned list is sorted and deduplicated.
+    """
+    types = infer_layer_types(config)
+    result: List[int] = []
+    if types["dense"]:
+        result.append(types["dense"][0])
+    if types["sparse"]:
+        result.append(types["sparse"][0])
+    return sorted(set(result)) or [0]
 
 
 # ── Error classification ──────────────────────────────────────────────────────
@@ -251,5 +323,6 @@ def load_model(
         patch_moe_for_fake(model)
         patch_indexer_for_fake(model)
         patch_hc_for_capture(model)
+        patch_v4_inference_stubs()
 
     return model, config, fake_mode

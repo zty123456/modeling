@@ -207,23 +207,31 @@ class SubPattern:
 
 
 def match_subsequence(op_names: List[str], pattern: List[str]) -> bool:
-    """Return True if *pattern* appears as a *contiguous* subsequence.
+    """Return True if *pattern* appears as an *ordered* subsequence.
 
-    Ops in PATTERN_SKIP are excluded from *op_names* before matching, so
-    shape/transparent ops between pattern elements do not break contiguity.
-    However, real compute ops (NOT in PATTERN_SKIP) MUST appear consecutively
-    — a pattern like ``[mm, softmax, mm]`` will NOT match across unrelated
-    ops (e.g. rope, residual-add) that sit between them.
+    Ops in PATTERN_SKIP are excluded from *op_names* before matching.
+    Pattern elements are matched in order but need not be contiguous —
+    intermediate compute ops (e.g. the QK scaling mul or mask add inside
+    scaled dot-product attention) are allowed between anchors.
+
+    This is safe because Pass 1 already groups ops by scope, so all ops in a
+    group are from the same module's computation.  Within-module ordering is
+    sufficient to uniquely identify kernels (e.g. attention's bmm→softmax→bmm
+    vs. MLP's mm→silu→mm).
     """
     effective = [op for op in op_names if op not in PATTERN_SKIP]
-    # Slide a window of len(pattern) over effective
-    for start in range(len(effective) - len(pattern) + 1):
-        if all(
-            re.search(pattern[i], effective[start + i], re.IGNORECASE)
-            for i in range(len(pattern))
-        ):
-            return True
-    return False
+    i = 0
+    for pat in pattern:
+        found = False
+        while i < len(effective):
+            if re.search(pat, effective[i], re.IGNORECASE):
+                i += 1
+                found = True
+                break
+            i += 1
+        if not found:
+            return False
+    return True
 
 
 # ── Shared module regexes used in pattern definitions ────────────────────────
@@ -274,6 +282,16 @@ _CUDA_PATTERNS: List[SubPattern] = [
                [r"threshold_backward|silu_backward|gelu_backward", r"\b(mm|addmm)\b"],
                priority=24),
     # ── Forward patterns ─────────────────────────────────────────────────────
+    # DeepSeek-V4 inline q second-norm + RoPE (at Attention scope, not a sub-module).
+    # square→rsqrt (inline RMSNorm on q) followed by view_as_complex (RoPE) is unique to V4.
+    SubPattern("v4_q_norm", _ATTN_RE,
+               [r"square", r"rsqrt", r"view_as_complex"],
+               priority=46),
+    # DeepSeek-V4 kv RoPE + act_quant + window-topk + cache write (Attention scope).
+    # view_as_complex (RoPE on kv) followed by amax/clamp_min (act_quant block-scale) is unique.
+    SubPattern("v4_kv_quant", _ATTN_RE,
+               [r"view_as_complex", r"(amax|clamp_min)"],
+               priority=46),
     # DeepSeek-V4 sparse attention: gather(topk KV) → bmm(QK) → softmax → bmm(AV)
     # 'gather' before the first bmm distinguishes it from dense flash_attn.
     SubPattern("v4_sparse_attn", _ATTN_RE,
@@ -334,17 +352,17 @@ _ASCEND_PATTERNS: List[SubPattern] = [
                priority=50),
     # DeepSeek-V4 SparseAttnSharedKV → npu_sparse_attn_sharedkv kernel (Ascend)
     # Inference: sparse_attn kernel emits gather before the QK bmm
-    SubPattern("npu_sas", _ATTN_RE,
-               [r"\bgather\b", r"\b(mm|bmm|matmul)\b", r"softmax",
-                r"\b(mm|bmm|matmul)\b"],
-               priority=46),
+    # SubPattern("npu_sas", _ATTN_RE,
+    #            [r"\bgather\b", r"\b(mm|bmm|matmul)\b", r"softmax",
+    #             r"\b(mm|bmm|matmul)\b"],
+    #            priority=46),
     # Training: V4 Compressor module performs gated KV pooling — always maps to
     # npu_sparse_attn_sharedkv on Ascend.  The ops are split into multiple groups
     # by topo-sort interleaving with norm sub-module, so class-only matching is
     # used (empty op_seq = match any ops in a Compressor-class group).
-    SubPattern("npu_sas", r".*Compressor.*",
-               [],
-               priority=46),
+    # SubPattern("npu_sas", r".*Compressor.*",
+    #            [],
+    #            priority=46),
     # DeepSeek-V4 sparse attention fallback label for CUDA (same pattern, lower priority)
     SubPattern("v4_sparse_attn", _ATTN_RE,
                [r"\bgather\b", r"\b(mm|bmm|matmul)\b", r"softmax", r"\b(mm|bmm|matmul)\b"],

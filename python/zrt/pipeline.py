@@ -1,8 +1,14 @@
-"""Entry point: load model, trace forward/backward, write Excel + JSON + computation graph.
+"""ZRT capture pipeline: load model, trace phases, write outputs.
+
+This is the **top-level orchestration module** for the ZRT tool.
+It ties together model loading (``graph.model_loader``), dispatch/compile
+capture (``graph.dispatch``, internal helpers), fusion
+(``transform.fusion``), and reporting (``report.excel_writer``,
+``report.onnx_exporter``, ``report.dot_exporter``) into a single pipeline.
 
 Public API::
 
-    from python.zrt.graph import run_trace, run_trace_phases, build_config_summary, load_model
+    from python.zrt.pipeline import run_trace_phases, run_trace
 
     # Inference: trace both prefill and decode in one call (recommended)
     output_dir, phase_records = run_trace_phases(
@@ -10,15 +16,9 @@ Public API::
         num_layers=4,
         batch_size=1,
         seq_len=128,
-        output_dir="output/graph/DeepSeek-V3-0324",  # optional
     )
 
-    # Training: trace forward + backward (gradient ops included).
-    # result.graphs["train_forward"] and result.graphs["train_backward"] hold
-    # the separate (raw, fused) OpGraph pairs.
-    # result.graphs["train"] holds (stitched_raw, stitched_fused) — the
-    # forward and backward graphs merged into one connected training graph,
-    # with cross-phase edges and annotations["phase"] ∈ {"fwd", "bwd"}.
+    # Training: trace forward + backward (gradient ops included)
     output_dir, phase_records = run_trace_phases(
         model_id="deepseek-ai/DeepSeek-V3-0324",
         num_layers=4,
@@ -26,17 +26,11 @@ Public API::
         seq_len=128,
         phases=("train_forward", "train_backward"),
     )
-    result = run_trace_phases(...)
-    raw_fused_train = result.graphs["train"]          # (stitched_raw, stitched_fused)
-    raw_fwd, fused_fwd = result.graphs["train_forward"]
-    raw_bwd, fused_bwd = result.graphs["train_backward"]
 
-    # Trace a single phase
+    # Single phase
     output_dir, records = run_trace(
-        model_id="deepseek-ai/DeepSeek-V3-0324",
+        model_id="Qwen/Qwen2.5-7B-Instruct",
         num_layers=4,
-        batch_size=1,
-        seq_len=128,
         phase="prefill",
     )
 
@@ -55,7 +49,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 
 from python.zrt.graph.dispatch import RecordingDispatch, TensorTracker
-from python.zrt.report.excel_writer import ExcelWriter
 from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
 from python.zrt.graph.model_loader import load_model
 from python.zrt.graph.tracker import ModuleTracker, NullModuleTracker
@@ -126,6 +119,8 @@ class TraceResult(tuple):
         return self[1]
 
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+
 # Backward-compat map for --model v3 / v3.2 shorthand
 _MODEL_DIRS = {
     "v3":  "deepseek_v3",
@@ -137,81 +132,6 @@ _PHASE_ALIASES = {"forward": "prefill", "train": "train_forward"}
 
 # Phases that run with gradients enabled and model in train() mode
 _TRAINING_PHASES = {"train_forward", "train_backward"}
-
-
-# ── Layer-type inference ───────────────────────────────────────────────────────
-
-def infer_layer_types(config: Any) -> Dict[str, List[int]]:
-    """Infer which transformer layers are dense vs. sparse (MoE) from config.
-
-    Handles three architectures without hard-coding model names:
-
-    * **DeepSeek-V3 / V3.2 style** — config has ``first_k_dense_replace`` and
-      (optionally) ``moe_layer_freq``:
-      layers ``[0, first_k_dense_replace)`` are dense; the remaining layers are
-      MoE when ``layer_idx % moe_layer_freq == 0``, otherwise dense.
-    * **Mixtral style** — config has ``num_local_experts`` (but no
-      ``first_k_dense_replace``): all layers are treated as MoE.
-    * **Standard dense models** — no MoE fields: all layers are dense.
-
-    The layer count is taken from ``config._full_num_hidden_layers`` when
-    available (set by :func:`load_model`), falling back to
-    ``config.num_hidden_layers``.
-
-    Returns
-    -------
-    {"dense": [layer_idx, ...], "sparse": [layer_idx, ...]}
-        Each list is sorted; together they cover every layer index.
-    """
-    total: int = (
-        getattr(config, "_full_num_hidden_layers", None)
-        or getattr(config, "num_hidden_layers", 0)
-    )
-
-    first_k_dense: Optional[int] = getattr(config, "first_k_dense_replace", None)
-    moe_layer_freq: int = getattr(config, "moe_layer_freq", 1) or 1
-    has_local_experts: bool = getattr(config, "num_local_experts", None) is not None
-    has_routed_experts: bool = getattr(config, "n_routed_experts", None) is not None
-
-    dense: List[int] = []
-    sparse: List[int] = []
-
-    if first_k_dense is not None:
-        # DeepSeek-V3 style: first_k_dense dense layers, then a mix depending
-        # on moe_layer_freq (layer_idx % moe_layer_freq == 0 → MoE).
-        for i in range(total):
-            if i < first_k_dense:
-                dense.append(i)
-            elif i % moe_layer_freq == 0:
-                sparse.append(i)
-            else:
-                dense.append(i)
-    elif has_local_experts or has_routed_experts:
-        # Mixtral / all-MoE architectures
-        sparse = list(range(total))
-    else:
-        # Plain dense model (LLaMA, Qwen2, Mistral, etc.)
-        dense = list(range(total))
-
-    return {"dense": dense, "sparse": sparse}
-
-
-def auto_target_layers(config: Any) -> List[int]:
-    """Return the representative layer indices to trace for this config.
-
-    Selects the **first dense layer** and the **first sparse (MoE) layer**
-    (when the model has MoE layers).  For purely dense models returns ``[0]``.
-    For all-MoE models returns ``[0]``.
-
-    The returned list is sorted and deduplicated.
-    """
-    types = infer_layer_types(config)
-    result: List[int] = []
-    if types["dense"]:
-        result.append(types["dense"][0])
-    if types["sparse"]:
-        result.append(types["sparse"][0])
-    return sorted(set(result)) or [0]
 
 
 # ── Record filtering ───────────────────────────────────────────────────────────
@@ -432,16 +352,6 @@ def _compile_graph_to_records(
     that all downstream writers work without modification.  When Dynamo
     preserved ``nn_module_stack`` metadata, ``module_path`` and
     ``module_class`` are populated; otherwise they are left empty.
-
-    Parameters
-    ----------
-    id_to_path:
-        Mapping from ``id(module)`` to the full dotted module path (e.g.
-        ``"model.layers.0.self_attn"``).  Built once by
-        :func:`_trace_compile_phase` from ``model.named_modules()`` so that
-        ``nn_module_stack`` keys (which are ``id()`` strings of the original
-        modules) can be resolved to their full hierarchical paths even when
-        graph breaks strip the ``layers.N`` prefix from the path strings.
     """
     import torch.fx
     from python.zrt.graph.tensor_utils import SKIP_OPS
@@ -512,15 +422,6 @@ def _compile_graph_to_records(
             _collect(arg)
 
         # Module context — Dynamo preserves nn_module_stack
-        # nn_module_stack structure:
-        #   key   = str(id(module)) — e.g. "2587068077728"
-        #   value = (path_str, class_type) tuple
-        #     path_str  = e.g. "L['self'].layers.0.self_attn"  (may lose
-        #                 layers.N after graph breaks)
-        #     class_type = e.g. <class 'DeepseekV3Attention'>
-        # When id_to_path is available we resolve the key to the *full*
-        # module path via model.named_modules(), which always includes
-        # the layers.N prefix.
         module_path, module_class = "", ""
         layer = ""
         stack = node.meta.get("nn_module_stack")
@@ -718,9 +619,10 @@ def _save_phase_outputs(
         Both are :class:`~python.zrt.ir.graph.OpGraph` instances built
         from the raw and fused records respectively.
     """
-    from python.zrt.transform.fusion._dict_bridge import fuse_records
+    from python.zrt.transform.fusion import fuse_records
 
     excel_path = output_dir / f"{slug}_{phase}_ops.xlsx"
+    from python.zrt.report.excel_writer import ExcelWriter
     writer = ExcelWriter(tracker, platform=platform)
     writer.write(records, excel_path, config_summary)
     logger.info("Excel saved to %s", excel_path)
@@ -734,8 +636,12 @@ def _save_phase_outputs(
     _is_bwd = phase in ("train_backward", "backward")
     _max_leaf = 15 if _is_bwd else 0  # 0 = unlimited for forward
     fused_with_children = fuse_records(
-        records, tracker, platform=platform,
-        max_leaf_ops=_max_leaf, keep_children=True, debug=fusion_debug)
+        records, tracker,
+        platform=platform,
+        max_leaf_ops=_max_leaf,
+        keep_children=True,
+        debug=fusion_debug,
+    )
     fused_opgraph = fused_records_to_opgraph(
         fused_with_children, name=f"{graph_name}_fused", phase=phase
     )
@@ -880,11 +786,12 @@ def run_trace_phases(
                                              both training phases are requested)
     …
     """
+    from python.zrt.graph.model_loader import _load_config
+    from python.zrt.graph.patches import apply_compat_patches
+
     # ── Resolve target_layers before loading the model ────────────────────
     if auto_layers and target_layers is None:
         # Quick config-only load to infer layer types (no model weights).
-        from python.zrt.graph.model_loader import _load_config
-        from python.zrt.graph.patches import apply_compat_patches
         apply_compat_patches()
         cfg_tmp, _ = _load_config(model_id)
         # target_layers = auto_target_layers(cfg_tmp)
@@ -904,8 +811,7 @@ def run_trace_phases(
     # Detect if any requested phases are training phases — needed for DSV4
     # to apply patch_for_training_capture (removes @inference_mode, upgrades
     # kernel stubs to differentiable versions).
-    _TRAINING_PHASES_SET = {"train_forward", "train_backward"}
-    is_training_mode = any(p in _TRAINING_PHASES_SET for p in phases)
+    is_training_mode = any(p in _TRAINING_PHASES for p in phases)
 
     logger.info(
         "Loading model %s (%d layers, graph_mode=%s, training=%s) …",
@@ -1053,16 +959,3 @@ def run_trace(
     canonical = _PHASE_ALIASES.get(phase, phase)
     phase_graphs = result.graphs.get(canonical)
     return TraceResult(result.output_dir, result.phase_records[canonical], phase_graphs)
-
-
-# ── CLI entry point ────────────────────────────────────────────────────────────
-# The full CLI lives in python.zrt.cli.  This shim keeps
-# `python -m python.zrt.graph.main` working as before.
-
-def main() -> None:
-    from python.zrt.cli import main as _main
-    _main()
-
-
-if __name__ == "__main__":
-    main()

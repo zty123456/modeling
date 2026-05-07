@@ -19,24 +19,24 @@ logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid requiring torch at module load time
 # These are imported only when needed:
-#   from python.zrt.graph.main import run_trace_phases, _make_model_slug, _MODEL_DIRS, _PHASE_ALIASES
+#   from python.zrt.pipeline import run_trace_phases, _make_model_slug, _MODEL_DIRS, _PHASE_ALIASES
 
 
 def _get_model_dirs():
     """Lazy import of _MODEL_DIRS to avoid requiring torch at module load time."""
-    from python.zrt.graph.main import _MODEL_DIRS
+    from python.zrt.pipeline import _MODEL_DIRS
     return _MODEL_DIRS
 
 
 def _make_model_slug(model_id: str) -> str:
     """Lazy import of _make_model_slug to avoid requiring torch at module load time."""
-    from python.zrt.graph.main import _make_model_slug as _impl
+    from python.zrt.pipeline import _make_model_slug as _impl
     return _impl(model_id)
 
 
 def _run_trace_phases(**kwargs):
     """Lazy import of run_trace_phases to avoid requiring torch at module load time."""
-    from python.zrt.graph.main import run_trace_phases
+    from python.zrt.pipeline import run_trace_phases
     return run_trace_phases(**kwargs)
 
 
@@ -505,7 +505,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
                     )
                 else:
                     # Fallback: use transformers config API
-                    from python.zrt.graph.main import infer_layer_types
+                    from python.zrt.graph.model_loader import infer_layer_types
                     from python.zrt.graph.model_loader import _load_config
                     _, _cfg = _load_config(model_id)
                     _types = infer_layer_types(_cfg)

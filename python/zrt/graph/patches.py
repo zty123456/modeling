@@ -801,6 +801,32 @@ def _upgrade_kernel_stubs_for_backward() -> None:
         logger.debug("_upgrade_kernel_stubs_for_backward: no target modules found.")
 
 
+def patch_v4_inference_stubs() -> None:
+    """Patch V4 inference module globals that are unsafe under FakeTensorMode.
+
+    ``rotate_activation`` in ``inference/model.py`` asserts ``x.dtype == bfloat16``
+    and imports ``fast_hadamard_transform``.  Under FakeTensorMode the dtype check
+    can fail when intermediate tensors carry an unexpected dtype.  This function
+    replaces it with a no-op that returns the input unchanged, which is safe for
+    shape-only tracing.
+
+    Must be called after ``_import_inference_module()`` has loaded the V4 module.
+    Has no effect if the V4 inference module is not yet in ``sys.modules``.
+    """
+    import sys
+    _INF_MOD_NAME = "_v4_inference_model"
+    inf_mod = sys.modules.get(_INF_MOD_NAME)
+    if inf_mod is None:
+        return
+
+    def _noop(x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    if "rotate_activation" in vars(inf_mod):
+        setattr(inf_mod, "rotate_activation", _noop)
+        logger.debug("Patched rotate_activation noop in %s for inference.", _INF_MOD_NAME)
+
+
 def patch_for_training_capture(model: nn.Module) -> None:
     """Enable backward() on the DeepSeek-V4 inference model for training graph capture.
 

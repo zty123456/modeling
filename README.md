@@ -624,7 +624,7 @@ print(f"捕获算子数: {len(records)}")
 |------|------------|----------|
 | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3` | MoE meta patch |
 | DeepSeek-V3-0324 (V3.2) | `deepseek-ai/DeepSeek-V3-0324` | MoE meta patch + Indexer patch |
-| DeepSeek-V4 | `hf_models/deepseek_v4`（本地） | MoE meta patch；Ascend NPU 下 Attention 融合为 `npu_sas` |
+| DeepSeek-V4 | `hf_models/deepseek_v4`（本地） | MoE meta patch；推理路径 `rotate_activation` noop patch；CUDA 下 Attention 融合为 `v4_q_norm` / `v4_kv_quant` / `v4_sparse_attn`；Ascend NPU 下融合为 `npu_sas` |
 
 ### 本地目录支持
 
@@ -848,6 +848,24 @@ transformers 4.50+ 的 RoPE 实现会将 tensor 的 device type 直接传给 `to
 
 融合算法集中在 `transform/fusion/` 下（`core.py` 四遍算法、`rules.py` 平台规则、`_dict_bridge.py` Dict ↔ IR 桥接），`graph/` 模块只负责抓图，不再包含融合逻辑。
 
+#### 平台特定融合规则（CUDA）
+
+DeepSeek-V4 的 `Attention.forward` 在子模块调用之间有大量内联计算（q 归一化、RoPE、kv 量化等），无法通过第二阶段 parent merge 合并（因为 compressor/indexer 含子孙）。CUDA 平台通过三个 SubPattern（priority=46）精确标注这些内联段：
+
+| `op_type` | 关键算子序列 | 含义 |
+|-----------|------------|------|
+| `v4_q_norm` | `square → rsqrt → view_as_complex` | 内联 q 第二 RMSNorm + RoPE |
+| `v4_kv_quant` | `view_as_complex → amax\|clamp_min` | kv RoPE + act_quant + 窗口 topk + cache 写入 |
+| `v4_sparse_attn` | `gather → mm\|bmm → softmax → mm\|bmm` | 核心稀疏注意力（`sparse_attn` 内核） |
+
+每层预期 fusion 分布（4 层 decode trace）：
+```
+v4_q_norm:       4  （每层 1 个）
+v4_kv_quant:     4  （每层 1 个）
+v4_sparse_attn:  4  （每层 1 个）
+attn:            1  （layer 2 仅 3 ops：cat+to.dtype+copy_，Indexer topk 合并残留，可接受）
+```
+
 #### 平台特定融合规则（Ascend NPU）
 
 DeepSeek-V4 在昇腾 NPU 上使用 `npu_sparse_attn_sharedkv` 内核，对应三种 Attention 变体：
@@ -890,7 +908,7 @@ modeling/
 │   │   ├── classifier.py            # 组件分类 + 颜色映射
 │   │   ├── graph_builder.py         # build_op_graph / build_fused_op_graph
 │   │   ├── graph_exporter.py        # 导出 JSON / ONNX（原始图）
-│   │   ├── patches.py               # 运行时 patch（MoE、Indexer、legacy 属性）
+│   │   ├── patches.py               # 运行时 patch（MoE、Indexer、V4 推理 stubs、legacy 属性）
 │   │   ├── compat.py                # transformers 版本 shim + 本地模型注册表
 │   │   └── tensor_utils.py          # 张量工具 + SKIP_OPS
 │   │
