@@ -5,7 +5,7 @@ from typing import Any, List
 
 import torch
 
-from python.zrt.graph.fusion_rules import ALWAYS_TRANSPARENT, SHAPE_OPS
+from python.zrt.transform.fusion.rules import ALWAYS_TRANSPARENT, SHAPE_OPS
 
 SKIP_OPS: set[str] = ALWAYS_TRANSPARENT | SHAPE_OPS | {
     "aten._to_copy.default",

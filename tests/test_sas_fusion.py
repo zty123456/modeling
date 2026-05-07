@@ -1,11 +1,10 @@
-"""Tests for SparseAttnSharedKV (npu_sas) fusion rules and annotation pass."""
+"""Tests for SparseAttnSharedKV (npu_sas) fusion rules and annotation."""
 import pytest
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.types import TensorMeta, DType
 from python.zrt.transform.fusion.pass_ import FusionPass
-from python.zrt.transform.fusion.sas_pass import SparseAttnSharedKVPass
 from python.zrt.transform.context import TransformContext, ParallelConfig, StreamConfig
 import python.zrt.hardware.registry as hw_registry
 
@@ -112,46 +111,47 @@ def test_sas_not_triggered_on_cuda():
     )
 
 
-# ── SparseAttnSharedKVPass annotation ────────────────────────────────────────
+# ── FusionPass annotation ─────────────────────────────────────────────────────
 
-def test_sas_pass_annotates_attn_type():
-    """SparseAttnSharedKVPass sets attn_type/compress_ratio from graph.metadata."""
-    # compress_ratios: layer 0 → 128 (HCA), layer 1 → 4 (CSA), layer 2 → 0 (SWA)
+def _compressor_group(layer_idx: int) -> tuple[list, list]:
+    """Return (nodes, edges) for a 3-op Compressor group at the given layer."""
+    scope = f"transformer.layers.{layer_idx}.attn.compressor"
+    ops = [
+        (f"add_{layer_idx}",  "aten.add.Tensor"),
+        (f"sfmx_{layer_idx}", "aten._softmax.default"),
+        (f"mul_{layer_idx}",  "aten.mul.Tensor"),
+    ]
+    nodes = [_node(nid, op, scope=scope, layer=str(layer_idx),
+                   module_class="Compressor") for nid, op in ops]
+    edges = [_edge(ops[i][0], ops[i + 1][0]) for i in range(len(ops) - 1)]
+    return nodes, edges
+
+
+def test_fusion_pass_annotates_npu_sas():
+    """FusionPass sets attn_type/compress_ratio on npu_sas nodes when compress_ratios in metadata."""
     compress_ratios = [128, 4, 0]
-
-    nodes = []
-    for layer_idx, (cr, expected_type) in enumerate(
-            zip(compress_ratios, ["HCA", "CSA", "SWA"])):
-        scope = f"transformer.layers.{layer_idx}.attn"
-        n = _node(f"attn_{layer_idx}", "npu_sas",
-                  scope=scope, layer=str(layer_idx),
-                  module_class="DeepseekV4Attention")
-        nodes.append(n)
-
-    g = _graph(nodes, [], metadata={"compress_ratios": compress_ratios})
-
+    expected_types = ["HCA", "CSA", "SWA"]
     ctx = _ctx("ascend_910b")
-    out = SparseAttnSharedKVPass().run(g, ctx)
 
-    expected = [("HCA", 128), ("CSA", 4), ("SWA", 0)]
-    for (node_id, node) in out.nodes.items():
-        layer_idx = int(node.scope.split("layers.")[1].split(".")[0])
-        exp_type, exp_cr = expected[layer_idx]
-        assert node.annotations.get("attn_type") == exp_type, (
-            f"layer {layer_idx}: expected attn_type={exp_type!r}, "
-            f"got {node.annotations.get('attn_type')!r}"
+    for layer_idx, (exp_type, exp_cr) in enumerate(zip(expected_types, compress_ratios)):
+        nodes, edges = _compressor_group(layer_idx)
+        g = _graph(nodes, edges, metadata={"compress_ratios": compress_ratios})
+        out = FusionPass().run(g, ctx)
+        npu_sas = next((n for n in out.topo_sort() if n.op_type == "npu_sas"), None)
+        assert npu_sas is not None, f"layer {layer_idx}: expected npu_sas node"
+        assert npu_sas.annotations.get("attn_type") == exp_type, (
+            f"layer {layer_idx}: expected {exp_type!r}, "
+            f"got {npu_sas.annotations.get('attn_type')!r}"
         )
-        assert node.annotations.get("compress_ratio") == exp_cr
+        assert npu_sas.annotations.get("compress_ratio") == exp_cr
 
 
-def test_sas_pass_skips_without_compress_ratios():
-    """SparseAttnSharedKVPass is a no-op when compress_ratios not in metadata."""
-    scope = "transformer.layers.0.attn"
-    n = _node("a", "npu_sas", scope=scope, layer="0",
-              module_class="DeepseekV4Attention")
-    g = _graph([n], [])  # no compress_ratios in metadata
-
+def test_fusion_pass_no_annotation_without_compress_ratios():
+    """FusionPass skips attn_type annotation when compress_ratios not in metadata."""
+    nodes, edges = _compressor_group(0)
+    g = _graph(nodes, edges)  # no compress_ratios in metadata
     ctx = _ctx("ascend_910b")
-    out = SparseAttnSharedKVPass().run(g, ctx)
-    node = next(iter(out.nodes.values()))
-    assert "attn_type" not in node.annotations
+    out = FusionPass().run(g, ctx)
+    npu_sas = next((n for n in out.topo_sort() if n.op_type == "npu_sas"), None)
+    assert npu_sas is not None
+    assert "attn_type" not in npu_sas.annotations

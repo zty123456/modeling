@@ -9,32 +9,17 @@ Public API::
 
 Imports from submodules that require torch (main, model_loader, patches, classifier,
 graph_builder, graph_exporter, compat) are lazy — they only load when accessed.
-"""
 
-# ── Eager imports (no torch dependency) ──────────────────────────────────────
+Fusion symbols (ALWAYS_TRANSPARENT, SHAPE_OPS, etc.) are lazy-re-exported from
+python.zrt.transform.fusion.rules.  The old graph/fusion.py and
+graph/fusion_rules.py shim modules have been removed.
+"""
 
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.adapter import records_to_opgraph, fused_records_to_opgraph
-from python.zrt.graph.fusion_rules import (
-    ALWAYS_TRANSPARENT,
-    SHAPE_OPS,
-    INIT_OPS,
-    LIFT_OPS,
-    POTENTIAL_COPY_OPS,
-    PATTERN_SKIP,
-    SEMANTIC_LABELS,
-    PLATFORM_SUBPATTERNS,
-    PLATFORM_SETTINGS,
-    get_semantic_label,
-    get_subpatterns,
-    get_platform_settings,
-    match_subsequence,
-    SubPattern,
-)
-
-# ── Lazy imports (require torch at module level) ─────────────────────────────
 
 _MODULE_MAP = {
+    # ── Graph builder / tracer (require torch) ──────────────────────────────
     "main": "python.zrt.graph.main",
     "run_trace": "python.zrt.graph.main",
     "run_trace_phases": "python.zrt.graph.main",
@@ -53,6 +38,22 @@ _MODULE_MAP = {
     "export_graphs": "python.zrt.report.onnx_exporter",
     "find_local_fallback": "python.zrt.graph.compat",
     "_LOCAL_REGISTRY": "python.zrt.graph.compat",
+    # ── Fusion rules (moved to transform/fusion/rules.py) ───────────────────
+    "ALWAYS_TRANSPARENT": "python.zrt.transform.fusion.rules",
+    "SHAPE_OPS": "python.zrt.transform.fusion.rules",
+    "INIT_OPS": "python.zrt.transform.fusion.rules",
+    "LIFT_OPS": "python.zrt.transform.fusion.rules",
+    "POTENTIAL_COPY_OPS": "python.zrt.transform.fusion.rules",
+    "PATTERN_SKIP": "python.zrt.transform.fusion.rules",
+    "SEMANTIC_LABELS": "python.zrt.transform.fusion.rules",
+    "PLATFORM_SUBPATTERNS": "python.zrt.transform.fusion.rules",
+    "PLATFORM_SETTINGS": "python.zrt.transform.fusion.rules",
+    "CONTAINER_SEMANTICS": "python.zrt.transform.fusion.rules",
+    "SubPattern": "python.zrt.transform.fusion.rules",
+    "get_semantic_label": "python.zrt.transform.fusion.rules",
+    "get_subpatterns": "python.zrt.transform.fusion.rules",
+    "get_platform_settings": "python.zrt.transform.fusion.rules",
+    "match_subsequence": "python.zrt.transform.fusion.rules",
 }
 
 _CACHE: dict = {}

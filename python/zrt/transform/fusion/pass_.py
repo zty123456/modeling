@@ -11,6 +11,7 @@ of the OpGraph IR.
 from __future__ import annotations
 
 import copy
+import re as _re
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,36 @@ if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
     from python.zrt.ir.node import OpNode
     from python.zrt.transform.context import TransformContext
+
+
+# ── npu_sas annotation helpers ───────────────────────────────────────────────
+
+_LAYER_RE = _re.compile(r"layers\.(\d+)\.")
+
+
+def _sas_attn_type(cr: int) -> str:
+    if cr == 0:
+        return "SWA"
+    if cr == 4:
+        return "CSA"
+    return "HCA"
+
+
+def _annotate_npu_sas(g: "OpGraph") -> None:
+    """Annotate npu_sas nodes with attn_type/compress_ratio from V4 config."""
+    compress_ratios = g.metadata.get("compress_ratios")
+    if not compress_ratios:
+        return
+    for node in g.topo_sort():
+        if node.op_type != "npu_sas":
+            continue
+        m = _LAYER_RE.search(node.scope or "")
+        if m is None:
+            continue
+        idx = int(m.group(1))
+        cr = compress_ratios[idx] if idx < len(compress_ratios) else 0
+        node.annotations["attn_type"] = _sas_attn_type(cr)
+        node.annotations["compress_ratio"] = cr
 
 
 # ── scope helpers ─────────────────────────────────────────────────────────────
@@ -273,6 +304,7 @@ class FusionPass(GraphPass):
         if _is_prefused(g):
             # Graph already fused by Stage-1 capture → only Pass 4 needed
             self._expand_containers(g, platform, path_to_class)
+            _annotate_npu_sas(g)
             return g
 
         # ── OpNode → FusionItem ───────────────────────────────────────────────
@@ -300,6 +332,7 @@ class FusionPass(GraphPass):
             fuse_idx += 1
             g.replace_subgraph(group_ids, new_node)
 
+        _annotate_npu_sas(g)
         return g
 
     @staticmethod

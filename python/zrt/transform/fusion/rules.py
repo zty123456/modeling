@@ -334,7 +334,7 @@ _ASCEND_PATTERNS: List[SubPattern] = [
                priority=50),
     # DeepSeek-V4 SparseAttnSharedKV → npu_sparse_attn_sharedkv kernel (Ascend)
     # Inference: sparse_attn kernel emits gather before the QK bmm
-    SubPattern("SparseAttnSharedKV ", _ATTN_RE,
+    SubPattern("npu_sas", _ATTN_RE,
                [r"\bgather\b", r"\b(mm|bmm|matmul)\b", r"softmax",
                 r"\b(mm|bmm|matmul)\b"],
                priority=46),
@@ -342,7 +342,7 @@ _ASCEND_PATTERNS: List[SubPattern] = [
     # npu_sparse_attn_sharedkv on Ascend.  The ops are split into multiple groups
     # by topo-sort interleaving with norm sub-module, so class-only matching is
     # used (empty op_seq = match any ops in a Compressor-class group).
-    SubPattern("SparseAttnSharedKV ", r".*Compressor.*",
+    SubPattern("npu_sas", r".*Compressor.*",
                [],
                priority=46),
     # DeepSeek-V4 sparse attention fallback label for CUDA (same pattern, lower priority)

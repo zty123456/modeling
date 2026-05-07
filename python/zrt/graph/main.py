@@ -718,7 +718,7 @@ def _save_phase_outputs(
         Both are :class:`~python.zrt.ir.graph.OpGraph` instances built
         from the raw and fused records respectively.
     """
-    from python.zrt.graph.fusion import FusionEngine
+    from python.zrt.transform.fusion._dict_bridge import fuse_records
 
     excel_path = output_dir / f"{slug}_{phase}_ops.xlsx"
     writer = ExcelWriter(tracker, platform=platform)
@@ -733,10 +733,9 @@ def _save_phase_outputs(
     # is unreliable (forward hooks don't fire during backward()).
     _is_bwd = phase in ("train_backward", "backward")
     _max_leaf = 15 if _is_bwd else 0  # 0 = unlimited for forward
-    fusion_engine = FusionEngine(
-        tracker, platform=platform, debug=fusion_debug,
-        max_leaf_ops=_max_leaf)
-    fused_with_children = fusion_engine.fuse_keep_children(records)
+    fused_with_children = fuse_records(
+        records, tracker, platform=platform,
+        max_leaf_ops=_max_leaf, keep_children=True, debug=fusion_debug)
     fused_opgraph = fused_records_to_opgraph(
         fused_with_children, name=f"{graph_name}_fused", phase=phase
     )
