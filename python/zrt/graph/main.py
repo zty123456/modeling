@@ -888,7 +888,7 @@ def run_trace_phases(
         from python.zrt.graph.patches import apply_compat_patches
         apply_compat_patches()
         cfg_tmp, _ = _load_config(model_id)
-        target_layers = auto_target_layers(cfg_tmp)
+        # target_layers = auto_target_layers(cfg_tmp)
         logger.info("Auto-selected target layers: %s", target_layers)
 
     # When specific layers are requested, ensure we load enough layers.
@@ -973,6 +973,11 @@ def run_trace_phases(
             raw_opgraph, fused_opgraph = _save_phase_outputs(
                 records, tracker, phase, slug, output_dir, config_summary,
                 platform=platform, fusion_debug=fusion_debug)
+            # Expose compress_ratios from V4 config for SparseAttnSharedKVPass
+            cr = getattr(config, "compress_ratios", None)
+            if cr:
+                raw_opgraph.metadata["compress_ratios"] = list(cr)
+                fused_opgraph.metadata["compress_ratios"] = list(cr)
             all_records[phase] = records
             all_graphs[phase] = (raw_opgraph, fused_opgraph)
 

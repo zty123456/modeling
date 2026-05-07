@@ -261,6 +261,17 @@ def main() -> None:
 
     effective_auto_layers = args.auto_layers or (target_layers is None)
 
+    effective_platform = args.platform
+    if effective_platform == "generic" and args.hw:
+        import python.zrt.hardware.registry as hw_registry
+        _hw = hw_registry.load(args.hw)
+        _vendor = getattr(_hw, "vendor", "").lower()
+        _device_type = getattr(_hw, "device_type", "").lower()
+        if "nvidia" in _vendor or "cuda" in _vendor:
+            effective_platform = "cuda"
+        elif "huawei" in _vendor or "ascend" in _vendor or _device_type == "npu":
+            effective_platform = "ascend_npu"
+
     result = _run_trace_phases(
         model_id=model_id,
         num_layers=args.layers,
@@ -270,7 +281,7 @@ def main() -> None:
         phases=tuple(phases),
         target_layers=target_layers,
         auto_layers=effective_auto_layers,
-        platform=args.platform,
+        platform=effective_platform,
         graph_mode=args.graph_mode,
         gradient_checkpointing=args.gradient_checkpointing,
     )

@@ -65,7 +65,7 @@ def build_pipeline() -> TransformPipeline:
     )
     from python.zrt.transform.parallel.context_parallel import ContextParallelPass
     from python.zrt.transform.parallel.data_parallel import DataParallelPass
-    from python.zrt.transform.fusion import FusionPass
+    from python.zrt.transform.fusion import FusionPass, SparseAttnSharedKVPass
     from python.zrt.transform.optim import (
         QuantizationPass, EPLBPass, SharedExpertPass, MTPPass,
     )
@@ -98,6 +98,12 @@ def build_pipeline() -> TransformPipeline:
 
     # ── Stage 2: Fuse ─────────────────────────────────────────────────────────
     pipe.add("fuse", FusionPass())
+    pipe.add("fuse", SparseAttnSharedKVPass(),
+             condition=lambda c: c.hw_spec is not None and (
+                 "ascend" in getattr(c.hw_spec, "vendor", "").lower()
+                 or "huawei" in getattr(c.hw_spec, "vendor", "").lower()
+                 or getattr(c.hw_spec, "device_type", "").lower() == "npu"
+             ))
 
     # ── Stage 3: Optim ────────────────────────────────────────────────────────
     pipe.add("optim", QuantizationPass(),
