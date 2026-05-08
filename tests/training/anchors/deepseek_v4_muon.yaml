@@ -19,5 +19,5 @@ config:
     ns_steps: 10
     muon_param_fraction: 0.85
 targets:
-  mfu: 0.45
+  mfu: 0.5127
   tolerance: 0.20

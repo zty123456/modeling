@@ -3,10 +3,12 @@
 import pytest
 from zrt.training.ir.builders import build_graph
 from zrt.training.ir.training_graph import Op
+from zrt.training.compose.stage import op_to_time
 from zrt.training.models.flops import OpCost, op_cost, total_training_flops, recompute_overhead_flops
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import RecomputePolicy, Strategy
+from zrt.training.spec.system import GPU, NetTier, SystemSpec
 
 
 def test_matmul_cost():
@@ -95,6 +97,22 @@ def test_memory_bound_cost():
     assert cost.bound == "memory"
     assert cost.fwd_bytes == 1000
     assert cost.dx_bytes > 0
+
+
+def test_op_to_time_treats_hbm_bandwidth_as_gb_per_second():
+    """GPU.hbm_bw_gbps is stored as GB/s, not Gbit/s."""
+    system = SystemSpec(
+        gpu=GPU(name="test", flops_bf16=0, flops_fp8=0, hbm_gb=80, hbm_bw_gbps=100),
+        host_mem_gb=256,
+        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        nodes=1,
+        gpus_per_node=1,
+    )
+
+    bytes_ = 200_000_000
+    expected = bytes_ / (100 * 1e9 * 0.85)
+
+    assert op_to_time(0, bytes_, system) == pytest.approx(expected)
 
 
 def test_6p_rule():

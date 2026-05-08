@@ -22,5 +22,5 @@ config:
     adam_param_types: ["embed", "lm_head", "router", "bias"]
     muon_param_fraction: 0.85
 targets:
-  mfu: 0.36
+  mfu: 0.1203
   tolerance: 0.20

@@ -50,27 +50,22 @@ def ep_imbalance_factor(num_experts: int, ep: int, topk: int = 1) -> float:
 
 
 def op_to_time(
-    flops: float, bytes_: float, bound: str, system: SystemSpec,
+    flops: float, bytes_: float, system: SystemSpec,
     gpu_name: str = "", dtype: Dtype = Dtype.BF16,
 ) -> float:
-    """Convert per-op cost to wall-clock time in seconds.
-
-    compute-bound: flops / (peak * efficiency)
-    memory-bound: bytes / (hbm_bw * efficiency)
-    """
+    """Roofline: op time = max(compute_time, memory_time)."""
     gpu = system.gpu
-
-    if bound == "compute" and flops > 0:
-        peak = gpu.flops_bf16 * 1e12  # TFLOP/s -> FLOP/s
+    compute_t = 0.0
+    if flops > 0:
+        peak = gpu.flops_bf16 * 1e12
         eff = achieved_flops_efficiency(gpu_name or gpu.name, dtype, flops)
-        return flops / (peak * eff) if peak > 0 else 0.0
-
-    elif bound == "memory" and bytes_ > 0:
-        bw = gpu.hbm_bw_gbps * 1e9 / 8  # GB/s -> bytes/s
+        compute_t = flops / (peak * eff) if peak > 0 else 0.0
+    memory_t = 0.0
+    if bytes_ > 0:
+        bw = gpu.hbm_bw_gbps * 1e9
         eff = achieved_bandwidth_efficiency(gpu_name or gpu.name, bytes_)
-        return bytes_ / (bw * eff) if bw > 0 else 0.0
-
-    return 0.0
+        memory_t = bytes_ / (bw * eff) if bw > 0 else 0.0
+    return max(compute_t, memory_t)
 
 
 def stage_time(
@@ -89,21 +84,12 @@ def stage_time(
 
     for op in stage_ops:
         cost = op_cost(op, model)
-
-        if cost.bound == "compute":
-            fwd_t = op_to_time(cost.fwd_flops, 0, "compute", system, gpu_name)
-            dx_t = op_to_time(cost.dx_flops, 0, "compute", system, gpu_name)
-            dw_t = op_to_time(cost.dw_flops, 0, "compute", system, gpu_name)
-            t_fwd += fwd_t
-            t_bwd_dx += dx_t
-            t_bwd_dw += dw_t
-        else:
-            fwd_t = op_to_time(0, cost.fwd_bytes, "memory", system, gpu_name)
-            dx_t = op_to_time(0, cost.dx_bytes, "memory", system, gpu_name)
-            dw_t = op_to_time(0, cost.dw_bytes, "memory", system, gpu_name)
-            t_fwd += fwd_t
-            t_bwd_dx += dx_t
-            t_bwd_dw += dw_t
+        fwd_t = op_to_time(cost.fwd_flops, cost.fwd_bytes, system, gpu_name)
+        dx_t  = op_to_time(cost.dx_flops,  cost.dx_bytes,  system, gpu_name)
+        dw_t  = op_to_time(cost.dw_flops,  cost.dw_bytes,  system, gpu_name)
+        t_fwd    += fwd_t
+        t_bwd_dx += dx_t
+        t_bwd_dw += dw_t
 
     # Recompute: re-do forward for selected ops before backward
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
@@ -201,7 +187,7 @@ def _recompute_time(
         op_cats = _op_recompute_categories(op)
         if "full" in cats or (op_cats & cats):
             cost = op_cost(op, model)
-            t += op_to_time(cost.fwd_flops, cost.fwd_bytes, cost.bound, system, gpu_name)
+            t += op_to_time(cost.fwd_flops, cost.fwd_bytes, system, gpu_name)
 
     return t
 
@@ -220,10 +206,8 @@ def _ep_parallel_fraction(
     t_ep = 0.0
     for op in ops:
         cost = op_cost(op, model)
-        if cost.bound == "compute" and cost.fwd_flops > 0:
-            t = op_to_time(cost.fwd_flops, 0, "compute", system, gpu_name)
-        elif cost.bound == "memory" and cost.fwd_bytes > 0:
-            t = op_to_time(0, cost.fwd_bytes, "memory", system, gpu_name)
+        if cost.fwd_flops > 0 or cost.fwd_bytes > 0:
+            t = op_to_time(cost.fwd_flops, cost.fwd_bytes, system, gpu_name)
         else:
             continue
         t_total += t
@@ -275,10 +259,7 @@ def _ep_gemm_time(
     for op in ops:
         if op.kind == "matmul" and "routed_expert" in op.name:
             cost = op_cost(op, model)
-            if cost.bound == "compute" and cost.fwd_flops > 0:
-                total += op_to_time(cost.fwd_flops, 0, "compute", system, gpu_name)
-            elif cost.bound == "memory" and cost.fwd_bytes > 0:
-                total += op_to_time(0, cost.fwd_bytes, "memory", system, gpu_name)
+            total += op_to_time(cost.fwd_flops, cost.fwd_bytes, system, gpu_name)
     return total
 
 

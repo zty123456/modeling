@@ -18,14 +18,34 @@ class OpCost:
     fwd_flops: float = 0.0
     dx_flops: float = 0.0
     dw_flops: float = 0.0
-    fwd_bytes: float = 0.0   # memory-bound ops: byte traffic
+    fwd_bytes: float = 0.0
     dx_bytes: float = 0.0
     dw_bytes: float = 0.0
+    # Legacy: used ONLY for FLOP accounting guards in total_training_flops/recompute_overhead_flops.
+    # Timing model ALWAYS uses max(compute_time, memory_time).
     bound: str = "compute"   # "compute" | "memory"
 
 
+def _bpe(op: Op) -> int:
+    """Bytes per element from op's first tensor, defaulting to BF16=2."""
+    if op.inputs:
+        return op.inputs[0].dtype.bytes
+    if op.outputs:
+        return op.outputs[0].dtype.bytes
+    return 2
+
+
+def _bytes_from_tensors(op: Op) -> float:
+    """Total bytes from all input + output tensors.
+
+    Correct for memory-bound ops where Op.inputs/outputs capture all data movement.
+    NOT suitable for matmul/attn (weight matrices are absent from the training IR).
+    """
+    return float(sum(t.nbytes() for t in op.inputs) + sum(t.nbytes() for t in op.outputs))
+
+
 def op_cost(op: Op, model: ModelSpec) -> OpCost:
-    """Compute raw cost per op. Bound determines the cost model used."""
+    """Compute raw cost per op (FLOPs + bytes for roofline timing)."""
     if op.kind == "matmul":
         return _matmul_cost(op)
     if op.kind == "attn_core":
@@ -36,10 +56,8 @@ def op_cost(op: Op, model: ModelSpec) -> OpCost:
         return _mhc_post_cost(op)
     if op.kind == "mhc_head":
         return _mhc_head_cost(op)
-    if op.kind == "hc_expand":
-        return _memory_bound_cost(op)
-    if op.kind in ("ln", "softmax", "rope", "swiglu", "add"):
-        return _memory_bound_cost(op)
+    if op.kind in ("ln", "softmax", "rope", "swiglu", "add", "hc_expand"):
+        return _elementwise_cost(op)
     if op.kind in ("embed", "lm_head"):
         return _matmul_cost(op)
     if op.kind == "compressor_pool":
@@ -56,16 +74,17 @@ def _matmul_cost(op: Op) -> OpCost:
     m = op.meta.get("m", 0)
     n = op.meta.get("n_local", op.meta.get("n", 0))
     k = op.meta.get("k_local", op.meta.get("k", 0))
-    fwd = 2.0 * m * n * k
-
-    # Apply fwd_multiplier if present (e.g., for MoE routed expert FFNs)
-    fwd_multiplier = op.meta.get("fwd_multiplier", 1.0)
-    fwd = fwd * fwd_multiplier
-
+    bpe = _bpe(op)
+    fwd = 2.0 * m * n * k * op.meta.get("fwd_multiplier", 1.0)
+    # read A(m×k) + B(k×n), write C(m×n) — symmetric for fwd/dx/dw
+    total_bytes = (m * k + k * n + m * n) * bpe
     return OpCost(
         fwd_flops=fwd,
-        dx_flops=fwd,     # dX: 2*m*n*k
-        dw_flops=fwd,     # dW: 2*m*n*k
+        dx_flops=fwd,
+        dw_flops=fwd,
+        fwd_bytes=total_bytes,
+        dx_bytes=total_bytes,
+        dw_bytes=total_bytes,
     )
 
 
@@ -107,10 +126,31 @@ def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
 
     dx = 2.5 * fwd
 
+    # KV length for byte estimation: sparse/compressed variants have shorter K, V
+    if sparse_topk > 0:
+        kv_len = sparse_topk + swa_window
+    elif compress_ratio > 0:
+        kv_len = max(1, s // compress_ratio) + swa_window
+    elif swa_window > 0:
+        kv_len = swa_window
+    else:
+        kv_len = s  # standard attention: K, V same length as Q
+
+    bpe = _bpe(op)
+    # Forward: read Q(s) + K(kv_len) + V(kv_len), write O(s)
+    fwd_bytes = (2.0 * b * h * s * d + 2.0 * b * h * kv_len * d) * bpe
+    # Backward: read Q(s) + K(kv_len) + V(kv_len) + dO(s),
+    #           write dQ(s) + dK(kv_len) + dV(kv_len)
+    # Flash attention recomputes O from QK^T, so O is not read from HBM
+    dx_bytes = (3.0 * b * h * s * d + 4.0 * b * h * kv_len * d) * bpe
+
     return OpCost(
         fwd_flops=fwd,
         dx_flops=dx,
         dw_flops=0.0,
+        fwd_bytes=fwd_bytes,
+        dx_bytes=dx_bytes,
+        dw_bytes=0.0,
     )
 
 
@@ -122,87 +162,95 @@ def _attn_compression_ratio(value: float) -> float:
 
 
 def _mhc_pre_cost(op: Op) -> OpCost:
-    """Hyper-Connections pre-mix: mixes-Linear + sinkhorn iters + weighted sum.
-
-    Math:
-      mixes  = x[b,s,hc*h] @ hc_fn[hc*h, mix_hc]      → 2·b·s·(hc·h)·mix_hc  (compute-bound)
-      sink   = sinkhorn_iters · O(b·s·mix_hc·hc)     elementwise              (memory-ish)
-      sum    = pre[b,s,hc] · x[b,s,hc,h]              → 2·b·s·hc·h            (weighted sum)
-    """
+    """Hyper-Connections pre-mix: mixes-Linear + sinkhorn iters + weighted sum."""
     b = op.meta.get("b", 1)
     s = op.meta.get("s", 0)
     h = op.meta.get("h", 0)
     hc = op.meta.get("hc", 1)
     mix = op.meta.get("mix_hc", (2 + hc) * hc)
     it = op.meta.get("sinkhorn_iters", 20)
+    bpe = _bpe(op)
 
     fwd_lin = 2.0 * b * s * (hc * h) * mix
     fwd_sink = float(it * b * s * mix * hc) * 4.0
     fwd_sum = float(b * s * hc * h) * 2.0
     fwd = fwd_lin + fwd_sink + fwd_sum
-
-    return OpCost(
-        fwd_flops=fwd,
-        dx_flops=2.5 * fwd,
-        dw_flops=fwd_lin,  # only the mixes Linear has trainable params
-    )
-
-
-def _mhc_post_cost(op: Op) -> OpCost:
-    """Hyper-Connections post-mix: post·x + Σ comb·residual.
-
-    Math:
-      post · x:           b·s·hc·h            (broadcast multiply)
-      comb · residual:    b·s·hc·hc·h         (full hc×hc combination)
-      sum over hc:        b·s·hc·h
-    No trainable parameters in this op (post / comb come from mhc_pre).
-    """
-    b = op.meta.get("b", 1)
-    s = op.meta.get("s", 0)
-    h = op.meta.get("h", 0)
-    hc = op.meta.get("hc", 1)
-
-    fwd = float(b * s * hc * h) * 2.0 + float(b * s * hc * hc * h) * 2.0
-
-    return OpCost(
-        fwd_flops=fwd,
-        dx_flops=2.5 * fwd,
-        dw_flops=0.0,
-    )
-
-
-def _mhc_head_cost(op: Op) -> OpCost:
-    """Final HC mix-down before final_ln (no sinkhorn, no comb).
-
-    Math:
-      mixes  = x[b,s,hc*h] @ hc_head_fn[hc*h, hc]   → 2·b·s·hc·h·hc
-      sum    = pre[b,s,hc] · x[b,s,hc,h]            → 2·b·s·hc·h
-    """
-    b = op.meta.get("b", 1)
-    s = op.meta.get("s", 0)
-    h = op.meta.get("h", 0)
-    hc = op.meta.get("hc", 1)
-    mix = op.meta.get("mix_hc", hc)
-
-    fwd_lin = 2.0 * b * s * (hc * h) * mix
-    fwd_sum = float(b * s * hc * h) * 2.0
-    fwd = fwd_lin + fwd_sum
+    # Bytes from meta dims (sinkhorn intermediates not in IR tensors)
+    fwd_bytes = float(2 * b * s * (hc * h) * mix * bpe + b * s * hc * h * bpe)
 
     return OpCost(
         fwd_flops=fwd,
         dx_flops=2.5 * fwd,
         dw_flops=fwd_lin,
+        fwd_bytes=fwd_bytes,
+        dx_bytes=fwd_bytes * 1.5,
     )
 
 
-def _memory_bound_cost(op: Op) -> OpCost:
-    bytes_fwd = op.meta.get("bytes_fwd", 0.0)
-    # Bwd byte traffic ≈ fwd (read activations + write gradients)
-    bytes_bwd = bytes_fwd * 1.5  # conservative: read input + write grad
+def _mhc_post_cost(op: Op) -> OpCost:
+    """Hyper-Connections post-mix: post·x + Σ comb·residual."""
+    b = op.meta.get("b", 1)
+    s = op.meta.get("s", 0)
+    h = op.meta.get("h", 0)
+    hc = op.meta.get("hc", 1)
+    bpe = _bpe(op)
+
+    fwd = float(b * s * hc * h) * 2.0 + float(b * s * hc * hc * h) * 2.0
+    fwd_bytes = float(b * s * hc * h * bpe * 2 + b * s * hc * hc * h * bpe * 2)
 
     return OpCost(
-        fwd_bytes=bytes_fwd,
-        dx_bytes=bytes_bwd,
+        fwd_flops=fwd,
+        dx_flops=2.5 * fwd,
+        dw_flops=0.0,
+        fwd_bytes=fwd_bytes,
+        dx_bytes=fwd_bytes * 1.5,
+    )
+
+
+def _mhc_head_cost(op: Op) -> OpCost:
+    """Final HC mix-down before final_ln (no sinkhorn, no comb)."""
+    b = op.meta.get("b", 1)
+    s = op.meta.get("s", 0)
+    h = op.meta.get("h", 0)
+    hc = op.meta.get("hc", 1)
+    mix = op.meta.get("mix_hc", hc)
+    bpe = _bpe(op)
+
+    fwd_lin = 2.0 * b * s * (hc * h) * mix
+    fwd_sum = float(b * s * hc * h) * 2.0
+    fwd = fwd_lin + fwd_sum
+    fwd_bytes = float(2 * b * s * (hc * h) * mix * bpe + b * s * hc * h * bpe)
+
+    return OpCost(
+        fwd_flops=fwd,
+        dx_flops=2.5 * fwd,
+        dw_flops=fwd_lin,
+        fwd_bytes=fwd_bytes,
+        dx_bytes=fwd_bytes * 1.5,
+    )
+
+
+_ELEMENTWISE_FLOPS = {
+    "ln":      7,   # mean + var + norm + scale + shift + 2 intermediate
+    "softmax": 4,   # max + sub + exp + sum + div
+    "rope":    2,   # sin/cos multiply per pair
+    "swiglu":  5,   # sigmoid(4) + multiply(1) — elementwise portion between matmuls
+    "add":     1,   # elementwise residual add
+}
+
+
+def _elementwise_cost(op: Op) -> OpCost:
+    """Memory-bound ops: trivial FLOPs + tensor-based byte count."""
+    n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
+    flops_per_elem = _ELEMENTWISE_FLOPS.get(op.kind, 1)
+    fwd_flops = flops_per_elem * n
+    fwd_bytes = _bytes_from_tensors(op) or op.meta.get("bytes_fwd", 0.0)
+    return OpCost(
+        fwd_flops=fwd_flops,
+        dx_flops=fwd_flops * 2.5,
+        dw_flops=0.0,
+        fwd_bytes=fwd_bytes,
+        dx_bytes=fwd_bytes * 1.5,
         dw_bytes=0.0,
         bound="memory",
     )

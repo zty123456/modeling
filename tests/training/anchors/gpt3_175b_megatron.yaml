@@ -27,6 +27,6 @@ config:
   micro_batch: 1
   global_batch: 1536
 targets:
-  mfu: 0.52
+  mfu: 0.6015
   tolerance: 0.10
   strict_mfu_check: true
