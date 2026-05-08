@@ -17,6 +17,23 @@ def report_to_dict(report: Report) -> dict:
         "total_flops": report.total_flops,
         "warnings": report.warnings,
         "config_summary": report.config_summary,
+        "schedule_name": report.schedule_name,
+        "bubble_fraction": round(report.bubble_fraction, 4),
+        "warmup_ms": round(report.warmup_ms, 3),
+        "steady_ms": round(report.steady_ms, 3),
+        "cooldown_ms": round(report.cooldown_ms, 3),
+        "dp_ar_exposed_ms": round(report.dp_ar_exposed_ms, 3),
+        "optimizer_time_ms": round(report.optimizer_time_ms, 3),
+        "optimizer_comm_ms": round(report.optimizer_comm_ms, 3),
+        "warmup_fwd_ms": round(report.warmup_fwd_ms, 3),
+        "warmup_bwd_ms": round(report.warmup_bwd_ms, 3),
+        "steady_fwd_ms": round(report.steady_fwd_ms, 3),
+        "steady_bwd_ms": round(report.steady_bwd_ms, 3),
+        "cooldown_fwd_ms": round(report.cooldown_fwd_ms, 3),
+        "cooldown_bwd_ms": round(report.cooldown_bwd_ms, 3),
+        "steady_fwd_per_mb_ms": round(report.steady_fwd_per_mb_ms, 3),
+        "steady_bwd_per_mb_ms": round(report.steady_bwd_per_mb_ms, 3),
+        "steady_per_mb_ms": round(report.steady_per_mb_ms, 3),
     }
 
     if report.memory is not None:
@@ -59,8 +76,36 @@ def report_summary(report: Report) -> str:
     lines.append("")
 
     lines.append(f"  Step time:  {report.step_time_ms:.1f} ms")
+    lines.append(f"  Schedule:   {report.schedule_name}")
+    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}")
     lines.append(f"  MFU:        {report.mfu:.1%}")
     lines.append(f"  HFU:        {report.hfu:.1%}")
+
+    if report.warmup_ms > 0 or report.steady_ms > 0:
+        lines.append(f"  Step time breakdown:")
+        lines.append(f"    Phase      | FWD (ms)  | BWD (ms)  | Total (ms)")
+        lines.append(f"    Warmup     | {report.warmup_fwd_ms:9.2f} | {report.warmup_bwd_ms:9.2f} | {report.warmup_ms:9.2f}")
+        lines.append(f"    Steady     | {report.steady_fwd_ms:9.2f} | {report.steady_bwd_ms:9.2f} | {report.steady_ms:9.2f}")
+        lines.append(f"    Cooldown   | {report.cooldown_fwd_ms:9.2f} | {report.cooldown_bwd_ms:9.2f} | {report.cooldown_ms:9.2f}")
+        
+        total_fwd = report.warmup_fwd_ms + report.steady_fwd_ms + report.cooldown_fwd_ms
+        total_bwd = report.warmup_bwd_ms + report.steady_bwd_ms + report.cooldown_bwd_ms
+        total_phase = report.warmup_ms + report.steady_ms + report.cooldown_ms
+        lines.append(f"    TOTAL      | {total_fwd:9.2f} | {total_bwd:9.2f} | {total_phase:9.2f}")
+
+        if report.dp_ar_exposed_ms > 0:
+            lines.append(f"    DP AR exposed:   {report.dp_ar_exposed_ms:.2f} ms")
+        if report.optimizer_time_ms > 0:
+            lines.append(f"    Optimizer:       {report.optimizer_time_ms:.2f} ms")
+        if report.optimizer_comm_ms > 0:
+            lines.append(f"    Opt comm:        {report.optimizer_comm_ms:.2f} ms")
+
+        if report.steady_per_mb_ms > 0:
+            mb_count = int(report.steady_ms / report.steady_per_mb_ms) if report.steady_per_mb_ms > 0 else 0
+            lines.append(f"    Per-microbatch (steady phase):")
+            lines.append(
+                f"    FWD: {report.steady_fwd_per_mb_ms:.2f} ms | BWD: {report.steady_bwd_per_mb_ms:.2f} ms | Total: {report.steady_per_mb_ms:.2f} ms")
+            lines.append(f"    (averaged over {mb_count} microbatches in steady phase)")
 
     if report.memory is not None:
         gb = report.memory.to_gb()

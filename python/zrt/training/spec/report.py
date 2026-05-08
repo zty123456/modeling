@@ -84,6 +84,27 @@ class TrainingReport:
     warmup_steps: int = 0  # [Stack B]
     cooldown_steps: int = 0  # [Stack B]
     steady_steps: int = 0  # [Stack B]
+    
+    # Step time breakdown (milliseconds)
+    warmup_ms: float = 0.0
+    steady_ms: float = 0.0
+    cooldown_ms: float = 0.0
+    dp_ar_exposed_ms: float = 0.0
+    optimizer_time_ms: float = 0.0
+    optimizer_comm_ms: float = 0.0
+    
+    # Fwd/Bwd breakdown per phase (milliseconds)
+    warmup_fwd_ms: float = 0.0
+    warmup_bwd_ms: float = 0.0
+    steady_fwd_ms: float = 0.0
+    steady_bwd_ms: float = 0.0
+    cooldown_fwd_ms: float = 0.0
+    cooldown_bwd_ms: float = 0.0
+    
+    # Per-microbatch time in steady phase (milliseconds)
+    steady_fwd_per_mb_ms: float = 0.0
+    steady_bwd_per_mb_ms: float = 0.0
+    steady_per_mb_ms: float = 0.0
 
     # Config info
     config_summary: str | dict = ""  # [Stack B] uses str, [Stack A] uses dict
@@ -112,6 +133,18 @@ class TrainingReport:
             "total_flops": self.total_flops,
             "bubble_fraction": self.bubble_fraction,
             "schedule_name": self.schedule_name,
+            "warmup_ms": self.warmup_ms,
+            "steady_ms": self.steady_ms,
+            "cooldown_ms": self.cooldown_ms,
+            "dp_ar_exposed_ms": self.dp_ar_exposed_ms,
+            "optimizer_time_ms": self.optimizer_time_ms,
+            "optimizer_comm_ms": self.optimizer_comm_ms,
+            "warmup_fwd_ms": self.warmup_fwd_ms,
+            "warmup_bwd_ms": self.warmup_bwd_ms,
+            "steady_fwd_ms": self.steady_fwd_ms,
+            "steady_bwd_ms": self.steady_bwd_ms,
+            "cooldown_fwd_ms": self.cooldown_fwd_ms,
+            "cooldown_bwd_ms": self.cooldown_bwd_ms,
         }
 
         # Add optional fields if present

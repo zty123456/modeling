@@ -55,7 +55,7 @@ def estimate(
     }
 
     return TrainingReport(
-        step_time_ms=step_result.step_time * 1000,  # convert to ms
+        step_time_ms=step_result.step_time * 1000,
         mfu=step_result.mfu,
         hfu=step_result.hfu,
         memory=step_result.memory,
@@ -65,6 +65,21 @@ def estimate(
         config_summary=config_summary,
         bubble_fraction=step_result.bubble_fraction,
         schedule_name=step_result.schedule_name,
+        warmup_ms=step_result.warmup * 1000,
+        steady_ms=step_result.steady * 1000,
+        cooldown_ms=step_result.cooldown * 1000,
+        dp_ar_exposed_ms=step_result.dp_ar_exposed * 1000,
+        optimizer_time_ms=step_result.optimizer_time * 1000,
+        optimizer_comm_ms=step_result.optimizer_comm * 1000,
+        warmup_fwd_ms=step_result.warmup_fwd * 1000,
+        warmup_bwd_ms=step_result.warmup_bwd * 1000,
+        steady_fwd_ms=step_result.steady_fwd * 1000,
+        steady_bwd_ms=step_result.steady_bwd * 1000,
+        cooldown_fwd_ms=step_result.cooldown_fwd * 1000,
+        cooldown_bwd_ms=step_result.cooldown_bwd * 1000,
+        steady_fwd_per_mb_ms=step_result.steady_fwd_per_mb * 1000,
+        steady_bwd_per_mb_ms=step_result.steady_bwd_per_mb * 1000,
+        steady_per_mb_ms=step_result.steady_per_mb * 1000,
     )
 
 

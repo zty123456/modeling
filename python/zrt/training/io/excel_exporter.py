@@ -83,6 +83,40 @@ def export_estimate_excel(
         ["Step Time", f"{report.step_time_ms:.2f}", "ms"],
         ["Per-Stage Time", f"{report.per_stage_ms:.2f}" if report.per_stage_ms > 0 else "N/A", "ms"],
         ["", "", ""],
+        ["Per-Stage Details", "", ""],
+    ]
+    if report.per_stage:
+        for i, st in enumerate(report.per_stage):
+            summary_rows.append([
+                f"  Stage {i}",
+                f"fwd={st.fwd*1000:.2f}ms  bwd={st.bwd*1000:.2f}ms  total={((st.fwd+st.bwd)*1000):.2f}ms",
+                "",
+            ])
+    summary_rows.extend([
+        ["", "", ""],
+        ["", "", ""],
+        ["Step Time Breakdown", "", ""],
+        ["  Warmup", f"{report.warmup_ms:.2f}" if report.warmup_ms >= 0 else "N/A", "ms"],
+        ["  Steady", f"{report.steady_ms:.2f}" if report.steady_ms >= 0 else "N/A", "ms"],
+        ["  Cooldown", f"{report.cooldown_ms:.2f}" if report.cooldown_ms >= 0 else "N/A", "ms"],
+        ["", "", ""],
+        ["Phase Breakdown", "FWD (ms)", "BWD (ms)"],
+        ["  Warmup", f"{report.warmup_fwd_ms:.2f}" if report.warmup_fwd_ms >= 0 else "N/A",
+         f"{report.warmup_bwd_ms:.2f}" if report.warmup_bwd_ms >= 0 else "N/A"],
+        ["  Steady", f"{report.steady_fwd_ms:.2f}" if report.steady_fwd_ms >= 0 else "N/A",
+         f"{report.steady_bwd_ms:.2f}" if report.steady_bwd_ms >= 0 else "N/A"],
+        ["  Cooldown", f"{report.cooldown_fwd_ms:.2f}" if report.cooldown_fwd_ms >= 0 else "N/A",
+         f"{report.cooldown_bwd_ms:.2f}" if report.cooldown_bwd_ms >= 0 else "N/A"],
+        ["", "", ""],
+        ["Per-Microbatch (steady)", "", ""],
+        ["  FWD", f"{report.steady_fwd_per_mb_ms:.2f}" if report.steady_fwd_per_mb_ms >= 0 else "N/A", "ms"],
+        ["  BWD", f"{report.steady_bwd_per_mb_ms:.2f}" if report.steady_bwd_per_mb_ms >= 0 else "N/A", "ms"],
+        ["  Total", f"{report.steady_per_mb_ms:.2f}" if report.steady_per_mb_ms >= 0 else "N/A", "ms"],
+        ["", "", ""],
+        ["DP AR Exposed", f"{report.dp_ar_exposed_ms:.2f}" if report.dp_ar_exposed_ms >= 0 else "N/A", "ms"],
+        ["Optimizer Time", f"{report.optimizer_time_ms:.2f}" if report.optimizer_time_ms >= 0 else "N/A", "ms"],
+        ["Optimizer Comm", f"{report.optimizer_comm_ms:.2f}" if report.optimizer_comm_ms >= 0 else "N/A", "ms"],
+        ["", "", ""],
         # Efficiency
         ["MFU", f"{report.mfu:.4%}" if report.mfu > 0 else "0.00%", ""],
         ["HFU", f"{report.hfu:.4%}" if report.hfu > 0 else "0.00%", ""],
@@ -94,7 +128,7 @@ def export_estimate_excel(
         ["", "", ""],
         # Memory
         ["Memory (per GPU)", "", ""],
-    ]
+    ])
     if report.memory:
         for k, v in report.memory.to_gb().items():
             summary_rows.append([f"  {k}", f"{v:.2f}", "GB"])
