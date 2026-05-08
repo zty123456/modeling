@@ -45,8 +45,6 @@ def export_estimate_excel(
     # ── Styles ───────────────────────────────────────────────────────────
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill(start_color="1A237E", end_color="1A237E", fill_type="solid")
-    sub_header_font = Font(bold=True, size=10)
-    sub_header_fill = PatternFill(start_color="E8EAF6", end_color="E8EAF6", fill_type="solid")
     thin_border = Border(
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"),
@@ -54,18 +52,21 @@ def export_estimate_excel(
 
     def _write_sheet(ws, rows, col_widths=None):
         """Write rows to a worksheet.
-        Headers (row 1) are centered. Data cells are left-aligned."""
+        Headers (row 1) are centered. Data cells are left-aligned.
+        Empty rows (all blank) get NO style, acting as visual spacers.
+        """
         for r_idx, row in enumerate(rows, 1):
+            is_empty = all(v in (None, "") for v in row)
             for c_idx, val in enumerate(row, 1):
                 cell = ws.cell(row=r_idx, column=c_idx, value=val)
                 if r_idx == 1:
                     cell.font = header_font
                     cell.fill = header_fill
                     cell.alignment = Alignment(horizontal="center", wrap_text=True)
-                elif r_idx == 2 and rows[0] != rows[1]:
-                    cell.font = sub_header_font
-                    cell.fill = sub_header_fill
-                    cell.alignment = Alignment(horizontal="left")
+                elif is_empty:
+                    # Spacer row: explicitly clear borders/fill so it acts as whitespace
+                    cell.border = Border()
+                    cell.fill = PatternFill()
                 else:
                     cell.border = thin_border
                     cell.alignment = Alignment(horizontal="left")
@@ -79,7 +80,6 @@ def export_estimate_excel(
     summary_rows = [
         ["Metric", "Value", "Unit"],
         # Timing
-        ["", "", ""],
         ["Step Time", f"{report.step_time_ms:.2f}", "ms"],
         ["Per-Stage Time", f"{report.per_stage_ms:.2f}" if report.per_stage_ms > 0 else "N/A", "ms"],
         ["", "", ""],
@@ -160,10 +160,16 @@ def export_estimate_excel(
     from zrt.training.compose.stage import op_to_time
     _act_dtype = model.act_dtype if hasattr(model, "act_dtype") else Dtype.BF16
 
+    def _fmt_num(x: float | None) -> str:
+        """Format large numbers as scientific (e.g. 2.28e13) or '-' if empty."""
+        if x is None or x <= 0:
+            return "-"
+        return f"{x:.2e}"
+
     op_rows = [
         ["#", "Op Name", "Kind", "Layer", "Layer Kind",
          "Fwd FLOPs", "Bwd FLOPs", "Total FLOPs",
-         "Bound", "Fwd Bytes", "Bwd Bytes", "Latency (us)"],
+         "Bound", "Fwd Bytes", "Bwd Bytes", "Latency (μs)"],
     ]
     for idx, op in enumerate(graph.ops, 1):
         cost = op_costs.get(op.name)
@@ -188,13 +194,13 @@ def export_estimate_excel(
             op.kind,
             op.layer_id,
             layer_k,
-            fwd_flops if fwd_flops > 0 else None,
-            bwd_flops if bwd_flops > 0 else None,
-            total_flops if total_flops > 0 else None,
+            _fmt_num(fwd_flops),
+            _fmt_num(bwd_flops),
+            _fmt_num(total_flops),
             cost.bound,
-            cost.fwd_bytes if cost.fwd_bytes > 0 else None,
-            cost.dx_bytes + cost.dw_bytes if (cost.dx_bytes + cost.dw_bytes) > 0 else None,
-            f"{latency_us:.2f}" if latency_us > 0 else "N/A",
+            _fmt_num(cost.fwd_bytes),
+            _fmt_num(cost.dx_bytes + cost.dw_bytes),
+            f"{latency_us:.2f}" if latency_us > 0 else "-",
         ])
     _write_sheet(ws2, op_rows, col_widths=[5, 35, 18, 6, 12, 18, 18, 18, 10, 16, 16, 14])
 
@@ -206,7 +212,6 @@ def export_estimate_excel(
     model_rows = [
         ["Parameter", "Value", "Unit"],
         # Core geometry
-        ["", "", ""],
         ["Hidden Size", model.hidden, ""],
         ["FFN Intermediate", model.ffn, ""],
         ["Num Attention Heads", model.num_heads, ""],
@@ -275,7 +280,6 @@ def export_estimate_excel(
     gpu = system.gpu
     hw_rows = [
         ["Parameter", "Value", "Unit"],
-        ["", "", ""],
         ["GPU", gpu.name, ""],
         ["Compute Peak TFLOPs (BF16)", f"{gpu.flops_bf16:.1f}" if gpu.flops_bf16 else "N/A", "TFLOPs"],
         ["Compute Peak TFLOPs (FP8)", f"{gpu.flops_fp8:.1f}" if gpu.flops_fp8 else "N/A", "TFLOPs"],
@@ -301,7 +305,6 @@ def export_estimate_excel(
     ws5 = wb.create_sheet("Strategy")
     strat_rows = [
         ["Parameter", "Value", "Unit"],
-        ["", "", ""],
         ["TP", strategy.tp, ""],
         ["CP", strategy.cp, ""],
         ["PP", strategy.pp, ""],
