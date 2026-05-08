@@ -165,9 +165,26 @@ class TrainingMemoryPass(GraphPass):
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         g = graph.clone()
 
-        param_dtype = 2  # BF16
+        # ── Determine param dtype ─────────────────────────────────────────────
+        # Use actual model dtype from metadata (set by FlopsPass/graph capture),
+        # fallback to BF16=2 bytes when unavailable.
+        param_dtype = g.metadata.get("param_dtype_bytes", 2)
+
+        # ── Layer scaling for partial-trace graphs ─────────────────────────────
+        # When only a subset of layers is traced, count_params(g) returns the
+        # parameter count for those traced layers.  Scale to full model using
+        # the same layer_scale factor computed by TrainingFlopsPass.
+        num_layers = g.metadata.get("num_layers", 0)
+        num_layers_traced = g.metadata.get("num_layers_traced", num_layers)
+        layer_scale = (
+            num_layers / num_layers_traced
+            if num_layers_traced > 0 and num_layers != num_layers_traced
+            else 1.0
+        )
 
         total_params = count_params(g)
+        if layer_scale != 1.0:
+            total_params = int(total_params * layer_scale)
 
         dp = ctx.parallel.dp if ctx.parallel else 1
         tp = ctx.parallel.tp if ctx.parallel else 1

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from zrt.training.compose.schedules import StepResult, pipeline_step_time
 from zrt.training.ir.builders import build_graph
+from zrt.training.ir.training_graph import Graph as _GraphType
 from zrt.training.ir.validate import validate as ir_validate
 from zrt.training.models.flops import total_training_flops
 from zrt.training.models.memory import MemBreakdown
@@ -24,17 +25,26 @@ Report = TrainingReport
 
 def estimate(
     model: ModelSpec, system: SystemSpec, strategy: Strategy,
+    graph: "_GraphType | None" = None,
 ) -> TrainingReport:
     """Single-point evaluation of a training config.
 
     Returns a TrainingReport with step time, MFU, memory, and per-stage breakdown.
+
+    Parameters
+    ----------
+    graph : optional
+        Pre-built IR graph. When provided, skips internal build_graph() call.
+        This avoids duplicate work when the caller already built the graph
+        (e.g., for op_cost computation in the CLI).
     """
     # Validate
     strategy.validate(model, system)
     warnings = ir_validate(model, system, strategy)
 
-    # Build IR
-    graph = build_graph(model, strategy)
+    # Build or reuse IR
+    if graph is None:
+        graph = build_graph(model, strategy)
 
     # Total training FLOPs
     total_flops = total_training_flops(graph, model, strategy)

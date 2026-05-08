@@ -81,7 +81,7 @@ def insert_collectives(graph: Graph, model: ModelSpec, strategy: Strategy) -> No
 
     # Insert EP collectives (expert parallel for MoE)
     if shard.has_ep:
-        _insert_ep_collectives(graph, shard, model, collectives)
+        _insert_ep_collectives(graph, shard, model, strategy, collectives)
 
     graph.collectives.extend(collectives)
 
@@ -373,7 +373,7 @@ def _insert_cp_collectives(
 
 
 def _insert_ep_collectives(
-    graph: Graph, shard: ShardPlan, model: ModelSpec,
+    graph: Graph, shard: ShardPlan, model: ModelSpec, strategy: Strategy,
     collectives: list[Collective],
 ) -> None:
     """Insert EP collectives (A2A pairs for expert parallel).
@@ -391,15 +391,18 @@ def _insert_ep_collectives(
     moe_ffn = model.moe_ffn if model.moe_ffn > 0 else model.ffn
     act_bytes = model.act_dtype.bytes
 
+    # EP A2A payload: micro_batch * seq * hidden * topk * dtype
+    # Each token is routed to topk experts, so A2A must transfer topk copies
+    micro_batch = strategy.micro_batch
+    topk = model.top_k
+    a2a_bytes = micro_batch * seq * h * topk * act_bytes
+
     for layer_id, (start, end) in graph.layer_index.items():
         # Check if this is an MoE layer
         if layer_id >= len(model.layers):
             continue
         if model.layers[layer_id].value != "moe":
             continue
-
-        # A2A payload size: tokens × hidden (after TP and CP sharding)
-        a2a_bytes = seq * h * act_bytes
 
         for i in range(start, end):
             op = graph.ops[i]

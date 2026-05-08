@@ -107,8 +107,10 @@ class CommLatencyPass(GraphPass):
             collective = node.attrs.get("collective", "all_reduce")
             group_size = node.attrs.get("group_size", 1)
 
-            # Compute total data bytes from inputs
-            data_bytes = sum(t.mem_bytes for t in node.inputs)
+            # Compute total data bytes: prefer explicit msg_bytes attr, else tensor sizes
+            data_bytes = node.attrs.get("msg_bytes", 0)
+            if data_bytes == 0:
+                data_bytes = sum(t.mem_bytes for t in node.inputs)
             if data_bytes == 0:
                 data_bytes = sum(t.mem_bytes for t in node.outputs)
             if data_bytes == 0:

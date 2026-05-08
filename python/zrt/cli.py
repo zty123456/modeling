@@ -601,13 +601,14 @@ def _run_estimate(config_path: str, output_path: str | None) -> None:
 
     model, system, strategy = load_specs(config_path)
 
-    # Build graph for op-level details
+    # Build graph for op-level details, then reuse it in estimate()
+    # to avoid duplicate build_graph() calls.
     graph = build_graph(model, strategy)
     op_costs: dict[str, object] = {}
     for op in graph.ops:
         op_costs[op.name] = _op_cost(op, model)
 
-    report = estimate(model, system, strategy)
+    report = estimate(model, system, strategy, graph=graph)
 
     if output_path:
         # If output ends with .xlsx, write Excel; otherwise JSON
