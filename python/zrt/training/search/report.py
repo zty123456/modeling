@@ -31,6 +31,9 @@ def report_to_dict(report: Report) -> dict:
         "steady_bwd_ms": round(report.steady_bwd_ms, 3),
         "cooldown_fwd_ms": round(report.cooldown_fwd_ms, 3),
         "cooldown_bwd_ms": round(report.cooldown_bwd_ms, 3),
+        "steady_fwd_per_mb_ms": round(report.steady_fwd_per_mb_ms, 3),
+        "steady_bwd_per_mb_ms": round(report.steady_bwd_per_mb_ms, 3),
+        "steady_per_mb_ms": round(report.steady_per_mb_ms, 3),
     }
 
     if report.memory is not None:
