@@ -548,89 +548,31 @@ def _build_blocks(
         if bd is not None:
             blocks.append(bd)
 
-    # 2) Layer blocks: merge identical structures, compute repeat
+    # 2) Layer blocks: one block per traced layer (preserves temporal order).
+    #    No cross-layer grouping — interleaved patterns (e.g. V4 even/odd) are
+    #    shown in their actual sequential order.
     if layer_hnodes:
         total_traced_layers = len(layer_hnodes)
         total_real_layers = (getattr(profile, "num_layers", None) if profile else None)
 
-        groups = _group_identical_layers(layer_hnodes, graph)
+        # Scale factor: each traced layer represents this many full-model layers.
+        _layer_scale = (total_real_layers / total_traced_layers
+                        if total_real_layers and total_real_layers > total_traced_layers
+                        else 1.0)
 
-        # Architecture-aware layer counts (when available from profile).
-        _dense_indices: list[int] = (
-            getattr(profile, "dense_layer_indices", None) if profile else None)
-        _sparse_indices: list[int] = (
-            getattr(profile, "sparse_layer_indices", None) if profile else None)
-        _has_arch_info = bool(_dense_indices or _sparse_indices)
-
-        # Count groups per architectural type for distribution.
-        _group_types: dict[str, str] = {}  # sig -> "dense"|"sparse"
-        if _has_arch_info:
-            for _sig, hnodes in groups.items():
-                first_name = hnodes[0].name if hnodes else ""
-                first_idx = int(first_name) if first_name.isdigit() else -1
-                if first_idx >= 0:
-                    if first_idx in (_sparse_indices or []):
-                        _group_types[_sig] = "sparse"
-                    elif first_idx in (_dense_indices or []):
-                        _group_types[_sig] = "dense"
-
-        # Collect (hnodes, bd) pairs; compute repeat scaled to real model depth
-        # when profile.num_layers is available.
-        layer_pairs: list[tuple[list, "BlockDetail"]] = []
-        for _sig, hnodes in groups.items():
-            traced_repeat = len(hnodes)
-
-            if _has_arch_info and _sig in _group_types:
-                # Architecture-aware: assign the exact layer count for this type.
-                _gtype = _group_types[_sig]
-                _type_groups = sum(
-                    1 for t in _group_types.values() if t == _gtype)
-                _type_total = (
-                    len(_sparse_indices) if _gtype == "sparse"
-                    else len(_dense_indices))
-                # Distribute equally among groups of the same type.
-                # Use floor for all but the last, which gets the remainder.
-                _base = _type_total // _type_groups if _type_groups > 0 else 0
-                _rem = _type_total % _type_groups
-                # Which group of this type are we? (deterministic by sig order)
-                _same_type_sigs = sorted(
-                    s for s, t in _group_types.items() if t == _gtype)
-                _my_pos = _same_type_sigs.index(_sig)
-                real_repeat = _base + (1 if _my_pos < _rem else 0)
-            elif (total_real_layers and total_traced_layers > 0
-                    and total_real_layers > total_traced_layers):
-                # Fallback: proportional extrapolation (use ceil-like rounding
-                # to avoid banker's-rounding off-by-one on .5 values).
-                _raw = traced_repeat / total_traced_layers * total_real_layers
-                real_repeat = max(1, int(_raw + 0.5))
-            else:
-                real_repeat = traced_repeat
-
+        for hn in layer_hnodes:
+            layer_idx = int(hn.name) if hn.name.isdigit() else -1
             bd = _build_single_block(
-                hnodes[0], graph, sim_results, phase,
-                total_latency, repeat=real_repeat, profile=profile,
+                hn, graph, sim_results, phase, total_latency,
+                repeat=1, profile=profile,
             )
-            if bd is not None:
-                bd.total_ms = bd.total_ms * real_repeat if bd.total_ms > 0 else 0
-                layer_pairs.append((hnodes, bd))
-
-        # Disambiguate layer blocks that share the same display name by appending
-        # the traced-layer index range (e.g. "TransformerBlock [layers 0-2]").
-        name_count: dict[str, int] = defaultdict(int)
-        for _, bd in layer_pairs:
-            name_count[bd.name] += 1
-
-        for layer_hn_list, bd in layer_pairs:
-            if name_count[bd.name] > 1:
-                indices = sorted(
-                    int(hn.name) for hn in layer_hn_list if hn.name.isdigit()
-                )
-                if indices:
-                    range_str = (
-                        f"layer {indices[0]}" if len(indices) == 1
-                        else f"layers {indices[0]}-{indices[-1]}"
-                    )
-                    bd.name = f"{bd.name} [{range_str}]"
+            if bd is None:
+                continue
+            # Scale timing to represent the full model depth.
+            bd.total_ms = bd.total_ms * _layer_scale if bd.total_ms > 0 else 0
+            bd.repeat = max(1, int(round(_layer_scale)))
+            # Label with the actual traced layer index.
+            bd.name = f"{bd.name} [layer {layer_idx}]"
             blocks.append(bd)
 
     # 3) Suffix blocks (Output, Final Norm, LM Head, …)
@@ -665,36 +607,6 @@ def _build_blocks(
             bd.pct_of_total = bd.total_ms / full_model_total_ms * 100
 
     return blocks
-
-
-def _group_identical_layers(
-    layer_blocks: list["HierNode"],
-    graph: "OpGraph",
-) -> dict[str, list["HierNode"]]:
-    """Group layer blocks that have identical structural signatures."""
-    groups: dict[str, list["HierNode"]] = defaultdict(list)
-
-    for hn in layer_blocks:
-        child_names = sorted([c.name for c in hn.children])
-        node_ids = hn.all_leaf_ids()
-        # For stitched fwd+bwd graphs, prefer forward-phase nodes for the
-        # signature so that bwd nodes with different/empty module_class don't
-        # split what should be one group into two.
-        fwd_ids = [
-            nid for nid in node_ids
-            if graph.nodes.get(nid) and
-            graph.nodes[nid].annotations.get("phase") != "bwd"
-        ]
-        sample_ids = fwd_ids[:5] if fwd_ids else node_ids[:5]
-        module_classes = []
-        for nid in sample_ids:
-            node = graph.nodes.get(nid)
-            if node and node.module_class:
-                module_classes.append(node.module_class)
-        sig = "|".join(child_names) + "::" + "|".join(module_classes)
-        groups[sig].append(hn)
-
-    return dict(groups)
 
 
 def _build_single_block(

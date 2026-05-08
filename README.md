@@ -106,14 +106,14 @@ python -m python.zrt --model-id hf_models/deepseek_v3 --layers 4 --train --hw nv
 # 启用激活重计算
 python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4 --train --hw nvidia_h100_sxm --tp 8 --gradient-checkpointing
 
-# Spec-based 训练估算（无需抓图，纯分析）
+# Spec-based 训练估算（无需抓图，纯分析）→ 默认输出 Excel
 python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
 
 # 网格搜索（Pareto 前沿）
 python -m python.zrt --search-config python/zrt/training/configs/llama3_70b_3d.yaml
 
-# 导出结果为 JSON
-python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml --output llama3_70b_report.json
+# 指定输出路径（.xlsx → Excel，.json → JSON）
+python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml --output my_report.xlsx
 
 # 图模式（torch.compile）
 python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 2 --phases train_backward --graph-mode
@@ -130,10 +130,17 @@ python -m python.zrt --model v3.2
 - `output/<model_slug>/reports/<slug>_<phase>_report.html` — HTML 报告
 - `output/<model_slug>/reports/<slug>_<phase>_trace.json` — Chrome Trace（可在 `chrome://tracing` 中加载）
 
+`--estimate-config` 默认输出 Excel 到 `output/estimate/<config名>_<时间戳>.xlsx`，包含 5 个 sheet：
+- **Summary** — Step time, MFU, HFU, FLOPs, Memory (per GPU), Pipeline schedule
+- **Ops** — 每个算子的 name, kind, layer, FLOPs, bytes, bound, latency (μs)
+- **Model** — 完整模型参数（几何、MoE、HC、MLA、压缩比、dtype 等）
+- **Hardware** — GPU 算力/HBM/网络 tier
+- **Strategy** — 并行配置、batch、schedule、recompute、offload
+
 ### Python API
 
 ```python
-from python.zrt.graph import run_trace_phases
+from python.zrt.pipeline import run_trace_phases
 
 # 推荐：prefill + decode 一次完成
 result = run_trace_phases(
@@ -156,7 +163,7 @@ print(f"输出目录:   {result.output_dir}")
 ```
 
 ```python
-from python.zrt.graph import run_trace
+from python.zrt.pipeline import run_trace
 
 # 单阶段（向后兼容）
 output_dir, records = run_trace(

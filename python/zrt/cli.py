@@ -61,7 +61,8 @@ def main() -> None:
     parser.add_argument(
         "--output",
         metavar="FILE",
-        help="Write estimation/search result as JSON to FILE (used with --estimate-config or --search-config).",
+        help="Write result to FILE. For --estimate-config: .xlsx for Excel report (default), "
+             ".json for JSON. For --search-config: writes Pareto frontier JSON.",
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -296,6 +297,115 @@ def main() -> None:
             _run_inference_pipeline(args, model_id, hw, result)
 
 
+def _build_model_profile(model_id: str, args) -> "SimpleNamespace":
+    """Build a model profile with layer architecture info for report generation.
+
+    Used by both inference and training pipelines so that the HTML report
+    correctly distinguishes dense vs. MoE layers.
+    """
+    from types import SimpleNamespace
+
+    _dense_indices: list[int] = []
+    _sparse_indices: list[int] = []
+    _n_exp = 0
+    _topk = 0
+
+    def _set_from_config_json(_raw: dict) -> bool:
+        """Try to infer architecture from config.json fields.
+
+        Returns True if successful, False if fields are missing.
+        """
+        nonlocal _dense_indices, _sparse_indices, _n_exp, _topk
+
+        _first_k = _raw.get("first_k_dense_replace")
+        _freq = _raw.get("moe_layer_freq")
+
+        # V4-style config: no first_k_dense_replace/moe_layer_freq fields.
+        # Don't compute — let the transformer API handle it.
+        if _first_k is None and _freq is None:
+            return False
+
+        _first_k = _first_k or 0
+        _freq = _freq or 1
+        _total_layers = _raw.get("num_hidden_layers", 61)
+        for i in range(_total_layers):
+            if i < _first_k:
+                _dense_indices.append(i)
+            elif (i - _first_k) % _freq == 0:
+                _sparse_indices.append(i)
+            else:
+                _dense_indices.append(i)
+        _n_exp = _raw.get("n_routed_experts", 0) or _raw.get(
+            "num_local_experts", 0)
+        _topk = _raw.get("num_experts_per_tok", 0) or _raw.get(
+            "moe_topk", 0) or _raw.get("top_k", 0)
+        return True
+
+    try:
+        import json as _json2
+        _cfg_path = Path(model_id) / "config.json"
+        if not _cfg_path.is_absolute():
+            _cfg_path = Path.cwd() / _cfg_path
+
+        if _cfg_path.exists():
+            with open(_cfg_path) as _f:
+                _raw = _json2.load(_f)
+
+            if not _set_from_config_json(_raw):
+                # config.json lacks first_k_dense_replace / moe_layer_freq.
+                # Fall through to transformer API below.
+                _n_exp = _raw.get("n_routed_experts", 0) or _raw.get(
+                    "num_local_experts", 0)
+                _topk = _raw.get("num_experts_per_tok", 0) or _raw.get(
+                    "moe_topk", 0) or _raw.get("top_k", 0)
+                _dense_indices = []
+                _sparse_indices = []
+                # Continue to transformer API fallback below.
+            else:
+                logger.info(
+                    "Architecture (from config.json): %d dense + %d sparse "
+                    "layers (total %d), experts=%d, topk=%d",
+                    len(_dense_indices), len(_sparse_indices),
+                    _raw.get("num_hidden_layers", 61), _n_exp, _topk,
+                )
+    except Exception as _exc:
+        logger.warning("Could not read config.json: %s", _exc)
+
+    # Fallback: use transformers config API (handles V4, Mixtral, etc.)
+    if not _dense_indices and not _sparse_indices:
+        try:
+            from python.zrt.graph.model_loader import infer_layer_types, _load_config
+            _cfg, _ = _load_config(model_id)
+            _types = infer_layer_types(_cfg)
+            _dense_indices = _types["dense"]
+            _sparse_indices = _types["sparse"]
+            if not _n_exp:
+                _n_exp = getattr(_cfg, "n_routed_experts", 0) or getattr(
+                    _cfg, "num_local_experts", 0)
+            if not _topk:
+                _topk = getattr(_cfg, "num_experts_per_tok", 0) or getattr(
+                    _cfg, "moe_topk", 0) or getattr(_cfg, "top_k", 0)
+            logger.info(
+                "Architecture (from transformers API): %d dense + %d sparse "
+                "layers (total %d), experts=%d, topk=%d",
+                len(_dense_indices), len(_sparse_indices),
+                getattr(_cfg, "num_hidden_layers", 0), _n_exp, _topk,
+            )
+        except Exception as _exc:
+            logger.warning("Could not infer layer architecture: %s", _exc)
+
+    return SimpleNamespace(
+        num_layers=getattr(args, "num_layers_full", None) or getattr(args, "layers", 0) or 0,
+        total_param_count=getattr(args, "total_params", 0) or 0,
+        hidden_size=getattr(args, "hidden", 7168) or 7168,
+        is_moe=len(_sparse_indices) > 0,
+        num_experts=_n_exp,
+        moe_topk=_topk,
+        dense_layer_indices=_dense_indices,
+        sparse_layer_indices=_sparse_indices,
+    )
+
+
 def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     """Run the inference transform + simulate + report pipeline."""
     from python.zrt.transform import (
@@ -319,6 +429,8 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 
     slug = _make_model_slug(model_id)
 
+    profile = _build_model_profile(model_id, args)
+
     for phase, (raw_graph, _) in result.graphs.items():
         g = pipe.run(raw_graph, ctx)
 
@@ -332,6 +444,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
                 graph=g, hw_spec=hw, ctx=ctx,
                 output_dir=report_dir, slug=slug,
                 flat_summary=True,
+                profile=profile,
             )
         except Exception as exc:
             logger.warning("Report export failed: %s", exc)
@@ -463,71 +576,9 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         # Hierarchical HTML + Chrome Trace (single export_reports call)
         train_graph = transformed.get("unified") or transformed.get("train_forward")
         if train_graph is not None:
-            from types import SimpleNamespace
             from python.zrt.report import export_reports
 
-            # Load model config to infer layer architecture (dense vs MoE)
-            _dense_indices: list[int] = []
-            _sparse_indices: list[int] = []
-            _n_exp = 0
-            _topk = 0
-            try:
-                # Read layer architecture from model config JSON (avoids
-                # re-loading a potentially modified-in-place config object).
-                import json as _json2
-                _cfg_path = Path(model_id) / "config.json"
-                if not _cfg_path.is_absolute():
-                    _cfg_path = Path.cwd() / _cfg_path
-                if _cfg_path.exists():
-                    with open(_cfg_path) as _f:
-                        _raw = _json2.load(_f)
-                    _first_k = _raw.get("first_k_dense_replace", 0) or 0
-                    _freq = _raw.get("moe_layer_freq", 1) or 1
-                    _total_layers = _raw.get("num_hidden_layers", 61)
-                    _dense_indices = []
-                    _sparse_indices = []
-                    for i in range(_total_layers):
-                        if i < _first_k:
-                            _dense_indices.append(i)
-                        elif (i - _first_k) % _freq == 0:
-                            _sparse_indices.append(i)
-                        else:
-                            _dense_indices.append(i)
-                    _n_exp = _raw.get("n_routed_experts", 0) or _raw.get(
-                        "num_local_experts", 0)
-                    _topk = _raw.get("num_experts_per_tok", 0) or _raw.get(
-                        "moe_topk", 0) or _raw.get("top_k", 0)
-                    logger.info(
-                        "Architecture (from config.json): %d dense + %d sparse "
-                        "layers (total %d), experts=%d, topk=%d",
-                        len(_dense_indices), len(_sparse_indices),
-                        _total_layers, _n_exp, _topk,
-                    )
-                else:
-                    # Fallback: use transformers config API
-                    from python.zrt.graph.model_loader import infer_layer_types
-                    from python.zrt.graph.model_loader import _load_config
-                    _, _cfg = _load_config(model_id)
-                    _types = infer_layer_types(_cfg)
-                    _dense_indices = _types["dense"]
-                    _sparse_indices = _types["sparse"]
-                    _n_exp = getattr(_cfg, "n_routed_experts", 0) or getattr(
-                        _cfg, "num_local_experts", 0)
-                    _topk = getattr(_cfg, "num_experts_per_tok", 0) or getattr(
-                        _cfg, "moe_topk", 0) or getattr(_cfg, "top_k", 0)
-            except Exception as _exc:
-                logger.warning("Could not infer layer architecture: %s", _exc)
-
-            cli_profile = SimpleNamespace(
-                num_layers=args.num_layers_full or args.layers or 0,
-                total_param_count=args.total_params or 0,
-                hidden_size=args.hidden or 7168,
-                is_moe=len(_sparse_indices) > 0,
-                num_experts=_n_exp,
-                moe_topk=_topk,
-                dense_layer_indices=_dense_indices,
-                sparse_layer_indices=_sparse_indices,
-            )
+            cli_profile = _build_model_profile(model_id, args)
             export_reports(
                 model=model_id, hardware=args.hw, phase="train",
                 batch_size=args.batch_size, seq_len=args.seq_len,
@@ -545,14 +596,46 @@ def _run_estimate(config_path: str, output_path: str | None) -> None:
     from python.zrt.training.io.config_loader import load_specs
     from python.zrt.training.search.estimator import estimate
     from python.zrt.training.search.report import report_summary, report_to_json
+    from python.zrt.training.ir.builders import build_graph
+    from python.zrt.training.models.flops import op_cost as _op_cost, total_training_flops
 
     model, system, strategy = load_specs(config_path)
+
+    # Build graph for op-level details
+    graph = build_graph(model, strategy)
+    op_costs: dict[str, object] = {}
+    for op in graph.ops:
+        op_costs[op.name] = _op_cost(op, model)
+
     report = estimate(model, system, strategy)
 
     if output_path:
-        report_to_json(report, output_path)
-        print(f"Report written to {output_path}")
+        # If output ends with .xlsx, write Excel; otherwise JSON
+        if output_path.endswith((".xlsx", ".xls")):
+            from python.zrt.training.io.excel_exporter import export_estimate_excel
+            export_estimate_excel(
+                report=report, graph=graph, model=model,
+                system=system, strategy=strategy,
+                op_costs=op_costs, output_path=output_path,
+            )
+            print(f"Excel report written to {output_path}")
+        else:
+            report_to_json(report, output_path)
+            print(f"Report written to {output_path}")
     else:
+        # Default: write Excel to output/estimate with timestamp
+        from datetime import datetime
+        from python.zrt.training.io.excel_exporter import export_estimate_excel
+        _slug = config_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _default_path = Path("output") / "estimate" / f"{_slug}_{_ts}.xlsx"
+        export_estimate_excel(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=_default_path,
+        )
+        print(f"Excel report written to {_default_path}")
+        print()
         print(report_summary(report))
 
 
