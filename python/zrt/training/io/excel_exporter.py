@@ -183,9 +183,9 @@ def export_estimate_excel(
         layer_k = _LAYER_KIND_MAP.get(op.layer_kind.value, op.layer_kind.value)
 
         # Compute latency from FLOPs/bytes using roofline model
-        fwd_time = op_to_time(fwd_flops, cost.fwd_bytes, cost.bound, system, dtype=_act_dtype)
-        bwd_time = (op_to_time(cost.dx_flops, cost.dx_bytes, cost.bound, system, dtype=_act_dtype)
-                    + op_to_time(cost.dw_flops, cost.dw_bytes, cost.bound, system, dtype=_act_dtype))
+        fwd_time = op_to_time(fwd_flops, cost.fwd_bytes, system, dtype=_act_dtype)
+        bwd_time = (op_to_time(cost.dx_flops, cost.dx_bytes, system, dtype=_act_dtype)
+                    + op_to_time(cost.dw_flops, cost.dw_bytes, system, dtype=_act_dtype))
         latency_us = (fwd_time + bwd_time) * 1e6
 
         op_rows.append([
