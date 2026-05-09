@@ -372,12 +372,10 @@ def _build_indexer_ops(model: ModelSpec, layer_id: int, seq: int,
     coff = 2  # overlapping for m=4
     ops: list[Op] = []
 
-    # Determine compressed_len for meta: V3.2 = full seq, V4-CSA = seq//4
+    # Indexer compressor pools m=4 raw tokens into 1 compressed block (both V3.2 and V4-CSA).
+    # Scoring einsum is (seq, kv_len) where kv_len = seq // 4 after compression.
     cp_type = model.get_layer_cp_type(layer_id) if model.use_v4_attn else 'none'
-    if cp_type == 'csa':
-        kv_len = max(1, seq // 4)
-    else:
-        kv_len = seq
+    kv_len = max(1, seq // 4)
 
     # Indexer queries from q_lora_rank latent
     ops.append(Op(name=f"{prefix}.idx_wq_b", kind="matmul",
@@ -409,20 +407,20 @@ def _build_indexer_ops(model: ModelSpec, layer_id: int, seq: int,
     ops.append(Op(name=f"{prefix}.idx_comp_pool", kind="compressor_pool",
         inputs=[_tensor("idx_kv_raw", (seq, coff * id_), act_dtype),
                 _tensor("idx_score_raw", (seq, coff * id_), act_dtype)],
-        outputs=[_tensor("idx_kv", (seq, id_), act_dtype)],
-        meta={"s": seq, "m": 4, "coff": coff, "d": id_, "bytes_fwd": seq * id_ * act_dtype.bytes},
+        outputs=[_tensor("idx_kv", (kv_len, id_), act_dtype)],
+        meta={"s": seq, "m": 4, "coff": coff, "d": id_, "bytes_fwd": kv_len * id_ * act_dtype.bytes},
         layer_id=layer_id, layer_kind=layer_kind))
 
-    # Scoring: einsum(q, kv) → ReLU × weights → sum → topk
-    # bytes_fwd = all input + output tensors (will be sharded by TP later)
+    # Scoring: einsum(q[seq,ih,id_], kv[kv_len,id_]) → ReLU × weights → topk
+    # idx_kv has kv_len = seq//4 entries after compression
     idx_q_bytes = seq * ih * id_ * act_dtype.bytes
-    idx_kv_bytes = seq * id_ * act_dtype.bytes
+    idx_kv_bytes = kv_len * id_ * act_dtype.bytes
     idx_w_bytes = seq * ih * act_dtype.bytes
     idx_out_bytes = seq * model.index_topk * act_dtype.bytes
     total_bytes = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
     ops.append(Op(name=f"{prefix}.idx_score_topk", kind="indexer_topk",
         inputs=[_tensor("idx_q", (seq, ih * id_), act_dtype),
-                _tensor("idx_kv", (seq, id_), act_dtype),
+                _tensor("idx_kv", (kv_len, id_), act_dtype),
                 _tensor("idx_w", (seq, ih), act_dtype)],
         outputs=[_tensor("topk_indices", (seq, model.index_topk), act_dtype)],
         meta={"s": seq, "ih": ih, "id": id_, "topk": model.index_topk,
