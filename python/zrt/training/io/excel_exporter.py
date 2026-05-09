@@ -169,7 +169,7 @@ def export_estimate_excel(
     _LAYER_KIND_MAP = {
         "dense": "Dense", "moe": "MoE", "mtp": "MTP",
     }
-    from zrt.training.compose.stage import op_to_time, _cost_phase_time
+    from zrt.training.compose.stage import has_heterogeneous_compute, _cost_phase_time
     _act_dtype = model.act_dtype if hasattr(model, "act_dtype") else Dtype.BF16
 
     def _fmt_num(x: float | None) -> str:
@@ -196,7 +196,7 @@ def export_estimate_excel(
 
         # Compute latency from FLOPs/bytes using roofline model (hetero-aware)
         gpu_name = system.gpu.name
-        overlap = system.gpu.overlap_ratio.get(op.kind, 0.0) if system.gpu.cube_tflops is not None else 0.0
+        overlap = system.gpu.overlap_ratio.get(op.kind, 0.0) if has_heterogeneous_compute(system) else 0.0
         fwd_time = _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
         bwd_time = (_cost_phase_time(cost, "dx", system, gpu_name, overlap)
                     + _cost_phase_time(cost, "dw", system, gpu_name, overlap))

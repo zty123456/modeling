@@ -4,7 +4,7 @@ Validates:
 1. OpCost cube/vector FLOPs split per op kind
 2. Heterogeneous timing formula correctness
 3. Backward compatibility (homogeneous hardware produces identical results)
-4. Ascend 910B YAML has cube/vector data; H100 does not
+4. Ascend 910B and H100 YAMLs have cube/vector data
 """
 from __future__ import annotations
 
@@ -76,11 +76,11 @@ class TestHardwareYAML:
         assert hw.compute.cube_bf16_tflops > 0
         assert hw.compute.vector_bf16_tflops > 0
 
-    def test_h100_has_no_hetero_fields(self):
+    def test_h100_has_hetero_fields(self):
         hw = hw_load("nvidia_h100_sxm")
-        assert hw.compute.cube_bf16_tflops is None
-        assert hw.compute.vector_bf16_tflops is None
-        assert hw.compute.overlap_ratio == {}
+        assert hw.compute.cube_bf16_tflops == 989
+        assert hw.compute.vector_bf16_tflops == 66.9
+        assert "attn_core" in hw.compute.overlap_ratio
 
     def test_compute_spec_defaults(self):
         c = ComputeSpec()
@@ -249,6 +249,19 @@ class TestBackwardCompat:
         memory_t = bytes_ / (bw * eff_bw)
         expected = max(compute_t, memory_t)
         assert abs(result - expected) < 1e-18
+
+    def test_partial_hetero_config_falls_back_to_standard_path(self):
+        """One missing hetero peak must not make that work class free."""
+        system = _make_system(flops_bf16=320, cube_tflops=280, vector_tflops=None)
+
+        cube_flops = 1e12
+        vector_flops = 5e11
+        bytes_ = 1e9
+
+        result = op_to_time_hetero(cube_flops, vector_flops, bytes_, system)
+        expected = op_to_time(cube_flops + vector_flops, bytes_, system)
+
+        assert result == expected
 
     def test_hetero_produces_different_result_than_homogeneous(self):
         """On Ascend 910B with attn_core, hetero gives different compute_us."""

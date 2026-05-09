@@ -11,9 +11,11 @@ class GPU:
     hbm_gb: float
     hbm_bw_gbps: float  # aggregate HBM bandwidth (GB/s)
 
-    # Heterogeneous-core fields (None = homogeneous, use flops_bf16 for all ops)
-    cube_tflops: float | None = None      # Cube core peak TFLOP/s (bf16)
-    vector_tflops: float | None = None    # Vector core peak TFLOP/s (bf16)
+    # Heterogeneous-core fields (None = homogeneous, use flops_bf16 for all ops).
+    # "cube" is the matrix/Tensor/Cube peak; both peaks must be set to enable
+    # heterogeneous timing.
+    cube_tflops: float | None = None      # Matrix/Tensor/Cube peak TFLOP/s (bf16)
+    vector_tflops: float | None = None    # Scalar/vector peak TFLOP/s (bf16)
     overlap_ratio: dict[str, float] = field(default_factory=dict)
 
 
