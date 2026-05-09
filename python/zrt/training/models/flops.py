@@ -206,8 +206,17 @@ def _mhc_pre_cost(op: Op) -> OpCost:
     fwd_sink = float(it * b * s * mix * hc) * 4.0
     fwd_sum = float(b * s * hc * h) * 2.0
     fwd = fwd_lin + fwd_sink + fwd_sum
-    # Bytes from meta dims (sinkhorn intermediates not in IR tensors)
-    fwd_bytes = float(2 * b * s * (hc * h) * mix * bpe + b * s * hc * h * bpe)
+
+    # Bytes: input(s, hc*h) + weights(hc*h, mix, read once) + output(s, mix)
+    # plus sinkhorn intermediates (s, mix) and residual (s, hc*h)
+    lin_in_bytes = b * s * (hc * h) * bpe
+    lin_wt_bytes = (hc * h) * mix * bpe  # weights read once, NOT per-token
+    lin_out_bytes = b * s * mix * bpe
+    # Sinkhorn operates on (s, mix) — read/write per iteration
+    sink_bytes = it * b * s * mix * bpe * 2
+    # Residual sum: read (s, hc*h), write (s, hc*h)
+    sum_bytes = b * s * hc * h * bpe * 2
+    fwd_bytes = lin_in_bytes + lin_wt_bytes + lin_out_bytes + sink_bytes + sum_bytes
 
     return OpCost(
         fwd_flops=fwd,
