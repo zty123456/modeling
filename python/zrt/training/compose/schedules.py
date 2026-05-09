@@ -17,7 +17,7 @@ from zrt.training.models.optimizer import muon_optimizer_step_flops, adam_step_f
 from zrt.training.io.perf_tables import achieved_flops_efficiency
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
-from zrt.training.spec.strategy import PPSched, Strategy, resolve_muon_ns_steps
+from zrt.training.spec.strategy import PPSched, Strategy, TPOverlap, resolve_muon_ns_steps
 from zrt.training.spec.system import SystemSpec
 
 
@@ -497,35 +497,6 @@ def pipeline_step_time(
 
     step.per_stage = stage_times
 
-    # Communication time breakdown (aggregate from comm_times dict)
-    # Group by collective group attribute (TP, CP, EP, DP, PP) instead of name prefix
-    # Note: collectives have names like "ag_L0.shared_up_proj", "a2a_before_L0.routed_expert_ffn"
-    # We use the c.group attribute to categorize them
-    tp_comm = sum(comm_times.get(c.name, 0) for c in graph.collectives if c.group == "TP")
-    cp_comm = sum(comm_times.get(c.name, 0) for c in graph.collectives if c.group == "CP")
-    ep_comm = sum(comm_times.get(c.name, 0) for c in graph.collectives if c.group == "EP")
-    # PP P2P contribution to step_time (must match how stage_times affect the schedule).
-    # Each stage has pp_p2p added to fwd and bwd; through 1F1B:
-    #   warmup: (pp-1)*pp_p2p, steady: M*2*pp_p2p, cooldown: (pp-1)*pp_p2p
-    # Total on critical path = (2*(pp-1) + 2*M) * pp_p2p
-    pp_p2p_total = pp_p2p * (2 * (pp - 1) + 2 * M) if pp > 1 else 0.0
-    dp_comm = dp_ar_time  # DP gradient reduce at step end
-
-    step.tp_comm = tp_comm
-    step.cp_comm = cp_comm
-    step.ep_comm = ep_comm
-    step.pp_comm = pp_p2p_total
-    step.dp_comm = dp_comm
-    step.total_comm = tp_comm + cp_comm + ep_comm + pp_p2p_total + dp_comm
-
-    # Compute time = step_time before optimizer - total_comm
-    # (step_time at this point is the pure pipeline time without optimizer)
-    step.compute_time = step.step_time - step.total_comm
-    # Overlap is the portion of comm that is hidden by compute
-    # For now, estimate overlap as max(0, total_comm - exposed_comm)
-    exposed_comm = step.dp_ar_exposed  # DP AR that couldn't be hidden
-    step.overlap_time = max(0.0, step.total_comm - exposed_comm)
-
     # Dual-batch overlap: two batches run simultaneously so the bubble of one
     # is filled by the steady-state work of the other.
     # Residual bubble = max(warmup + cooldown - steady, 0).
@@ -546,6 +517,69 @@ def pipeline_step_time(
         step.cooldown = new_cooldown
         step.dp_ar_exposed = new_dp_exposed
         step.bubble_fraction = residual_bubble / step.step_time if step.step_time > 0 else 0.0
+
+    # === Communication and compute breakdown ===
+    # Placed after dual-batch so step.step_time / step.dp_ar_exposed are final.
+    #
+    # comm_fwd/comm_bwd in StageTime are the *exposed* comm portions — TP/EP overlap
+    # reductions are already applied inside stage_time().  Using the bottleneck stage's
+    # ratio gives a schedule-agnostic critical-path decomposition that is consistent with
+    # however the composer computed step_time.
+    s_bot = max(stage_times, key=lambda st: st.fwd + st.bwd)
+    bot_total = s_bot.fwd + s_bot.bwd
+    bot_comm = s_bot.comm_fwd + s_bot.comm_bwd  # exposed comm per stage per microbatch
+
+    # pipeline_time = step_time minus the exposed DP AR tail
+    pipeline_time = step.step_time - step.dp_ar_exposed
+    comm_frac = (bot_comm / bot_total) if bot_total > 0 else 0.0
+
+    # Exposed comm from pipeline (uses same scale as step_time) + exposed DP AR
+    exposed_comm_excl_dp = pipeline_time * comm_frac
+    step.total_comm = exposed_comm_excl_dp + step.dp_ar_exposed
+    # compute_time is exact by construction: compute_time + total_comm == step_time
+    step.compute_time = step.step_time - step.total_comm
+
+    # PP P2P exposed on critical path (pp_p2p per stage already baked into bot_comm;
+    # derive its critical-path contribution using the same comm_frac scaling)
+    pp_p2p_exposed = (pipeline_time * (2.0 * pp_p2p) / bot_total) if bot_total > 0 else 0.0
+
+    # TP/CP/EP: proportional split of the remaining exposed comm.
+    # Apply TP exposure factor before proportioning (matches stage_time() logic).
+    _tp_expose = (
+        0.0 if strategy.tp_overlap == TPOverlap.MC2
+        else (0.1 if strategy.tp_overlap == TPOverlap.COC else 1.0)
+    )
+    raw_tp = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "TP")
+    raw_cp = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "CP")
+    raw_ep = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "EP")
+    eff_tp = raw_tp * _tp_expose
+    eff_total = eff_tp + raw_cp + raw_ep
+
+    remain = max(0.0, exposed_comm_excl_dp - pp_p2p_exposed)
+    if eff_total > 0 and remain > 0:
+        step.tp_comm = remain * eff_tp / eff_total
+        step.cp_comm = remain * raw_cp / eff_total
+        step.ep_comm = remain * raw_ep / eff_total
+    else:
+        step.tp_comm = 0.0
+        step.cp_comm = 0.0
+        step.ep_comm = 0.0
+    step.pp_comm = pp_p2p_exposed
+    step.dp_comm = step.dp_ar_exposed  # exposed DP AR (not total dp_ar_time)
+
+    # Overlap = comm running in parallel with compute (not on critical path).
+    # DP AR hidden in pipeline bubble — independent, exact.
+    dp_hidden = max(0.0, dp_ar_time - step.dp_ar_exposed)
+    # TP hidden by MC2/CoC — derived from exposure factor and exposed TP.
+    if _tp_expose > 0 and step.tp_comm > 0:
+        tp_hidden = step.tp_comm * (1.0 - _tp_expose) / _tp_expose
+    elif _tp_expose == 0 and raw_tp > 0 and bot_total > 0:
+        # MC2: all TP comm is hidden; estimate from raw TP scaled via same comm ratio
+        raw_tp_per_stage = raw_tp / max(pp, 1)
+        tp_hidden = pipeline_time * raw_tp_per_stage / bot_total
+    else:
+        tp_hidden = 0.0
+    step.overlap_time = dp_hidden + tp_hidden
 
     # Optimizer time and communication
     opt_time = _compute_optimizer_time(model, system, strategy)
