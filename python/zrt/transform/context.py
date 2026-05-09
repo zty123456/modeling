@@ -136,6 +136,7 @@ class TransformContext:
     phase:        str             = "prefill"
     profile:      Any             = None   # ModelProfile (optional)
     stack:        Any             = None   # SoftwareStack (optional)
+    model_id:     str             = ""     # HF model id, used by FusionPass to load platform rules
 
     @property
     def is_training(self) -> bool:

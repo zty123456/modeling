@@ -189,13 +189,15 @@ class TransformedGraphExcelWriter:
                     cell.border = self._thin_border
 
     def _write_transformed_ops_sheet(self, wb: openpyxl.Workbook,
-                                     graph: OpGraph, ctx: TransformContext) -> None:
+                                     graph: OpGraph, ctx: TransformContext,
+                                     sheet_name: str = "Transformed Operators") -> None:
         """Write all transformed operators with detailed annotations."""
         from python.zrt.simulator.backends.roofline import get_op_formulas
-        ws = wb.create_sheet("Transformed Operators")
+        ws = wb.create_sheet(sheet_name)
 
         columns = [
             ("Node ID", 12),
+            ("Op Name", 18),
             ("Op Type", 25),
             ("Category", 12),
             ("Scope", 45),
@@ -273,6 +275,7 @@ class TransformedGraphExcelWriter:
 
             values = [
                 node.id,
+                node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
                 node.op_type,
                 node.category,
                 node.scope,
@@ -1023,13 +1026,20 @@ def _export_json(graph: OpGraph, ctx: TransformContext, output_path: Path) -> No
         node_data = {
             "id": node.id,
             "op_type": node.op_type,
+            "name": node.name,
+            "module_class": node.module_class,
             "category": node.category,
             "scope": node.scope,
             "layer": node.layer,
+            "fused_from": list(node.fused_from),
+            "num_sub_ops": node.num_sub_ops,
+            "fusion_level": node.fusion_level,
             "attrs": node.attrs,
             "annotations": node.annotations,
             "input_shapes": [list(t.shape) for t in node.inputs],
             "output_shapes": [list(t.shape) for t in node.outputs],
+            "input_dtypes": [t.dtype.value for t in node.inputs],
+            "output_dtypes": [t.dtype.value for t in node.outputs],
         }
         data["nodes"].append(node_data)
 
@@ -1064,12 +1074,27 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         ctx: TransformContext,
         output_path: Path,
         training_summary=None,
+        fwd_records: List[Dict[str, Any]] | None = None,
+        bwd_records: List[Dict[str, Any]] | None = None,
     ) -> None:
         """Write training workbook (fwd + bwd graphs + summary sheet)."""
         wb = openpyxl.Workbook()
 
         self._write_metadata_sheet(wb, fwd_graph, ctx)
-        self._write_transformed_ops_sheet(wb, fwd_graph, ctx)
+
+        # Pre-fusion vs post-fusion comparison sheets (when raw records provided).
+        if fwd_records:
+            self._write_raw_operators_sheet(wb, fwd_records, "fwd")
+            self._write_fused_operators_sheet(
+                wb, _graph_to_fused_records(fwd_graph, phase_filter="fwd"), "fwd")
+        if bwd_records:
+            self._write_raw_operators_sheet(wb, bwd_records, "bwd")
+            if bwd_graph is not None:
+                self._write_fused_operators_sheet(
+                    wb, _graph_to_fused_records(bwd_graph, phase_filter="bwd"), "bwd")
+
+        self._write_transformed_ops_sheet(
+            wb, fwd_graph, ctx, sheet_name="Forward Operators")
         self._write_communication_sheet(wb, fwd_graph, ctx)
         self._write_parallelism_summary_sheet(wb, fwd_graph, ctx)
         self._write_stream_assignment_sheet(wb, fwd_graph, ctx)
@@ -1092,6 +1117,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         columns = [
             ("Node ID", 12),
+            ("Op Name", 18),
             ("Op Type", 25),
             ("Category", 12),
             ("Scope", 45),
@@ -1139,6 +1165,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             comm_vol = sum(t.mem_bytes for t in node.outputs) if node.is_comm else ""
             values = [
                 node.id,
+                node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
                 node.op_type,
                 node.category,
                 node.scope,
@@ -1312,12 +1339,52 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         ws.column_dimensions["B"].width = 28
 
 
+def _graph_to_fused_records(graph: OpGraph,
+                            phase_filter: str | None = None) -> List[Dict[str, Any]]:
+    """Build fused-record dicts from an OpGraph for the Fused Operators sheet.
+
+    When the graph is a stitched fwd+bwd unified graph, ``phase_filter``
+    keeps only nodes whose ``annotations["phase"]`` matches.
+    """
+    arrow = " → "
+    records: List[Dict[str, Any]] = []
+    nodes = layer_stable_sort(graph.topo_sort())
+    if phase_filter is not None and (graph.phase == "train"
+                                     or graph.metadata.get("fwd_bwd_stitched")):
+        nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]
+    for idx, node in enumerate(nodes):
+        constituents = node.fused_from or [node.op_type]
+        records.append({
+            "node_id": idx,
+            "fused_op": node.op_type,
+            "aten_ops": arrow.join(constituents),
+            "num_sub_ops": node.num_sub_ops or 1,
+            "layer": node.layer or "",
+            "module_class": node.module_class,
+            "module_path": node.scope,
+            "fusion_level": node.fusion_level or ("leaf" if (node.num_sub_ops or 0) <= 1 else "parent"),
+            "input_shapes": ", ".join(str(t.shape) for t in node.inputs),
+            "input_dtypes": ", ".join(str(t.dtype) for t in node.inputs),
+            "output_shapes": ", ".join(str(t.shape) for t in node.outputs),
+            "output_dtypes": ", ".join(str(t.dtype) for t in node.outputs),
+            "fused_input_shapes": ", ".join(str(t.shape) for t in node.inputs),
+            "fused_input_dtypes": ", ".join(str(t.dtype) for t in node.inputs),
+            "fused_output_shapes": ", ".join(str(t.shape) for t in node.outputs),
+            "fused_output_dtypes": ", ".join(str(t.dtype) for t in node.outputs),
+            "fused_input_sources": "",
+            "fused_output_sources": "",
+        })
+    return records
+
+
 def export_training_graphs(
     fwd_graph: OpGraph,
     bwd_graph: OpGraph | None,
     ctx: TransformContext,
     output_dir: Path,
     training_summary=None,
+    fwd_records: List[Dict[str, Any]] | None = None,
+    bwd_records: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Path]:
     """Export forward + backward training graphs to Excel and JSON.
 
@@ -1347,7 +1414,10 @@ def export_training_graphs(
 
     excel_path = output_dir / f"{base}_training.xlsx"
     writer = TrainingGraphExcelWriter()
-    writer.write_training(fwd_graph, bwd_graph, ctx, excel_path, training_summary)
+    writer.write_training(
+        fwd_graph, bwd_graph, ctx, excel_path, training_summary,
+        fwd_records=fwd_records, bwd_records=bwd_records,
+    )
 
     json_fwd = output_dir / f"{base}_train_forward.json"
     _export_json(fwd_graph, ctx, json_fwd)

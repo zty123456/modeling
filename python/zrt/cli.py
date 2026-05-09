@@ -421,7 +421,6 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     )
     from python.zrt.transform.context import QuantConfig
     from python.zrt.report import export_reports
-    from python.zrt.report.excel_writer import append_perf_summary
 
     quant = QuantConfig(weight=args.quant, activation=args.quant) if args.quant else None
     ctx = TransformContext(
@@ -431,6 +430,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         ),
         stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
         quant=quant,
+        model_id=model_id,
     )
     pipe = build_default_pipeline()
 
@@ -457,20 +457,12 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
             logger.warning("Report export failed: %s", exc)
             continue
 
-        # Print console summary + append Excel
+        # Print console summary
         if flat is not None:
             try:
                 print(f"\n{flat}")
             except UnicodeEncodeError:
                 logger.info("Performance summary: %s", flat)
-
-            xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"
-            if xlsx_path.exists():
-                try:
-                    append_perf_summary(xlsx_path, flat)
-                    logger.info("Performance summary written to %s", xlsx_path)
-                except Exception as exc:
-                    logger.warning("Excel summary append failed: %s", exc)
 
 
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
@@ -478,14 +470,12 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     from python.zrt.transform.analysis import estimate_training_from_graphs
     from python.zrt.transform.exporter import export_training_graphs
 
-    fwd_pair = result.graphs.get("train_forward")
-    if not fwd_pair:
+    raw_fwd = result.graphs.get("train_forward")
+    if raw_fwd is None:
         logger.error("--train --hw requires train_forward phase but none was captured.")
         return
 
-    raw_fwd = fwd_pair[0]
-    bwd_pair = result.graphs.get("train_backward")
-    raw_bwd = bwd_pair[0] if bwd_pair else None
+    raw_bwd = result.graphs.get("train_backward")
 
     if raw_bwd is None:
         logger.warning("No train_backward graph captured; backward metrics will use forward-only fallback.")
@@ -538,6 +528,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         quant=args.quant,
         moe_total_experts=_moe_total,
         moe_active_experts=_moe_active,
+        model_id=model_id,
     )
 
     try:
@@ -559,11 +550,15 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             bwd_for_export = None
 
         if fwd_for_export:
+            fwd_records = result.phase_records.get("train_forward")
+            bwd_records = result.phase_records.get("train_backward")
             export_training_graphs(
                 fwd_graph=fwd_for_export,
                 bwd_graph=bwd_for_export,
                 ctx=ctx,
                 output_dir=output_dir,
+                fwd_records=fwd_records,
+                bwd_records=bwd_records,
             )
             logger.info("Training Excel exported to %s", output_dir / f"{slug}_training.xlsx")
     except Exception as exc:

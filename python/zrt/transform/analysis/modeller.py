@@ -49,6 +49,7 @@ def estimate_training_from_graphs(
     quant: str | None = None,
     moe_total_experts: int = 0,
     moe_active_experts: int = 1,
+    model_id: str = "",
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -95,6 +96,7 @@ def estimate_training_from_graphs(
     quant_cfg = QuantConfig(weight=quant, activation=quant) if quant else None
     ctx = TransformContext(
         hw_spec=hw_spec,
+        model_id=model_id,
         parallel=ParallelConfig(tp=tp, pp=pp, ep=ep, dp=dp, cp=cp),
         training=TrainingConfig(
             optimizer=optimizer,
@@ -192,6 +194,11 @@ def estimate_training_from_graphs(
         config_parts.append(f"micro{training.micro_batch}")
     config_summary = "-".join(config_parts) if config_parts else "default"
 
+    # ── Fused-operator summary ────────────────────────────────────────────────
+    # Walk the transformed graph(s) and aggregate by op_type so the report
+    # can show what fusion produced and how it scales.
+    fused_ops_summary = _summarise_fused_ops(results)
+
     report = TrainingReport(
         config_summary=config_summary,
         step_time_ms=step_time_ms,
@@ -208,8 +215,72 @@ def estimate_training_from_graphs(
         steady_steps=steady_steps,
         bubble_fraction=bubble_fraction,
         total_params=total_params,
+        fused_ops_summary=fused_ops_summary,
     )
 
     if return_transformed:
         return report, ctx, results
     return report
+
+
+# ── Fused-operator summary helper ────────────────────────────────────────────
+
+def _summarise_fused_ops(graphs: dict) -> dict:
+    """Aggregate fused-node statistics across all transformed graphs.
+
+    Skips raw aten.* / comm.* nodes so the table focuses on what fusion
+    actually produced — module-level units (Linear, RMSNorm, ...) and
+    rich-rule outputs (mla_sparse_attn, kv_compressor, rms_norm, ...).
+
+    Returns ``{op_type: {count, sample_names, total_flops, dtype, module_class}}``.
+    """
+    summary: dict[str, dict] = {}
+
+    for g in graphs.values():
+        for node in g.nodes.values():
+            op_type = node.op_type or ""
+            # Skip primitive aten / comm / optimizer nodes — those aren't
+            # the "fused operators" the user wants to see.
+            if op_type.startswith("aten.") or op_type.startswith("comm."):
+                continue
+            if op_type.startswith("optimizer."):
+                continue
+
+            entry = summary.setdefault(op_type, {
+                "count": 0,
+                "sample_names": [],
+                "total_flops": 0.0,
+                "dtype": None,
+                "module_class": None,
+            })
+            entry["count"] += 1
+
+            # Collect a friendly name from scope tail (e.g.
+            # "transformer.layers.0.attn.wq_b" → "wq_b") or from the
+            # leaf_attr stored on the node.  Keep up to 8 unique samples.
+            name = node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else "")
+            if name and name not in entry["sample_names"] and len(entry["sample_names"]) < 8:
+                entry["sample_names"].append(name)
+
+            # Prefer the rule-derived sem_flops; fall back to the
+            # downstream FlopsPass annotation.
+            ann = node.annotations or {}
+            flops = ann.get("sem_flops")
+            if flops is None:
+                flops = ann.get("flops")
+            if isinstance(flops, (int, float)):
+                entry["total_flops"] += float(flops)
+
+            if entry["dtype"] is None:
+                d = ann.get("sem_dtype")
+                if d:
+                    entry["dtype"] = d
+                elif node.inputs:
+                    entry["dtype"] = node.inputs[0].dtype.value
+                elif node.outputs:
+                    entry["dtype"] = node.outputs[0].dtype.value
+
+            if entry["module_class"] is None and node.module_class:
+                entry["module_class"] = node.module_class
+
+    return summary
