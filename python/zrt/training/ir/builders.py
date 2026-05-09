@@ -414,6 +414,12 @@ def _build_indexer_ops(model: ModelSpec, layer_id: int, seq: int,
         layer_id=layer_id, layer_kind=layer_kind))
 
     # Scoring: einsum(q, kv) → ReLU × weights → sum → topk
+    # bytes_fwd = all input + output tensors (will be sharded by TP later)
+    idx_q_bytes = seq * ih * id_ * act_dtype.bytes
+    idx_kv_bytes = seq * id_ * act_dtype.bytes
+    idx_w_bytes = seq * ih * act_dtype.bytes
+    idx_out_bytes = seq * model.index_topk * act_dtype.bytes
+    total_bytes = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
     ops.append(Op(name=f"{prefix}.idx_score_topk", kind="indexer_topk",
         inputs=[_tensor("idx_q", (seq, ih * id_), act_dtype),
                 _tensor("idx_kv", (seq, id_), act_dtype),
@@ -421,7 +427,7 @@ def _build_indexer_ops(model: ModelSpec, layer_id: int, seq: int,
         outputs=[_tensor("topk_indices", (seq, model.index_topk), act_dtype)],
         meta={"s": seq, "ih": ih, "id": id_, "topk": model.index_topk,
               "kv_len": kv_len,
-              "bytes_fwd": seq * ih * id_ * act_dtype.bytes},
+              "bytes_fwd": total_bytes},
         layer_id=layer_id, layer_kind=layer_kind))
 
     return ops

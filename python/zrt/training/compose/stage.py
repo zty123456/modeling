@@ -15,7 +15,7 @@ from zrt.training.models.comm import collective_time, tier_for_group, total_comm
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
-from zrt.training.spec.strategy import Strategy
+from zrt.training.spec.strategy import Strategy, TPOverlap
 from zrt.training.spec.system import SystemSpec
 
 
@@ -97,6 +97,8 @@ def stage_time(
 
     t_comm_fwd = 0.0
     t_comm_bwd = 0.0
+    t_tp_comm_fwd = 0.0
+    t_tp_comm_bwd = 0.0
     for c in stage_collectives:
         group_size = _group_size(c.group, strategy)
         tier = tier_for_group(c.group, group_size, system)
@@ -110,12 +112,21 @@ def stage_time(
             elif c.phase == "both":
                 t_comm_fwd += ct * 0.5
                 t_comm_bwd += ct * 0.5
-        elif c.group in ("TP", "EP"):
-            t_comm_fwd += ct * 0.5
-            t_comm_bwd += ct * 0.5
+        elif c.group == "TP":
+            t_tp_comm_fwd += ct * 0.5
+            t_tp_comm_bwd += ct * 0.5
         else:
             t_comm_fwd += ct * 0.5
             t_comm_bwd += ct * 0.5
+
+    # Apply TP overlap: CoC exposes ~10%, MC2 exposes 0%, NONE exposes 100%
+    tp_expose = 1.0
+    if strategy.tp_overlap == TPOverlap.MC2:
+        tp_expose = 0.0
+    elif strategy.tp_overlap == TPOverlap.COC:
+        tp_expose = 0.1
+    t_comm_fwd += t_tp_comm_fwd * tp_expose
+    t_comm_bwd += t_tp_comm_bwd * tp_expose
 
     t_fwd += t_comm_fwd
     t_bwd_dx += t_comm_bwd

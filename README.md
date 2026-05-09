@@ -61,6 +61,13 @@ uvicorn[standard]>=0.23.0
 
 ### 命令行
 
+#### 两种建模方式
+
+| 方式 | 入口 | 前提 | 适用场景 |
+|------|------|------|----------|
+| 图捕获建模 | `--model-id` [+ `--hw`] | HF model config（几 KB） | 推理/训练算子级分析、精确 FLOPs |
+| 配置估算建模 | `--estimate-config` | YAML 规格文件 | 训练策略快速探索、并行搜索 |
+
 ```bash
 # 推理抓图（HF Hub 模型，只下载 config.json）
 python -m python.zrt --model-id deepseek-ai/DeepSeek-V3-0324 --layers 4
@@ -569,6 +576,41 @@ print(f"捕获算子数: {len(records)}")
 | `--quant` | — | choice | — | 权重/激活量化精度：`int4` / `int8` / `fp8`（默认不量化） |
 
 > 推理模式下，这些参数影响 transform pipeline 的并行模拟（通信算子注入、FLOPs 拆分等）。
+
+#### 并行策略约束规则（`--estimate-config` 模式，参考 Megatron 实现）
+
+**总卡数公式**
+
+```
+TP × CP × PP × DP = world_size（nodes × gpus_per_node）
+```
+
+EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。
+
+**约束汇总**
+
+| 维度 | 规则 | 级别 |
+|------|------|------|
+| 总卡数 | `TP × CP × PP × DP = world_size` | 错误 |
+| TP | `num_heads % TP == 0` | 错误 |
+| TP | `num_kv_heads % TP == 0`（当 `num_kv_heads >= TP` 时）| 错误 |
+| TP | `ffn % TP == 0` | 错误 |
+| TP | `TP > gpus_per_node`（跨节点 TP，性能损失严重）| 警告 |
+| EP | `num_experts % EP == 0` | 错误 |
+| EP | `DP % EP == 0`（EP group 必须是 DP group 的子集）| 警告 |
+| EP | `EP > gpus_per_node`（跨节点 A2A）| 警告 |
+| PP | `PP ≤ num_layers` | 错误 |
+| PP | `num_layers % PP == 0`（否则各 stage 层数不均）| 警告 |
+| PP | `num_microbatches ≥ PP`，其中 `num_microbatches = global_batch / (micro_batch × DP)` | 警告 |
+| ZeRO | `zero_stage ≥ 1` 时要求 `DP > 1` | 错误 |
+| batch | `global_batch % (micro_batch × DP) == 0` | 错误 |
+| VPP | `vpp_chunks > 1` 时要求 `pp_schedule = i1f1b` | 警告 |
+| VPP | `num_layers % (PP × vpp_chunks) == 0` | 警告 |
+| CP(Ulysses) | `(num_heads // TP) % CP == 0` | 警告 |
+| CP(Ring) | `seq_len % (CP × 128) == 0` | 警告 |
+| CP(Hybrid) | 同时满足 Ulysses + Ring 两条规则 | 警告 |
+| CP | `CP > gpus_per_node`（跨节点 CP 通信）| 警告 |
+| CP + EP | 两者同时存在时 A2A pattern 需人工确认 | 警告 |
 
 ### 硬件规格
 

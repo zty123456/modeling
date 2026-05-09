@@ -103,6 +103,10 @@ def total_comm_time(
         result["muon_ag"] = muon_comm.get("muon_ag", 0.0)
         result["muon_rs"] = muon_comm.get("muon_rs", 0.0)
 
+    # PP P2P activation transfer between adjacent stages
+    if strategy.pp > 1:
+        result["pp_p2p"] = pp_p2p_time(model, system, strategy)
+
     return result
 
 
@@ -170,6 +174,35 @@ def optimizer_comm_time(
         "muon_ag": ag_time,
         "muon_rs": rs_time,
     }
+
+
+def pp_p2p_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
+    """One-way P2P activation transfer time between adjacent pipeline stages (seconds).
+
+    For intra-node PP (pp <= gpus_per_node), NVLink bandwidth makes P2P negligible.
+    For cross-node PP, exposed latency + transfer time is in the critical path.
+
+    Returns the per-microbatch P2P overhead added to each stage's fwd and bwd time.
+    """
+    if strategy.pp <= 1:
+        return 0.0
+
+    act_bytes = (
+        strategy.micro_batch * model.seq_len * model.hidden
+        * model.act_dtype.bytes // max(strategy.tp, 1)
+    )
+
+    if strategy.pp <= system.gpus_per_node:
+        tier = system.intra_tier()
+    else:
+        tier = system.inter_tier()
+
+    if tier is None or tier.bw_gbps <= 0:
+        return 0.0
+
+    bw_bytes = tier.bw_gbps * 1e9 / 8
+    latency = tier.latency_us * 1e-6
+    return latency + act_bytes / bw_bytes
 
 
 def _group_size_for(group: str, strategy: Strategy) -> int:

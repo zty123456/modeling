@@ -58,7 +58,9 @@ def op_cost(op: Op, model: ModelSpec) -> OpCost:
         return _mhc_head_cost(op)
     if op.kind in ("ln", "softmax", "rope", "swiglu", "add", "hc_expand"):
         return _elementwise_cost(op)
-    if op.kind in ("embed", "lm_head"):
+    if op.kind == "embed":
+        return _embed_cost(op)
+    if op.kind == "lm_head":
         return _matmul_cost(op)
     if op.kind == "compressor_pool":
         return _compressor_pool_cost(op)
@@ -68,6 +70,35 @@ def op_cost(op: Op, model: ModelSpec) -> OpCost:
         return OpCost()  # table lookup, negligible FLOPs
     # Unknown ops: zero cost
     return OpCost()
+
+
+def _embed_cost(op: Op) -> OpCost:
+    """Embedding lookup: gather operation, memory-bound with zero FLOPs.
+
+    Embedding lookup reads rows from an embedding table based on indices.
+    This is a gather operation, not a matmul, so FLOPs = 0.
+
+    Forward: read embedding table rows -> write embeddings
+    Backward: read embeddings -> update embedding table rows (gradient scatter)
+    """
+    # Get dimensions from op meta
+    seq = op.meta.get("m", 0)  # sequence length
+    hidden = op.meta.get("n", 0)  # embedding dimension
+
+    # Forward bytes: read seq * hidden elements from embedding table
+    # Backward bytes: same volume (gradient scatter)
+    bpe = _bpe(op)
+    fwd_bytes = seq * hidden * bpe
+
+    return OpCost(
+        fwd_flops=0.0,  # gather has no FLOPs
+        dx_flops=0.0,   # scatter gradient has no FLOPs
+        dw_flops=0.0,   # embedding table update is scatter, no FLOPs
+        fwd_bytes=fwd_bytes,
+        dx_bytes=fwd_bytes,
+        dw_bytes=fwd_bytes,
+        bound="memory",
+    )
 
 
 def _matmul_cost(op: Op) -> OpCost:

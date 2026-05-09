@@ -27,6 +27,14 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
                     f"stages will be imbalanced"
                 )
 
+        num_mb = strategy.num_microbatches()
+        if num_mb < strategy.pp:
+            warnings.append(
+                f"num_microbatches ({num_mb}) < PP ({strategy.pp}); "
+                f"pipeline warmup needs at least PP microbatches to fill all stages "
+                f"(increase global_batch or reduce pp)"
+            )
+
     if strategy.cp > 1:
         if strategy.cp_kind == CPKind.NONE:
             warnings.append(
@@ -110,16 +118,29 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
             f"EP A2A will cross node boundaries (inter-node bandwidth)"
         )
 
+    if strategy.ep > 1 and strategy.dp % strategy.ep != 0:
+        warnings.append(
+            f"DP ({strategy.dp}) not divisible by EP ({strategy.ep}); "
+            f"Megatron requires EP groups to be subsets of DP groups (DP % EP == 0)"
+        )
+
     if strategy.tp > system.gpus_per_node:
         warnings.append(
             f"TP ({strategy.tp}) > gpus_per_node ({system.gpus_per_node}); "
             f"TP communication will be inter-node (severe performance penalty)"
         )
 
-    if strategy.vpp_chunks > 1 and strategy.pp_schedule.value != "i1f1b":
-        warnings.append(
-            f"vpp_chunks ({strategy.vpp_chunks}) > 1 but schedule is "
-            f"{strategy.pp_schedule.value}; VPP requires i1f1b schedule"
-        )
+    if strategy.vpp_chunks > 1:
+        if strategy.pp_schedule.value != "i1f1b":
+            warnings.append(
+                f"vpp_chunks ({strategy.vpp_chunks}) > 1 but schedule is "
+                f"{strategy.pp_schedule.value}; VPP requires i1f1b schedule"
+            )
+        if n_layers % (strategy.pp * strategy.vpp_chunks) != 0:
+            warnings.append(
+                f"VPP requires num_layers ({n_layers}) divisible by "
+                f"PP ({strategy.pp}) * vpp_chunks ({strategy.vpp_chunks}) = "
+                f"{strategy.pp * strategy.vpp_chunks}"
+            )
 
     return warnings

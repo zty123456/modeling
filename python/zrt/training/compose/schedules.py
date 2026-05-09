@@ -138,11 +138,11 @@ class OneF1BComposer(PipelineComposer):
         steady = M * t_stage_max
         cooldown = (pp - 1) * t_bwd_max
 
-        # DP AR: hide in bubble if enabled
+        # DP AR: hide in cooldown (backward drain phase) if enabled
         bubble = warmup + cooldown
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(bubble, dp_ar_time)
+            hidden = min(cooldown, dp_ar_time)
             dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
@@ -206,7 +206,7 @@ class Interleaved1F1BComposer(PipelineComposer):
         bubble = warmup + cooldown
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(bubble, dp_ar_time)
+            hidden = min(cooldown, dp_ar_time)
             dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
@@ -264,7 +264,7 @@ class DualPipeComposer(PipelineComposer):
         steady = M * t_stage_max
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(bubble, dp_ar_time)
+            hidden = min(cooldown, dp_ar_time)
             dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
@@ -321,7 +321,7 @@ class DualPipeVComposer(PipelineComposer):
         steady = M * t_stage_max
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(bubble, dp_ar_time)
+            hidden = min(cooldown, dp_ar_time)
             dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
@@ -381,7 +381,7 @@ class ZeroBubbleComposer(PipelineComposer):
 
         dp_exposed = dp_ar_time
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(bubble, dp_ar_time)
+            hidden = min(cooldown, dp_ar_time)
             dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
@@ -461,9 +461,24 @@ def pipeline_step_time(
         st = stage_time(stage_ops, stage_colls, model, system, strategy)
         stage_times.append(st)
 
-    # Compute DP allreduce time
+    # Compute DP allreduce time and PP P2P overhead
     comm_times = total_comm_time(graph, model, system, strategy)
     dp_ar_time = comm_times.get("dp_grad_reduce", 0.0)
+
+    # Add PP P2P per-microbatch cost to each stage's fwd and bwd
+    pp_p2p = comm_times.get("pp_p2p", 0.0)
+    if pp_p2p > 0:
+        stage_times = [
+            StageTime(
+                fwd=st.fwd + pp_p2p,
+                bwd=st.bwd + pp_p2p,
+                bwd_dx=st.bwd_dx + pp_p2p,
+                bwd_dw=st.bwd_dw,
+                comm_fwd=st.comm_fwd + pp_p2p,
+                comm_bwd=st.comm_bwd + pp_p2p,
+            )
+            for st in stage_times
+        ]
 
     # Compose according to schedule
     composer_cls = COMPOSER_BY_SCHED.get(strategy.pp_schedule, OneF1BComposer)
@@ -471,6 +486,27 @@ def pipeline_step_time(
     step = composer.compose(stage_times, M, pp, dp_ar_time, strategy)
 
     step.per_stage = stage_times
+
+    # Dual-batch overlap: two batches run simultaneously so the bubble of one
+    # is filled by the steady-state work of the other.
+    # Residual bubble = max(warmup + cooldown - steady, 0).
+    # When M >> PP-1 (typical), steady >> bubble → bubble fully hidden.
+    if strategy.dualbatch and pp > 1:
+        original_bubble = step.warmup + step.cooldown
+        residual_bubble = max(original_bubble - step.steady, 0.0)
+        bubble_saved = original_bubble - residual_bubble
+        new_cooldown = residual_bubble / 2.0
+        # Recompute DP AR exposure against the shrunk cooldown window
+        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
+            new_dp_exposed = dp_ar_time - min(new_cooldown, dp_ar_time)
+        else:
+            new_dp_exposed = step.dp_ar_exposed
+        dp_delta = new_dp_exposed - step.dp_ar_exposed
+        step.step_time = step.step_time - bubble_saved + dp_delta
+        step.warmup = residual_bubble / 2.0
+        step.cooldown = new_cooldown
+        step.dp_ar_exposed = new_dp_exposed
+        step.bubble_fraction = residual_bubble / step.step_time if step.step_time > 0 else 0.0
 
     # Optimizer time and communication
     opt_time = _compute_optimizer_time(model, system, strategy)
