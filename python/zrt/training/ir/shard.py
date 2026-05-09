@@ -525,9 +525,10 @@ def _apply_tp_sharding(
                     elif "idx_w" in t.name and t.shape_logical:
                         t.shape_local = (t.shape_logical[0], ih_local)
                 # Scale bytes_fwd: idx_q and idx_w are sharded by ih/TP,
-                # idx_kv and output are replicated (shared across TP ranks).
+                # idx_kv uses compressed kv_len (for CSA), output is replicated.
+                kv_len = op.meta.get("kv_len", op.meta.get("s", 0))
                 idx_q_bytes = op.meta.get("s", 0) * ih_local * id_ * 2
-                idx_kv_bytes = op.meta.get("s", 0) * id_ * 2
+                idx_kv_bytes = kv_len * id_ * 2
                 idx_w_bytes = op.meta.get("s", 0) * ih_local * 2
                 idx_out_bytes = op.meta.get("s", 0) * op.meta.get("topk", 0) * 2
                 op.meta["bytes_fwd"] = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
