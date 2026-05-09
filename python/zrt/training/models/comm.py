@@ -179,20 +179,26 @@ def optimizer_comm_time(
 def pp_p2p_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
     """One-way P2P activation transfer time between adjacent pipeline stages (seconds).
 
-    For intra-node PP (pp <= gpus_per_node), NVLink bandwidth makes P2P negligible.
-    For cross-node PP, exposed latency + transfer time is in the critical path.
+    Activation shape per PP boundary: (micro_batch, seq_len/cp, hidden/tp).
+    CP shards the sequence, so each rank only transfers its local token slice.
+
+    Tier selection: in Megatron layout [DP, PP, CP, TP] (outer→inner), adjacent PP
+    stages are separated by cp*tp GPUs. They are intra-node only when both stages'
+    full CP×TP groups fit within one node: cp*tp*2 <= gpus_per_node.
 
     Returns the per-microbatch P2P overhead added to each stage's fwd and bwd time.
     """
     if strategy.pp <= 1:
         return 0.0
 
+    cp = max(strategy.cp, 1)
     act_bytes = (
-        strategy.micro_batch * model.seq_len * model.hidden
+        strategy.micro_batch * (model.seq_len // cp) * model.hidden
         * model.act_dtype.bytes // max(strategy.tp, 1)
     )
 
-    if strategy.pp <= system.gpus_per_node:
+    # Adjacent PP stages span cp*tp GPUs; intra-node only if both fit in one node.
+    if strategy.tp * cp * 2 <= system.gpus_per_node:
         tier = system.intra_tier()
     else:
         tier = system.inter_tier()
