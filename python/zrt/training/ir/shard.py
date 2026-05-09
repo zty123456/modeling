@@ -391,11 +391,12 @@ def _insert_ep_collectives(
     moe_ffn = model.moe_ffn if model.moe_ffn > 0 else model.ffn
     act_bytes = model.act_dtype.bytes
 
-    # EP A2A payload: micro_batch * seq * hidden * topk * dtype
-    # Each token is routed to topk experts, so A2A must transfer topk copies
+    # EP A2A payload: micro_batch * seq * hidden * topk * dtype / EP
+    # Each token is routed to topk experts, but A2A distributes tokens across EP ranks
+    # So each rank sends/receives 1/EP of the total routed data
     micro_batch = strategy.micro_batch
     topk = model.top_k
-    a2a_bytes = micro_batch * seq * h * topk * act_bytes
+    a2a_bytes = micro_batch * seq * h * topk * act_bytes // shard.ep
 
     for layer_id, (start, end) in graph.layer_index.items():
         # Check if this is an MoE layer

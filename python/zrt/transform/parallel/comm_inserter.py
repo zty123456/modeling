@@ -130,12 +130,10 @@ class CommInserterPass(GraphPass):
         micro_batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 8
 
-        # EP dispatch: each rank sends batch * seq_len * hidden * topk bytes
-        # (dispatch: tokens are scattered to experts based on routing)
-        # EP combine: each rank receives batch * seq_len * hidden * topk bytes
-        # (combine: expert outputs are gathered back)
-        # Total A2A volume = batch * seq_len * hidden * topk * dtype_bytes
-        ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes
+        # EP dispatch/combine: A2A distributes routed tokens across EP ranks
+        # Each rank sends/receives 1/EP of the total routed data
+        # Message size = batch * seq_len * hidden * topk / EP * dtype_bytes
+        ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes // ep
 
         # Import TensorMeta for creating correct tensor shapes
         from python.zrt.ir.types import TensorMeta, DType
