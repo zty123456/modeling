@@ -227,7 +227,11 @@ def test_class_only_rules_dont_have_op_regexes(loaded_rules):
 def test_no_duplicate_rule_signatures(loaded_rules):
     sigs = [(str(r.target_class), r.op_type) for r in loaded_rules]
     counts = Counter(sigs)
-    duplicates = [k for k, v in counts.items() if v > 1]
+    # ``hc_pre`` legitimately has two rules: a raw 11-op form and a
+    # post-rms_coef 8-op form (for multi-pass fusion).  The rules have
+    # distinct names; only the (target_class, op_type) pair collides.
+    allowed = {("*", "hc_pre")}
+    duplicates = [k for k, v in counts.items() if v > 1 and k not in allowed]
     assert not duplicates, f"duplicate rule signatures: {duplicates}"
 
 

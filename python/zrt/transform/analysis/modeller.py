@@ -50,6 +50,7 @@ def estimate_training_from_graphs(
     moe_total_experts: int = 0,
     moe_active_experts: int = 1,
     model_id: str = "",
+    fusion_config: "FusionConfig | None" = None,
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -66,7 +67,9 @@ def estimate_training_from_graphs(
     output_dir : str or Path, optional
         If provided, export each transformed graph as a DOT file to this directory.
     """
-    from python.zrt.transform.context import ParallelConfig, QuantConfig, TrainingConfig, TransformContext
+    from python.zrt.transform.context import (
+        FusionConfig, ParallelConfig, QuantConfig, TrainingConfig, TransformContext,
+    )
     from python.zrt.transform.pipeline import build_default_pipeline
 
     metadata: dict = {
@@ -108,6 +111,7 @@ def estimate_training_from_graphs(
             pp_schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
         ),
+        fusion=fusion_config or FusionConfig(),
         quant=quant_cfg,
     )
 
@@ -133,22 +137,34 @@ def estimate_training_from_graphs(
     else:
         results["train_forward"] = pipe.run(forward_graph, ctx)
 
-    # DOT export
+    # DOT export.
+    #
+    # ``render_dot`` shells out to graphviz ``dot``; layout is super-linear
+    # in node count (with ``splines=ortho`` it can take ~15s per 1k-node
+    # graph, ~hours for 5k+).  Production runs only need the ``.dot`` text
+    # — anyone wanting the SVG can render manually.  We skip rendering for
+    # graphs above ``_RENDER_DOT_NODE_BUDGET`` so the e2e stays fast.
+    _RENDER_DOT_NODE_BUDGET = 300
     if output_dir is not None:
         from python.zrt.report.dot_exporter import export_dot, render_dot
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         model_name = forward_graph.name or "model"
+
+        def _maybe_render(graph, dot_path):
+            if len(graph.nodes) <= _RENDER_DOT_NODE_BUDGET:
+                render_dot(dot_path)  # no-op when graphviz absent
+
         # Export raw forward and backward graphs separately
         dot_path = export_dot(forward_graph, out / f"{model_name}_train_forward.dot")
-        render_dot(dot_path)  # no-op when graphviz absent
+        _maybe_render(forward_graph, dot_path)
         if backward_graph is not None:
             dot_path = export_dot(backward_graph, out / f"{model_name}_train_backward.dot")
-            render_dot(dot_path)
+            _maybe_render(backward_graph, dot_path)
         # Export transformed graphs (unified or forward-only)
         for tag, g in results.items():
             dot_path = export_dot(g, out / f"{model_name}_{tag}.dot")
-            render_dot(dot_path)  # no-op when graphviz absent
+            _maybe_render(g, dot_path)
 
     if "unified" in results:
         g = results["unified"]

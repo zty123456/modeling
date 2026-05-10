@@ -1,5 +1,9 @@
 """Fusion-node semantic field derivation.
 
+Step-1 note: file body literally copied from the original
+``python/zrt/transform/fusion/semantics.py``; only the import path of
+``safe_eval`` / ``FormulaError`` was adjusted.
+
 Given a matched fusion group + ``ModuleFusionRule``, derive the semantic
 quantities (batch_size / seq_len / hidden_in / hidden_out / dtype /
 flops / memory_bytes) and write them into ``fused_node.annotations``
@@ -23,12 +27,12 @@ from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING, Any, Optional
 
-from ._safe_eval import FormulaError, safe_eval
+from .safe_eval import FormulaError, safe_eval
 
 if TYPE_CHECKING:  # pragma: no cover
     from python.zrt.ir.node import OpNode
     from python.zrt.ir.types import TensorMeta
-    from .rule import ModuleFusionRule
+    from python.zrt.transform.fusion.core.rule import ModuleFusionRule
 
 
 logger = logging.getLogger(__name__)

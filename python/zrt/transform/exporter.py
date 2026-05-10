@@ -567,15 +567,24 @@ class TransformedGraphExcelWriter:
         sheet_name = f"Fused Operators ({label})" if label else "Fused Operators"
         ws = wb.create_sheet(sheet_name)
         columns = [
-            ("Node ID", 8), ("Fused Operator", 38), ("Constituent Aten Ops", 70),
-            ("Sub-ops", 9), ("Layer", 7),
+            ("Node ID", 8), ("Op Name", 18), ("Rule Name", 22),
+            ("Fused Operator", 38),
+            ("Constituent Aten Ops", 70),
+            ("Sub-ops", 9), ("Raw Op IDs", 28), ("Layer", 7),
             ("Fused Input Shapes", 55), ("Fused Input Dtypes", 30), ("Input Sources", 60),
             ("Fused Output Shapes", 55), ("Fused Output Dtypes", 30), ("Output Sources", 60),
         ]
         self._write_header(ws, columns)
         for row_idx, rec in enumerate(fused, 2):
             values = [
-                rec["node_id"], rec["fused_op"], rec["aten_ops"], rec["num_sub_ops"], rec["layer"],
+                rec["node_id"],
+                rec.get("op_name", ""),
+                rec.get("rule_name", ""),
+                rec["fused_op"],
+                rec["aten_ops"],
+                rec["num_sub_ops"],
+                rec.get("raw_op_ids", ""),
+                rec["layer"],
                 rec.get("fused_input_shapes", rec["input_shapes"]),
                 rec.get("fused_input_dtypes", rec["input_dtypes"]),
                 rec.get("fused_input_sources", ""),
@@ -584,7 +593,7 @@ class TransformedGraphExcelWriter:
                 rec.get("fused_output_sources", ""),
             ]
             self._write_row(ws, row_idx, values, get_fill(rec["fused_op"]),
-                            center_cols={1, 4})
+                            center_cols={1, 6})
         ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(fused) + 1}"
         ws.freeze_panes = "A2"
 
@@ -1354,11 +1363,25 @@ def _graph_to_fused_records(graph: OpGraph,
         nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]
     for idx, node in enumerate(nodes):
         constituents = node.fused_from or [node.op_type]
+        # Recover the "raw Node IDs that fused into this node".  Strip the
+        # ``op_`` / ``bwd_op_`` prefix so the value lines up with the Node ID
+        # column in the Raw Operators sheet.
+        src_ids_raw = node.annotations.get("source_op_ids") or [node.id]
+        def _strip(idstr: str) -> str:
+            s = str(idstr)
+            for pre in ("bwd_op_", "op_"):
+                if s.startswith(pre):
+                    return s[len(pre):]
+            return s
+        raw_ids_str = ",".join(_strip(s) for s in src_ids_raw)
         records.append({
             "node_id": idx,
+            "op_name": node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
+            "rule_name": node.annotations.get("fused_by_rule", "") or "",
             "fused_op": node.op_type,
             "aten_ops": arrow.join(constituents),
             "num_sub_ops": node.num_sub_ops or 1,
+            "raw_op_ids": raw_ids_str,
             "layer": node.layer or "",
             "module_class": node.module_class,
             "module_path": node.scope,
