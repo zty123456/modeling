@@ -500,10 +500,10 @@ def total_training_flops(
     total = 0.0
     for op in graph.ops:
         cost = op_cost(op, model)
-        if cost.bound == "compute":
-            # Forward + dx + dw = 3× fwd_flops (2mnk × 3 = 6mnk for matmul)
-            total += cost.fwd_flops + cost.dx_flops + cost.dw_flops
-        # Memory-bound ops contribute negligible FLOPs
+        # Include ALL ops (compute-bound + memory-bound) for accurate FLOP
+        # accounting. Memory-bound ops have low FLOP counts but still consume
+        # real hardware cycles; excluding them artificially inflates MFU.
+        total += cost.fwd_flops + cost.dx_flops + cost.dw_flops
 
     # Scale by microbatch count
     M = strategy.num_microbatches()
@@ -560,8 +560,7 @@ def recompute_overhead_flops(
         op_cats = _op_recompute_categories(op)
         if "full" in cats or (op_cats & cats):
             cost = op_cost(op, model)
-            if cost.bound == "compute":
-                extra += cost.fwd_flops
+            extra += cost.fwd_flops
 
     M = strategy.num_microbatches()
     return extra * M

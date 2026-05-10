@@ -442,12 +442,37 @@ else:
 
 训练建模报告包含：
 
-- **Step time**：含 1F1B 流水线调度的完整 step 耗时
-- **MFU**：Model FLOPs Utilization
-- **HFU**：Hardware FLOPs Utilization（含重计算开销）
+- **Step time**：含流水线调度的完整 step 耗时
+- **MFU / HFU**：Model / Hardware FLOPs Utilization（HFU 含重计算开销）
 - **FLOPs 分解**：前向 / 反向 / 总计
 - **内存（每 GPU）**：权重 / 梯度 / 优化器状态 / 激活值 / 通信缓冲
 - **流水线指标**：warmup / steady / cooldown 步数、bubble 占比
+- **时延分解**：见下表
+
+### 时延分解字段
+
+Step time 按正交维度拆解，所有字段满足严格恒等式（单位 ms）：
+
+| 字段 | 含义 | 恒等式 |
+|------|------|--------|
+| `step_time_ms` | 完整单步耗时 | `= pipeline_time + optimizer_time + optimizer_comm` |
+| `pipeline_time_ms` | 流水线时间 | `= compute_time + exposed_comm` |
+| `compute_time_ms` | 关键路径纯计算 | — |
+| `exposed_comm_ms` | 关键路径通信（暴露，阻塞计算）| `= Σ *_exposed_ms` |
+| `hidden_comm_ms` | 非关键路径通信（掩盖，与计算重叠）| `= Σ *_hidden_ms` |
+| `total_comm_volume_ms` | 总通信量 | `= exposed_comm + hidden_comm` |
+| `optimizer_time_ms` | 优化器步计算 | — |
+| `optimizer_comm_ms` | 优化器通信（如 Muon AG+RS）| — |
+
+各并行组的暴露 / 掩盖拆分（`exposed_comm = Σ`，`hidden_comm = Σ`）：
+
+| 并行组 | 暴露字段 | 掩盖字段 | 掩盖机制 |
+|--------|---------|---------|---------|
+| TP | `tp_exposed_ms` | `tp_hidden_ms` | CoC（保留 10%）/ MC2（全掩盖）|
+| CP | `cp_exposed_ms` | — | — |
+| EP | `ep_exposed_ms` | `ep_hidden_ms` | wave-overlap（Expert GEMM 与 A2A 重叠）|
+| PP | `pp_exposed_ms` | — | — |
+| DP | `dp_exposed_ms` | `dp_hidden_ms` | 流水线 bubble 期间执行 AR/RS |
 
 ### Python API
 

@@ -143,6 +143,12 @@ def export_estimate_excel(
         ["Forward FLOPs", f"{report.forward_flops/1e12:.2f}" if report.forward_flops > 0 else "N/A", "TFLOPs"],
         ["Backward FLOPs", f"{report.backward_flops/1e12:.2f}" if report.backward_flops > 0 else "N/A", "TFLOPs"],
         ["", "", ""],
+        # Derived FLOPs metrics
+        ["FLOPs/Token", f"{report.flops_per_token:.2e}" if report.flops_per_token > 0 else "N/A", ""],
+        ["Tokens/Second", f"{report.tokens_per_sec:.0f}" if report.tokens_per_sec > 0 else "N/A", ""],
+        ["Effective Params", f"{report.effective_params/1e9:.2f}B" if report.effective_params > 0 else "N/A", ""],
+        ["Total Params", f"{model.total_params()/1e9:.2f}B", ""],
+        ["", "", ""],
         # Memory
         ["Memory (per GPU)", "", ""],
     ])

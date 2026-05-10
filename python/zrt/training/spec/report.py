@@ -140,6 +140,11 @@ class TrainingReport:
     # Model info
     total_params: int = 0  # [Stack B]
 
+    # Derived metrics (graph-based FLOPs accounting)
+    tokens_per_sec: float = 0.0      # Training throughput
+    effective_params: int = 0        # P_eff used for MoE-aware accounting
+    flops_per_token: float = 0.0     # Actual FLOPs consumed per token
+
     def __post_init__(self) -> None:
         """Sync total_flops with training_flops for unified contract.
 
@@ -211,6 +216,12 @@ class TrainingReport:
             result["steady_steps"] = self.steady_steps
         if self.total_params > 0:
             result["total_params"] = self.total_params
+        if self.effective_params > 0:
+            result["effective_params"] = self.effective_params
+        if self.flops_per_token > 0:
+            result["flops_per_token"] = self.flops_per_token
+        if self.tokens_per_sec > 0:
+            result["tokens_per_sec"] = self.tokens_per_sec
         if self.warnings:
             result["warnings"] = self.warnings
 

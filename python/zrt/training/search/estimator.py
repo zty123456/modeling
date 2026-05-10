@@ -66,6 +66,12 @@ def estimate(
     }
 
     s = step_result
+    # Derived metrics
+    tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
+    pre_opt_time = s.step_time  # MFU/HFU computed before optimizer addition
+    tokens_per_sec = tokens / pre_opt_time if pre_opt_time > 0 else 0.0
+    flops_per_token = total_flops / tokens if tokens > 0 else 0.0
+
     return TrainingReport(
         step_time_ms=s.step_time * 1000,
         pipeline_time_ms=s.pipeline_time * 1000,
@@ -108,6 +114,10 @@ def estimate(
         tp_hidden_ms=s.tp_hidden * 1000,
         ep_hidden_ms=s.ep_hidden * 1000,
         total_comm_volume_ms=s.total_comm_volume * 1000,
+        # Derived metrics
+        tokens_per_sec=tokens_per_sec,
+        effective_params=model.effective_params_for_flops(),
+        flops_per_token=flops_per_token,
     )
 
 

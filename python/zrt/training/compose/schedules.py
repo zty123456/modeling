@@ -626,7 +626,7 @@ def pipeline_step_time(
     step.memory = memory_breakdown(graph, model, system, strategy)
 
     # MFU (before adding optimizer time, per design doc §5.5.2)
-    step.mfu = compute_mfu(model, strategy, system, step.step_time)
+    step.mfu = compute_mfu(model, strategy, system, step.step_time, graph)
 
     # HFU
     step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
@@ -730,25 +730,27 @@ def util_from_flops(flops: float, peak_flops_total: float, step_time_s: float) -
 def compute_mfu(
     model: ModelSpec, strategy: Strategy,
     system: SystemSpec, step_time: float,
+    graph: Graph,
 ) -> float:
     """Model FLOPs Utilization.
 
-    MFU = model_flops_per_token * tokens_per_step / (world_size * peak_flops * step_time)
+    MFU = actual_training_flops / (world_size * peak_flops * step_time)
 
-    For MoE models, uses effective_params_for_flops() which accounts for top_k
-    expert sparsity instead of counting all expert parameters.
+    Uses actual graph-level FLOP accounting (Σ op_fwd+op_dx+op_dw × M)
+    instead of the 6P rule-of-thumb, which overestimates for MoE + low-rank
+    architectures (e.g. DeepSeek-V4: 6P gives 30× more FLOPs than actual).
     """
-    # Model FLOPs per token for forward pass: ~6 * P (P = effective params)
-    # Full training step (fwd+bwd): ~6P per token
-    # For MoE: effective_params_for_flops() only counts active expert params (top_k/num_experts)
-    P = model.effective_params_for_flops()
+    from zrt.training.models.flops import total_training_flops
+
     tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
-    model_flops = 6.0 * P * tokens  # 6P rule
+    actual_flops = total_training_flops(graph, model, strategy)
 
-    # Peak FLOP/s of entire cluster
-    peak = system.gpu.flops_bf16 * 1e12 * system.world_size  # TFLOP/s -> FLOP/s, times world
+    # Peak FLOP/s of single GPU (total_flops is per-GPU because the graph
+    # models sharded computation; cluster-wide FLOPs = per_gpu × world_size,
+    # and cluster peak = per_gpu_peak × world_size — the world_size cancels).
+    peak = system.gpu.flops_bf16 * 1e12
 
-    return util_from_flops(model_flops, peak, step_time)
+    return util_from_flops(actual_flops, peak, step_time)
 
 
 def compute_hfu(
@@ -758,12 +760,12 @@ def compute_hfu(
 ) -> float:
     """Hardware FLOPs Utilization — accounts for recomputed activations.
 
-    HFU = (model_flops + recompute_overhead) / (peak * step_time)
+    HFU = (actual_training_flops + recompute_overhead) / (peak * step_time)
     """
-    P = model.effective_params_for_flops()
-    tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
-    model_flops = 6.0 * P * tokens
-    rc_overhead = recompute_overhead_flops(graph, model, strategy)
-    peak = system.gpu.flops_bf16 * 1e12 * system.world_size
+    from zrt.training.models.flops import total_training_flops, recompute_overhead_flops
 
-    return util_from_flops(model_flops + rc_overhead, peak, step_time)
+    actual_flops = total_training_flops(graph, model, strategy)
+    rc_overhead = recompute_overhead_flops(graph, model, strategy)
+    peak = system.gpu.flops_bf16 * 1e12
+
+    return util_from_flops(actual_flops + rc_overhead, peak, step_time)

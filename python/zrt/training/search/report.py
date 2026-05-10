@@ -46,6 +46,9 @@ def report_to_dict(report: Report) -> dict:
         "tp_hidden_ms": round(report.tp_hidden_ms, 3),
         "ep_hidden_ms": round(report.ep_hidden_ms, 3),
         "total_comm_volume_ms": round(report.total_comm_volume_ms, 3),
+        "tokens_per_sec": round(report.tokens_per_sec, 1),
+        "effective_params": report.effective_params,
+        "flops_per_token": report.flops_per_token,
     }
 
     if report.memory is not None:
@@ -92,6 +95,11 @@ def report_summary(report: Report) -> str:
     lines.append(f"  Bubble:     {report.bubble_fraction:.1%}")
     lines.append(f"  MFU:        {report.mfu:.1%}")
     lines.append(f"  HFU:        {report.hfu:.1%}")
+
+    if report.flops_per_token > 0:
+        lines.append(f"  FLOPs/token: {report.flops_per_token:.2e}")
+    if report.tokens_per_sec > 0:
+        lines.append(f"  Tokens/s:    {report.tokens_per_sec:.0f}")
 
     if report.warmup_ms > 0 or report.steady_ms > 0:
         lines.append(f"  Step time breakdown:")

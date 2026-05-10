@@ -85,6 +85,36 @@ def insert_collectives(graph: Graph, model: ModelSpec, strategy: Strategy) -> No
 
     graph.collectives.extend(collectives)
 
+    # Apply TP/CP sharding to global ops (layer_id < 0: lm_head, final_ln, etc.)
+    # These are outside the per-layer ranges and would otherwise be skipped.
+    _apply_global_sharding(graph, shard, model)
+
+
+def _apply_global_sharding(
+    graph: Graph, shard: ShardPlan, model: ModelSpec,
+) -> None:
+    """Apply TP/CP sharding to global ops (layer_id < 0)."""
+    global_indices = [i for i, op in enumerate(graph.ops) if op.layer_id < 0]
+    if not global_indices:
+        return
+
+    # Find the layer range that contains the most global ops (usually the last layer)
+    # For lm_head/final_ln, they should get sharding similar to the last transformer layer
+    start = min(global_indices)
+    end = max(global_indices) + 1
+
+    if shard.tp > 1:
+        h = model.hidden
+        h_attn = model.num_heads * model.head_dim
+        h_kv = model.num_kv_heads * model.head_dim
+        ffn = model.ffn
+        seq = model.seq_len
+        act_bytes = model.act_dtype.bytes
+        _apply_tp_sharding(graph, start, end, shard, h, h_attn, h_kv, ffn, seq, act_bytes)
+
+    if shard.has_cp:
+        _apply_cp_sharding(graph, start, end, shard, model.seq_len, model.hidden)
+
 
 def _insert_tp_collectives(
     graph: Graph, shard: ShardPlan, model: ModelSpec,
@@ -485,10 +515,17 @@ def _apply_tp_sharding(
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
             elif "routed_expert" in op.name:
+                # routed_expert_ffn fuses up+gate+down projections into one op.
+                # up/gate are column-parallel (n sharded), down is row-parallel
+                # (k sharded). Total FLOPs = 6*m*n*k*top_k / tp (single tp factor).
+                # If we set both n_local AND k_local, _matmul_cost computes
+                # 2*m*n_local*k_local*multiplier = 6*m*n*k*top_k / tp² — WRONG.
+                # Fix: only set k_local in meta (so cost uses full n * k_local/tp),
+                # but still update both tensor shapes for memory tracking.
                 k_local = k // shard.tp
                 n_local = n // shard.tp
                 op.meta["k_local"] = k_local
-                op.meta["n_local"] = n_local
+                # Deliberately do NOT set n_local — prevents tp² division.
                 for t in op.inputs:
                     if t.shape_logical and t.shape_logical[-1] == k:
                         t.shape_local = (t.shape_logical[0], k_local)
@@ -536,6 +573,17 @@ def _apply_tp_sharding(
                 idx_w_bytes = op.meta.get("s", 0) * ih_local * 2
                 idx_out_bytes = op.meta.get("s", 0) * op.meta.get("topk", 0) * 2
                 op.meta["bytes_fwd"] = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
+        elif op.kind == "lm_head":
+            # Column-parallel: vocab (n) sharded by TP
+            n = op.meta.get("n", 0)
+            if n > 0:
+                n_local = n // shard.tp
+                op.meta["n_local"] = n_local
+                for t in op.outputs:
+                    if t.shape_logical and t.shape_logical[-1] == n:
+                        t.shape_local = (t.shape_logical[0], n_local)
+            if "bytes_fwd" in op.meta:
+                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.tp
         elif op.kind == "compressor_pool":
             # Shard compressor dim by TP: d → d_local
             d = op.meta.get("d", 0)

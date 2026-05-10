@@ -216,28 +216,57 @@ def stage_time(
             t_comm_fwd = t_comm_fwd * (1 - ep_frac) + t_comm_fwd * ep_frac * imb
             t_comm_bwd = t_comm_bwd * (1 - ep_frac) + t_comm_bwd * ep_frac * imb
 
-    # EP wave-overlap: split EP A2A into K waves, overlap with expert GEMM
+    # EP wave-overlap: split EP A2A into K waves, overlap with expert GEMM.
+    # Fix (2026-05-10): compute fwd and bwd overlap independently, since
+    # bwd GEMM (dx + dw) is ~2.5× fwd GEMM and can hide much more comm.
+    # Also separate EP comm into fwd/bwd portions instead of treating them
+    # as a single pool.
     t_ep_hidden = 0.0
     if strategy.ep_overlap and strategy.ep > 1 and model.num_experts > 0:
-        t_comm_ep = _ep_comm_time(stage_collectives, strategy, system)
-        t_ep_gemm = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
-        if t_comm_ep > 0 and t_ep_gemm > 0:
-            K = 4  # number of overlap waves
-            comm_per_wave = t_comm_ep / K
-            gemm_per_wave = t_ep_gemm / K
-            # Exposed comm = max(comm_per_wave - gemm_per_wave, 0) per wave
-            # But first wave's comm is fully exposed
-            exposed_per_wave = max(comm_per_wave - gemm_per_wave, 0.0)
-            exposed_total = comm_per_wave + (K - 1) * exposed_per_wave
-            saved = t_comm_ep - exposed_total
-            # Deduct saved time from total (both fwd and bwd)
-            saved_fwd = min(saved * 0.5, t_comm_fwd)
-            saved_bwd = min(saved * 0.5, t_comm_bwd)
-            t_fwd -= saved_fwd
-            t_bwd_dx -= saved_bwd
-            t_comm_fwd -= saved_fwd
-            t_comm_bwd -= saved_bwd
-            t_ep_hidden = saved_fwd + saved_bwd  # recorded for hidden_comm accounting
+        # Separate EP comm into fwd and bwd portions
+        t_comm_ep_fwd = 0.0
+        t_comm_ep_bwd = 0.0
+        for c in stage_collectives:
+            if c.group != "EP":
+                continue
+            group_size = _group_size(c.group, strategy)
+            tier = tier_for_group(c.group, group_size, system)
+            ct = collective_time(c, group_size, tier)
+            if c.phase == "fwd":
+                t_comm_ep_fwd += ct
+            elif c.phase == "bwd":
+                t_comm_ep_bwd += ct
+            elif c.phase == "both":
+                t_comm_ep_fwd += ct * 0.5
+                t_comm_ep_bwd += ct * 0.5
+
+        K = 4  # number of overlap waves
+
+        # Fwd overlap: use fwd GEMM time
+        t_ep_gemm_fwd = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
+        saved_fwd = _wave_overlap_saved(t_comm_ep_fwd, t_ep_gemm_fwd, K)
+        saved_fwd = min(saved_fwd, t_comm_fwd)  # can't save more than comm exists
+        t_fwd -= saved_fwd
+        t_comm_fwd -= saved_fwd
+        t_ep_hidden += saved_fwd
+
+        # Bwd overlap: use bwd GEMM time (dx + dw), not just fwd
+        t_ep_gemm_bwd = 0.0
+        for op in stage_ops:
+            if op.kind == "matmul" and "routed_expert" in op.name:
+                cost = op_cost(op, model)
+                if hetero:
+                    dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap)
+                    dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap)
+                else:
+                    dx_t = op_to_time(cost.dx_flops, cost.dx_bytes, system, gpu_name)
+                    dw_t = op_to_time(cost.dw_flops, cost.dw_bytes, system, gpu_name)
+                t_ep_gemm_bwd += dx_t + dw_t
+        saved_bwd = _wave_overlap_saved(t_comm_ep_bwd, t_ep_gemm_bwd, K)
+        saved_bwd = min(saved_bwd, t_comm_bwd)
+        t_bwd_dx -= saved_bwd
+        t_comm_bwd -= saved_bwd
+        t_ep_hidden += saved_bwd
 
     t_bwd = t_bwd_dx + t_bwd_dw
     return StageTime(
@@ -321,6 +350,25 @@ def _op_recompute_categories(op: Op) -> set[str]:
     if op.kind == "ln":
         return {"ln"}
     return set()
+
+
+def _wave_overlap_saved(comm_time: float, gemm_time: float, K: int = 4) -> float:
+    """Compute how much EP comm time is saved by wave overlap with GEMM.
+
+    Model: split comm and GEMM into K waves. First wave's comm is fully
+    exposed (no prior compute to overlap with). Subsequent waves can
+    overlap comm with the previous wave's GEMM.
+
+        exposed_total = comm_per_wave + (K-1) * max(comm_per_wave - gemm_per_wave, 0)
+        saved = total_comm - exposed_total
+    """
+    if comm_time <= 0 or gemm_time <= 0 or K <= 0:
+        return 0.0
+    comm_per_wave = comm_time / K
+    gemm_per_wave = gemm_time / K
+    exposed_per_wave = max(comm_per_wave - gemm_per_wave, 0.0)
+    exposed_total = comm_per_wave + (K - 1) * exposed_per_wave
+    return max(0.0, comm_time - exposed_total)
 
 
 def _ep_comm_time(

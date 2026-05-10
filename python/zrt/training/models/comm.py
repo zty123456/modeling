@@ -226,16 +226,46 @@ def _group_size_for(group: str, strategy: Strategy) -> int:
 
 
 def _params_on_rank_for_dp(model: ModelSpec, strategy: Strategy) -> int:
-    """Params per rank for DP gradient reduce (after TP/PP sharding)."""
-    P = model.total_params()
+    """Params per rank for DP gradient reduce (after TP/EP/PP sharding).
+
+    For MoE models, routed expert params are sharded by EP across ranks.
+    The DP gradient reduction only needs to reduce gradients for params
+    actually held on this rank (dense + shared experts + routed/EP).
+
+    Mirrors the logic in memory._params_on_rank() for consistency.
+    """
+    from zrt.training.models.memory import (
+        _dense_params, _shared_expert_params, _moe_params,
+    )
+
+    dense_params = _dense_params(model)
+    moe_params = _moe_params(model)
+    total = dense_params + moe_params
+
+    # TP: shard all params by TP
     if strategy.tp > 1:
-        P //= strategy.tp
+        total //= strategy.tp
+
+    # EP: shard routed expert params by EP (shared experts NOT sharded by EP)
+    if strategy.ep > 1 and model.num_experts > 0:
+        shared_params = _shared_expert_params(model)
+        routed_params = moe_params - shared_params
+        if strategy.tp > 1:
+            shared_params //= strategy.tp
+            routed_params //= strategy.tp
+        routed_after_ep = routed_params // strategy.ep
+        moe_after_tp_ep = shared_params + routed_after_ep
+        moe_after_tp = moe_params // strategy.tp if strategy.tp > 1 else moe_params
+        total = (total - moe_after_tp) + moe_after_tp_ep
+
+    # PP: only hold params for layers on this stage
     if strategy.pp > 1:
         n_layers = len(model.layers)
-        embed = model.vocab * model.hidden * 2
-        non_embed = P - embed
+        embed_params = model.vocab * model.hidden * 2  # embed + lm_head
+        non_embed = total - embed_params
         non_embed = int(non_embed * (n_layers / strategy.pp) / n_layers)
-        P = non_embed + embed // strategy.pp
+        total = non_embed + embed_params // strategy.pp
+
     if strategy.zero_stage >= 2:
-        P //= strategy.dp
-    return P
+        total //= strategy.dp
+    return total
