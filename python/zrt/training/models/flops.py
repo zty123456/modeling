@@ -520,7 +520,7 @@ def forward_backward_flops(
 ) -> tuple[float, float]:
     """Return (forward_flops, backward_flops) separately.
 
-    Only counts compute-bound ops, consistent with total_training_flops.
+    Same loop as total_training_flops but splits fwd from dx+dw.
     """
     fwd = 0.0
     bwd = 0.0

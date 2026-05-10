@@ -730,11 +730,6 @@ def test_pp_heterogeneous_1f1b_formula():
     stage_bwd = result.metadata.get("stage_timelines_bwd", {})
     pm = result.metadata.get("pipeline_metrics")
 
-    # Skip test if phase-aware timelines not yet implemented (Items 3–5 not landed)
-    if not stage_fwd or not stage_bwd or not all(stage_bwd.values()):
-        import pytest
-        pytest.skip("Phase-aware timelines (Items 3–5) not yet implemented")
-
     # Asymmetry must be visible in per-stage output
     assert stage_fwd.get(0, 0) < stage_fwd.get(1, 0), (
         f"Stage 0 fwd ({stage_fwd.get(0):.1f}µs) should be < "

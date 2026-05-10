@@ -173,6 +173,7 @@ def test_vpp_composer_reduces_bubble_vs_1f1b():
 
 
 def test_dualpipe_composer_reduces_bubble_vs_1f1b():
+    # MagicMock scheduler → validates composer dispatch + bubble arithmetic, not DAG timing
     f1b = _run_pass(pp=4, pp_schedule="1f1b")
     dp = _run_pass(pp=4, pp_schedule="dualpipe")
     assert dp.step_time_ms < f1b.step_time_ms
@@ -181,6 +182,7 @@ def test_dualpipe_composer_reduces_bubble_vs_1f1b():
 
 
 def test_dualpipev_composer_matches_or_beats_dualpipe():
+    # MagicMock scheduler → validates composer dispatch + bubble arithmetic, not DAG timing
     dp = _run_pass(pp=4, pp_schedule="dualpipe")
     dpv = _run_pass(pp=4, pp_schedule="dualpipev", vpp_chunks=2)
     assert dpv.step_time_ms <= dp.step_time_ms
@@ -224,6 +226,7 @@ def test_zero_bubble_uses_bottleneck_stage_dw_split():
 
 def test_zero_bubble_falls_back_to_homogeneous_when_no_stage_ids(caplog):
     caplog.set_level("WARNING", logger="python.zrt.transform.analysis.training")
+
     metrics = _run_pass(pp=4, pp_schedule="zb")
     assert metrics.step_time_ms > 0
     assert any("homogeneous fallback" in r.message for r in caplog.records)
