@@ -4,7 +4,6 @@ import pytest
 from zrt.training.compose.schedules import OneF1BComposer, pipeline_step_time
 from zrt.training.compose.stage import StageTime
 from zrt.training.ir.builders import build_graph
-from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec, GPU, NetTier
@@ -121,4 +120,4 @@ def test_mfu_positive_and_bounded():
     graph = build_graph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
-    assert 0 < result.mfu <= 1.0
+    assert 0 < result.mfu < 1.0

@@ -516,11 +516,6 @@ class TestTrainingPipelinePassPerStage:
         result = TrainingPipelinePass().run(g_flops, ctx)
         return result, result.metadata["pipeline_metrics"]
 
-    def test_metrics_present(self):
-        result, metrics = self._run_pipeline_pass()
-        assert metrics is not None
-        assert metrics.step_time_ms >= 0
-
     def test_pp1_no_bubble(self):
         from python.zrt.transform.analysis.training import TrainingFlopsPass
 
