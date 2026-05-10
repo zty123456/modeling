@@ -8,7 +8,8 @@ from zrt.training.models.flops import OpCost, op_cost, total_training_flops, rec
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import RecomputePolicy, Strategy
-from zrt.training.spec.system import GPU, NetTier, SystemSpec
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+from zrt.training.spec.system import GPU, SystemSpec
 
 
 def test_matmul_cost():
@@ -104,7 +105,10 @@ def test_op_to_time_treats_hbm_bandwidth_as_gb_per_second():
     system = SystemSpec(
         gpu=GPU(name="test", flops_bf16=0, flops_fp8=0, hbm_gb=80, hbm_bw_gbps=100),
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=1,
         gpus_per_node=1,
     )
@@ -155,7 +159,8 @@ def test_unknown_op_zero_cost():
 
 def test_moe_effective_params_is_sane():
     """MoE effective params should be less than total params when top_k < num_experts."""
-    from zrt.training.spec.system import GPU, NetTier, SystemSpec
+    from zrt.hardware.spec import InterconnectSpec, LinkSpec
+    from zrt.training.spec.system import GPU, SystemSpec
     from zrt.training.spec.strategy import Strategy
     from zrt.training.compose.schedules import compute_mfu
 
@@ -216,7 +221,8 @@ def test_moe_mfu_is_sane():
 def test_hfu_equals_mfu_without_recompute():
     """HFU == MFU when no recompute policy is configured."""
     from zrt.training.search.estimator import estimate
-    from zrt.training.spec.system import GPU, NetTier, SystemSpec
+    from zrt.hardware.spec import InterconnectSpec, LinkSpec
+    from zrt.training.spec.system import GPU, SystemSpec
 
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -227,7 +233,10 @@ def test_hfu_equals_mfu_without_recompute():
     system = SystemSpec(
         gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=1, gpus_per_node=1,
     )
 
@@ -239,7 +248,8 @@ def test_hfu_equals_mfu_without_recompute():
 def test_hfu_exceeds_mfu_with_selective_recompute():
     """HFU > MFU when selective recompute is configured."""
     from zrt.training.search.estimator import estimate
-    from zrt.training.spec.system import GPU, NetTier, SystemSpec
+    from zrt.hardware.spec import InterconnectSpec, LinkSpec
+    from zrt.training.spec.system import GPU, SystemSpec
 
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -249,7 +259,10 @@ def test_hfu_exceeds_mfu_with_selective_recompute():
     system = SystemSpec(
         gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=1, gpus_per_node=1,
     )
     strategy = Strategy(
@@ -306,7 +319,8 @@ def test_recompute_overhead_full_recompute():
 def test_selective_recompute_increases_step_time():
     """Selective recompute should increase step time (extra forward pass)."""
     from zrt.training.search.estimator import estimate
-    from zrt.training.spec.system import GPU, NetTier, SystemSpec
+    from zrt.hardware.spec import InterconnectSpec, LinkSpec
+    from zrt.training.spec.system import GPU, SystemSpec
 
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
@@ -316,7 +330,10 @@ def test_selective_recompute_increases_step_time():
     system = SystemSpec(
         gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=1, gpus_per_node=1,
     )
     strat_no_rc = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)

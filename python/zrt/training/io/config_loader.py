@@ -12,7 +12,7 @@ from zrt.training.spec.strategy import (
     CPKind, MuonConfig, OffloadPolicy, OptKind, PPSched, RecomputePolicy, Strategy,
     TPOverlap,
 )
-from zrt.training.spec.system import GPU, NetTier, SystemSpec
+from zrt.training.spec.system import GPU, SystemSpec
 
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 
@@ -162,24 +162,10 @@ def _parse_system(d: dict) -> SystemSpec:
         vector_tflops=hw.compute.vector_bf16_tflops,
         overlap_ratio=dict(hw.compute.overlap_ratio),
     )
-    nets = [
-        NetTier(
-            scope="intra_node",
-            bw_gbps=hw.interconnect.intra_node.bandwidth_gbps,
-            latency_us=hw.interconnect.intra_node.latency_us,
-            topology=hw.interconnect.intra_node.topology,
-        ),
-        NetTier(
-            scope="inter_node",
-            bw_gbps=hw.interconnect.inter_node.bandwidth_gbps,
-            latency_us=hw.interconnect.inter_node.latency_us,
-            topology=hw.interconnect.inter_node.topology,
-        ),
-    ]
     return SystemSpec(
         gpu=gpu,
         host_mem_gb=d.get("host_mem_gb", 256),
-        nets=nets,
+        interconnect=hw.interconnect,
         nodes=d["nodes"],
         gpus_per_node=d["gpus_per_node"],
     )

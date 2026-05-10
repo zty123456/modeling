@@ -19,7 +19,8 @@ from zrt.training.io.perf_tables import achieved_flops_efficiency
 from zrt.training.ir.training_graph import Op
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
-from zrt.training.spec.system import GPU, NetTier, SystemSpec
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+from zrt.training.spec.system import GPU, SystemSpec
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -43,7 +44,10 @@ def _make_system(
     return SystemSpec(
         gpu=gpu,
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 400, 3, "ring")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="HCCS", bandwidth_gbps=400, latency_us=3, topology="full_mesh", num_devices=1),
+            inter_node=LinkSpec(type="RoCE", bandwidth_gbps=100, latency_us=10, topology="fat_tree"),
+        ),
         nodes=1,
         gpus_per_node=1,
     )

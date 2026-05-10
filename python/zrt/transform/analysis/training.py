@@ -700,8 +700,10 @@ class TrainingPipelinePass(GraphPass):
             ag_bytes = float(opt_node.attrs.get("muon_ag_bytes", 0))
             ns_rotation = opt_node.attrs.get("ns_rotation", True)
             if ag_bytes > 0:
-                dp_bw = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8
                 dp = ctx.parallel.dp if ctx.parallel else 1
+                gpus_per_node = hw.interconnect.intra_node.num_devices
+                link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
+                dp_bw = link.bandwidth_gbps * 1e9 / 8
                 # Ring factor: AG always, RS only when rotation=True
                 # AG: (dp-1)/dp factor; RS: same factor when rotation=True
                 if ns_rotation:
@@ -769,8 +771,10 @@ class TrainingPipelinePass(GraphPass):
             return latency_sum
 
         bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
+        gpus_per_node = hw.interconnect.intra_node.num_devices
+        link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
         dp_bw_bytes_per_us = (
-            hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
+            link.bandwidth_gbps * 1e9 / 8 / 1e6
         )
         ring_factor = 2.0 * (dp - 1) / dp
         return (

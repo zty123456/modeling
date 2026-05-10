@@ -15,5 +15,5 @@ config:
   micro_batch: 1
   global_batch: 1024
 targets:
-  mfu: 0.2369
+  mfu: 0.5298
   tolerance: 0.15

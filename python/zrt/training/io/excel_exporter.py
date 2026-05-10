@@ -318,11 +318,12 @@ def export_estimate_excel(
         ["", "", ""],
         ["Network Tiers", "", ""],
     ]
-    for net in system.nets:
+    for label, link in [("intra_node", system.interconnect.intra_node),
+                         ("inter_node", system.interconnect.inter_node)]:
         hw_rows.extend([
-            [f"  {net.scope}", f"{net.bw_gbps:.1f}", "GB/s"],
-            [f"    Latency", f"{net.latency_us:.1f}", "μs"],
-            [f"    Topology", net.topology, ""],
+            [f"  {label} ({link.type})", f"{link.bandwidth_gbps:.1f}", "GB/s"],
+            [f"    Latency", f"{link.latency_us:.1f}", "μs"],
+            [f"    Topology", link.topology, ""],
         ])
     _write_sheet(ws4, hw_rows, col_widths=[35, 35, 10])
 

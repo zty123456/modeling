@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+
 
 @dataclass
 class GPU:
@@ -20,18 +22,10 @@ class GPU:
 
 
 @dataclass
-class NetTier:
-    scope: str          # "intra_node" | "inter_node"
-    bw_gbps: float      # per-link unidirectional GB/s
-    latency_us: float
-    topology: str       # "ring" | "tree" | "nvswitch" | "fattree"
-
-
-@dataclass
 class SystemSpec:
     gpu: GPU
     host_mem_gb: float
-    nets: list[NetTier]  # ordered: intra first
+    interconnect: InterconnectSpec
     nodes: int
     gpus_per_node: int
 
@@ -39,14 +33,8 @@ class SystemSpec:
     def world_size(self) -> int:
         return self.nodes * self.gpus_per_node
 
-    def intra_tier(self) -> NetTier | None:
-        for t in self.nets:
-            if t.scope == "intra_node":
-                return t
-        return None
+    def intra_tier(self) -> LinkSpec:
+        return self.interconnect.intra_node
 
-    def inter_tier(self) -> NetTier | None:
-        for t in self.nets:
-            if t.scope == "inter_node":
-                return t
-        return None
+    def inter_tier(self) -> LinkSpec:
+        return self.interconnect.inter_node

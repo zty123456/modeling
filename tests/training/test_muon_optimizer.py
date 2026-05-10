@@ -15,7 +15,8 @@ from zrt.training.spec.strategy import (
     MuonConfig, OptKind, Strategy, resolve_muon_ns_steps,
     _MUON_NS_STEPS_DEFAULTS,
 )
-from zrt.training.spec.system import GPU, NetTier, SystemSpec
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+from zrt.training.spec.system import GPU, SystemSpec
 
 
 class TestNSFlops:
@@ -341,10 +342,10 @@ def _make_mock_system() -> SystemSpec:
     return SystemSpec(
         gpu=GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350),
         host_mem_gb=256,
-        nets=[
-            NetTier("intra_node", 900, 1.0, "nvswitch"),
-            NetTier("inter_node", 400, 10.0, "roce"),
-        ],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="RoCE", bandwidth_gbps=400, latency_us=10.0, topology="fat_tree"),
+        ),
         nodes=8,
         gpus_per_node=8,
     )
