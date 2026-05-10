@@ -71,7 +71,7 @@ def op_cost(op: Op, model: ModelSpec) -> OpCost:
         return _mhc_post_cost(op)
     if op.kind == "mhc_head":
         return _mhc_head_cost(op)
-    if op.kind in ("ln", "softmax", "rope", "swiglu", "add", "hc_expand"):
+    if op.kind in ("ln", "rmsnorm", "softmax", "rope", "swiglu", "add", "hc_expand"):
         return _elementwise_cost(op)
     if op.kind == "embed":
         return _embed_cost(op)
@@ -423,7 +423,8 @@ def _mhc_head_cost(op: Op) -> OpCost:
 
 
 _ELEMENTWISE_FLOPS = {
-    "ln":      7,   # mean + var + norm + scale + shift + 2 intermediate
+    "ln":      7,   # mean + var + norm + scale + shift + 2 intermediate (LayerNorm)
+    "rmsnorm": 5,   # rms + scale + shift + 2 intermediate (RMSNorm, no mean/var)
     "softmax": 4,   # max + sub + exp + sum + div
     "rope":    2,   # sin/cos multiply per pair
     "swiglu":  5,   # sigmoid(4) + multiply(1) — elementwise portion between matmuls

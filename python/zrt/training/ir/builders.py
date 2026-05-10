@@ -15,6 +15,16 @@ def _tensor(name: str, shape: tuple[int, ...], dtype: Dtype,
                   dtype=dtype, is_activation=is_activation, is_param=is_param)
 
 
+def _norm_kind(model: ModelSpec | None) -> str:
+    """Return the norm op kind based on model's norm_kind field.
+
+    Defaults to "rmsnorm" for DeepSeek models, "ln" (LayerNorm) for others.
+    """
+    if model is None:
+        return "ln"  # legacy default
+    return getattr(model, "norm_kind", "rmsnorm")
+
+
 # ── Hyper-Connection ops ───────────────────────────────────────────────
 
 def _mhc_pre_op(seq: int, hidden: int, hc_mult: int, sinkhorn_iters: int,
@@ -133,7 +143,7 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
         layer_id=layer_id, layer_kind=layer_kind))
 
     # q_a_layernorm
-    ops.append(Op(name=f"{prefix}.q_a_norm", kind="ln",
+    ops.append(Op(name=f"{prefix}.q_a_norm", kind=_norm_kind(model),
         inputs=[_tensor("q_a", (seq, model.q_lora_rank), act_dtype)],
         outputs=[_tensor("q_a_normed", (seq, model.q_lora_rank), act_dtype)],
         meta={"bytes_fwd": seq * model.q_lora_rank * act_dtype.bytes * 2},
@@ -154,7 +164,7 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
         layer_id=layer_id, layer_kind=layer_kind))
 
     # kv_a_layernorm (only on the kv_lora_rank part, not rope part)
-    ops.append(Op(name=f"{prefix}.kv_a_norm", kind="ln",
+    ops.append(Op(name=f"{prefix}.kv_a_norm", kind=_norm_kind(model),
         inputs=[_tensor("kv_a_latent", (seq, model.kv_lora_rank), act_dtype)],
         outputs=[_tensor("kv_a_normed", (seq, model.kv_lora_rank), act_dtype)],
         meta={"bytes_fwd": seq * model.kv_lora_rank * act_dtype.bytes * 2},
@@ -177,19 +187,20 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
         meta={"bytes_fwd": seq * (h_rope + qk_rope) * act_dtype.bytes * 2},
         layer_id=layer_id, layer_kind=layer_kind))
 
-    # Optional: Lightning Indexer for V3.2 DSA (index_topk > 0, no V4 attn)
-    if model.index_topk > 0 and not model.use_v4_attn:
+# Optional: Lightning Indexer for V3.2 DSA (index_topk > 0, no V4 attn, MOE layers only)
+    # Dense layers use full attention; Lightning Indexer only applies to MoE layers
+    if model.index_topk > 0 and not model.use_v4_attn and layer_kind == LayerKind.MOE:
         ops.extend(_build_indexer_ops(model, layer_id, seq,
                                        prefix, layer_kind, act_dtype,
                                        q_input_name="q_a_normed"))
 
-    # Attention core — MLA uses qk_nope + qk_rope for QK, v_head for V
+# Attention core — MLA uses qk_nope + qk_rope for QK, v_head for V
     effective_head_dim = qk_nope + qk_rope
     attn_meta = {"b": 1, "s": seq, "heads": n_h,
                  "head_dim": effective_head_dim, "causal": True,
                  "v_head_dim": v_hd}
-    # V3.2: sparse attention over indexer topk KV
-    if model.index_topk > 0 and not model.use_v4_attn:
+    # V3.2: sparse attention over indexer topk KV (MoE layers only)
+    if model.index_topk > 0 and not model.use_v4_attn and layer_kind == LayerKind.MOE:
         attn_meta["sparse_topk"] = model.index_topk
     ops.append(Op(name=f"{prefix}.attn_core", kind="attn_core",
         inputs=[_tensor("q_final", (seq, h_q), act_dtype),
@@ -228,7 +239,7 @@ def _build_v4_attn(model: ModelSpec, layer_id: int, seq: int,
         layer_id=layer_id, layer_kind=layer_kind))
 
     # q_norm (RMSNorm)
-    ops.append(Op(name=f"{prefix}.q_norm", kind="ln",
+    ops.append(Op(name=f"{prefix}.q_norm", kind=_norm_kind(model),
         inputs=[_tensor("qr", (seq, model.q_lora_rank), act_dtype)],
         outputs=[_tensor("qr_normed", (seq, model.q_lora_rank), act_dtype)],
         meta={"bytes_fwd": seq * model.q_lora_rank * act_dtype.bytes * 2},
@@ -242,7 +253,7 @@ def _build_v4_attn(model: ModelSpec, layer_id: int, seq: int,
         layer_id=layer_id, layer_kind=layer_kind))
 
     # rsqrt normalization (memory-bound)
-    ops.append(Op(name=f"{prefix}.q_rsqrt_norm", kind="ln",
+    ops.append(Op(name=f"{prefix}.q_rsqrt_norm", kind=_norm_kind(model),
         inputs=[_tensor("q_raw", (seq, h_attn), act_dtype)],
         outputs=[_tensor("q_norm2", (seq, h_attn), act_dtype)],
         meta={"bytes_fwd": seq * h_attn * act_dtype.bytes * 2},
@@ -256,7 +267,7 @@ def _build_v4_attn(model: ModelSpec, layer_id: int, seq: int,
         layer_id=layer_id, layer_kind=layer_kind))
 
     # kv_norm
-    ops.append(Op(name=f"{prefix}.kv_norm", kind="ln",
+    ops.append(Op(name=f"{prefix}.kv_norm", kind=_norm_kind(model),
         inputs=[_tensor("kv_raw", (seq, d), act_dtype)],
         outputs=[_tensor("kv_normed", (seq, d), act_dtype)],
         meta={"bytes_fwd": seq * d * act_dtype.bytes * 2},
@@ -555,7 +566,7 @@ def dense_block(
 
     # ── Pre-attention RMSNorm ──────────────────────────────────────────
     ops.append(Op(
-        name=f"{prefix}.ln1", kind="ln",
+        name=f"{prefix}.ln1", kind=_norm_kind(model),
         inputs=[ln1_in],
         outputs=[_tensor("x_ln1", (seq, h), act_dtype)],
         meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
@@ -622,7 +633,7 @@ def dense_block(
 
     # ── Post-attention RMSNorm ─────────────────────────────────────────
     ops.append(Op(
-        name=f"{prefix}.ln2", kind="ln",
+        name=f"{prefix}.ln2", kind=_norm_kind(model),
         inputs=[ln2_in],
         outputs=[_tensor("x_ln2", (seq, h), act_dtype)],
         meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
@@ -713,7 +724,7 @@ def _moe_block(
 
     # ── Pre-attention RMSNorm ──────────────────────────────────────────
     ops.append(Op(
-        name=f"{prefix}.ln1", kind="ln",
+        name=f"{prefix}.ln1", kind=_norm_kind(model),
         inputs=[ln1_in],
         outputs=[_tensor("x_ln1", (seq, h), act_dtype)],
         meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
@@ -779,7 +790,7 @@ def _moe_block(
 
     # ── Post-attention RMSNorm ─────────────────────────────────────────
     ops.append(Op(
-        name=f"{prefix}.ln2", kind="ln",
+        name=f"{prefix}.ln2", kind=_norm_kind(model),
         inputs=[ln2_in],
         outputs=[_tensor("x_ln2", (seq, h), act_dtype)],
         meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
@@ -972,9 +983,9 @@ def _mhc_head_op(seq: int, hidden: int, hc_mult: int, act_dtype: Dtype) -> Op:
     )
 
 
-def _final_ln_op(hidden: int, seq: int, act_dtype: Dtype) -> Op:
+def _final_ln_op(model: ModelSpec, hidden: int, seq: int, act_dtype: Dtype) -> Op:
     return Op(
-        name="final_ln", kind="ln",
+        name="final_ln", kind=_norm_kind(model),
         inputs=[_tensor("x_final_raw", (seq, hidden), act_dtype)],
         outputs=[_tensor("x_final", (seq, hidden), act_dtype)],
         meta={"bytes_fwd": seq * hidden * act_dtype.bytes * 2},
@@ -1041,8 +1052,8 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
     if hc_mult > 1:
         all_ops.append(_mhc_head_op(s, h, hc_mult, act_dtype))
 
-    # Final LN + lm_head
-    all_ops.append(_final_ln_op(h, s, act_dtype))
+# Final LN + lm_head
+    all_ops.append(_final_ln_op(model, h, s, act_dtype))
     all_ops.append(_lm_head_op(model.vocab, h, s, act_dtype))
 
     graph = Graph(ops=all_ops, collectives=[], layer_index=layer_index)

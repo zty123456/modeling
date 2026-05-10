@@ -44,7 +44,7 @@ def test_single_stage_dp_allreduce_overlaps_backward_when_enabled():
     result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
 
     assert result.step_time == 12.0
-    assert result.dp_ar_exposed == 0.0
+    assert result.dp_exposed == 0.0
 
 
 def test_single_stage_dp_allreduce_exposed_when_overlap_disabled():
@@ -57,7 +57,7 @@ def test_single_stage_dp_allreduce_exposed_when_overlap_disabled():
     result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
 
     assert result.step_time == 15.0
-    assert result.dp_ar_exposed == 3.0
+    assert result.dp_exposed == 3.0
 
 
 def test_pp2_bubble_ratio():

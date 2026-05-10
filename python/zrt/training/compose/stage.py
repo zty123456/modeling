@@ -25,8 +25,9 @@ class StageTime:
     bwd: float = 0.0
     bwd_dx: float = 0.0
     bwd_dw: float = 0.0
-    comm_fwd: float = 0.0
-    comm_bwd: float = 0.0
+    comm_fwd: float = 0.0   # exposed comm in fwd (after TP/EP overlap reductions)
+    comm_bwd: float = 0.0   # exposed comm in bwd (after TP/EP overlap reductions)
+    ep_hidden: float = 0.0  # EP comm hidden by wave-overlap (fwd + bwd combined)
 
 
 def ep_imbalance_factor(num_experts: int, ep: int, topk: int = 1) -> float:
@@ -216,6 +217,7 @@ def stage_time(
             t_comm_bwd = t_comm_bwd * (1 - ep_frac) + t_comm_bwd * ep_frac * imb
 
     # EP wave-overlap: split EP A2A into K waves, overlap with expert GEMM
+    t_ep_hidden = 0.0
     if strategy.ep_overlap and strategy.ep > 1 and model.num_experts > 0:
         t_comm_ep = _ep_comm_time(stage_collectives, strategy, system)
         t_ep_gemm = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
@@ -235,6 +237,7 @@ def stage_time(
             t_bwd_dx -= saved_bwd
             t_comm_fwd -= saved_fwd
             t_comm_bwd -= saved_bwd
+            t_ep_hidden = saved_fwd + saved_bwd  # recorded for hidden_comm accounting
 
     t_bwd = t_bwd_dx + t_bwd_dw
     return StageTime(
@@ -244,6 +247,7 @@ def stage_time(
         bwd_dw=t_bwd_dw,
         comm_fwd=t_comm_fwd,
         comm_bwd=t_comm_bwd,
+        ep_hidden=t_ep_hidden,
     )
 
 

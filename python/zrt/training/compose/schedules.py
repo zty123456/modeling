@@ -34,44 +34,66 @@ PP_SCHED_BY_NAME: dict[str, PPSched] = {
 
 @dataclass
 class StepResult:
-    step_time: float = 0.0         # seconds
-    per_stage: list[StageTime] = field(default_factory=list)
+    """Training step time breakdown.
+
+    Strict invariants (all in seconds):
+      step_time        = pipeline_time + optimizer_time + optimizer_comm
+      pipeline_time    = compute_time + exposed_comm
+      exposed_comm     = tp_exposed + cp_exposed + ep_exposed + pp_exposed + dp_exposed
+      hidden_comm      = dp_hidden + tp_hidden + ep_hidden
+      total_comm_volume = exposed_comm + hidden_comm
+    """
+
+    # ── Core step timing ──────────────────────────────────────────────────
+    step_time: float = 0.0          # Total step time (seconds)
+    pipeline_time: float = 0.0      # Pipeline time = compute_time + exposed_comm
+    optimizer_time: float = 0.0     # Optimizer step compute
+    optimizer_comm: float = 0.0     # Optimizer step communication (e.g. Muon AG+RS)
+
+    # ── Pipeline structure (set by composers) ─────────────────────────────
     bubble_fraction: float = 0.0
     warmup: float = 0.0
     steady: float = 0.0
     cooldown: float = 0.0
-    dp_ar_exposed: float = 0.0
+    dp_exposed: float = 0.0         # DP AR/RS on critical path (set by composer; also DP group share)
+    schedule_name: str = "1f1b"
+    warmup_steps: int = 0
+    cooldown_steps: int = 0
+    per_stage: list[StageTime] = field(default_factory=list)
     memory: MemBreakdown | None = None
     mfu: float = 0.0
     hfu: float = 0.0
-    schedule_name: str = "1f1b"    # Pipeline schedule identifier
-    warmup_steps: int = 0          # Number of warmup microbatches
-    cooldown_steps: int = 0        # Number of cooldown microbatches
-    optimizer_time: float = 0.0    # Optimizer step time (seconds)
-    optimizer_comm: float = 0.0    # Optimizer communication time (seconds)
-    
-    # Fwd/Bwd breakdown per phase (seconds)
+
+    # ── Fwd/Bwd phase breakdown (seconds) ────────────────────────────────
     warmup_fwd: float = 0.0
     warmup_bwd: float = 0.0
     steady_fwd: float = 0.0
     steady_bwd: float = 0.0
     cooldown_fwd: float = 0.0
     cooldown_bwd: float = 0.0
-    
-    # Per-microbatch time in steady phase (seconds)
     steady_fwd_per_mb: float = 0.0
     steady_bwd_per_mb: float = 0.0
     steady_per_mb: float = 0.0
 
-    # Communication time breakdown (seconds)
-    tp_comm: float = 0.0           # TP RS/AG time
-    cp_comm: float = 0.0           # CP A2A time
-    ep_comm: float = 0.0           # EP A2A time
-    pp_comm: float = 0.0           # PP P2P time
-    dp_comm: float = 0.0           # DP AR/RS time
-    total_comm: float = 0.0        # Total communication time
-    compute_time: float = 0.0      # Pure compute time
-    overlap_time: float = 0.0      # Compute-comm overlap time
+    # ── Compute / comm breakdown (set by pipeline_step_time) ─────────────
+    compute_time: float = 0.0       # Pure compute on critical path
+    exposed_comm: float = 0.0       # Comm on critical path = Σ *_exposed fields
+
+    # Per-group exposed comm (Σ = exposed_comm)
+    tp_exposed: float = 0.0         # TP RS/AG (after CoC/MC2 reduction)
+    cp_exposed: float = 0.0         # CP A2A
+    ep_exposed: float = 0.0         # EP A2A (after wave-overlap reduction)
+    pp_exposed: float = 0.0         # PP P2P
+    # dp_exposed declared in pipeline section; equals DP group contribution to exposed_comm
+
+    # Hidden comm — runs in parallel with compute, NOT on critical path
+    hidden_comm: float = 0.0        # Total hidden = Σ *_hidden fields
+    dp_hidden: float = 0.0          # DP AR absorbed in pipeline bubble
+    tp_hidden: float = 0.0          # TP hidden by CoC/MC2
+    ep_hidden: float = 0.0          # EP hidden by wave-overlap
+
+    # Total comm volume = exposed + hidden
+    total_comm_volume: float = 0.0  # All comm in step
 
 
 class PipelineComposer(ABC):
@@ -124,7 +146,7 @@ class OneF1BComposer(PipelineComposer):
                 warmup=0.0,
                 steady=step * M,
                 cooldown=0.0,
-                dp_ar_exposed=dp_exposed,
+                dp_exposed=dp_exposed,
                 schedule_name="1f1b",
                 warmup_steps=0,
                 cooldown_steps=0,
@@ -165,7 +187,7 @@ class OneF1BComposer(PipelineComposer):
             warmup=warmup,
             steady=steady,
             cooldown=cooldown,
-            dp_ar_exposed=dp_exposed,
+            dp_exposed=dp_exposed,
             schedule_name="1f1b",
             warmup_steps=pp - 1,
             cooldown_steps=pp - 1,
@@ -228,7 +250,7 @@ class Interleaved1F1BComposer(PipelineComposer):
             warmup=warmup,
             steady=steady,
             cooldown=cooldown,
-            dp_ar_exposed=dp_exposed,
+            dp_exposed=dp_exposed,
             schedule_name="i1f1b",
             warmup_steps=max(1, -(-(pp - 1) // V)),
             cooldown_steps=max(1, -(-(pp - 1) // V)),
@@ -286,7 +308,7 @@ class DualPipeComposer(PipelineComposer):
             warmup=warmup,
             steady=steady,
             cooldown=cooldown,
-            dp_ar_exposed=dp_exposed,
+            dp_exposed=dp_exposed,
             schedule_name="dualpipe",
             warmup_steps=max(1, -(-(pp - 1) // 2)),
             cooldown_steps=max(1, -(-(pp - 1) // 2)),
@@ -343,7 +365,7 @@ class DualPipeVComposer(PipelineComposer):
             warmup=warmup,
             steady=steady,
             cooldown=cooldown,
-            dp_ar_exposed=dp_exposed,
+            dp_exposed=dp_exposed,
             schedule_name="dualpipev",
             warmup_steps=max(1, -(-(pp - 1) // (2 * V))),
             cooldown_steps=max(1, -(-(pp - 1) // (2 * V))),
@@ -403,7 +425,7 @@ class ZeroBubbleComposer(PipelineComposer):
             warmup=warmup,
             steady=steady,
             cooldown=cooldown,
-            dp_ar_exposed=dp_exposed,
+            dp_exposed=dp_exposed,
             schedule_name="zb",
             warmup_steps=pp - 1,
             cooldown_steps=pp - 1,
@@ -510,41 +532,46 @@ def pipeline_step_time(
         if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
             new_dp_exposed = dp_ar_time - min(new_cooldown, dp_ar_time)
         else:
-            new_dp_exposed = step.dp_ar_exposed
-        dp_delta = new_dp_exposed - step.dp_ar_exposed
+            new_dp_exposed = step.dp_exposed
+        dp_delta = new_dp_exposed - step.dp_exposed
         step.step_time = step.step_time - bubble_saved + dp_delta
         step.warmup = residual_bubble / 2.0
         step.cooldown = new_cooldown
-        step.dp_ar_exposed = new_dp_exposed
+        step.dp_exposed = new_dp_exposed
         step.bubble_fraction = residual_bubble / step.step_time if step.step_time > 0 else 0.0
 
     # === Communication and compute breakdown ===
-    # Placed after dual-batch so step.step_time / step.dp_ar_exposed are final.
+    # Placed after dual-batch so step.step_time / step.dp_exposed are final.
     #
-    # comm_fwd/comm_bwd in StageTime are the *exposed* comm portions — TP/EP overlap
-    # reductions are already applied inside stage_time().  Using the bottleneck stage's
-    # ratio gives a schedule-agnostic critical-path decomposition that is consistent with
-    # however the composer computed step_time.
+    # Invariants enforced here:
+    #   pipeline_time    = compute_time + exposed_comm            (exact)
+    #   exposed_comm     = tp + cp + ep + pp + dp _exposed       (exact)
+    #   hidden_comm      = dp_hidden + tp_hidden + ep_hidden      (exact)
+    #   total_comm_volume = exposed_comm + hidden_comm            (exact)
+    #
+    # comm_fwd/comm_bwd in StageTime are already-reduced exposed portions
+    # (TP CoC/MC2 and EP wave-overlap applied inside stage_time()).
+    # The bottleneck stage ratio gives a schedule-agnostic critical-path split.
+
     s_bot = max(stage_times, key=lambda st: st.fwd + st.bwd)
     bot_total = s_bot.fwd + s_bot.bwd
     bot_comm = s_bot.comm_fwd + s_bot.comm_bwd  # exposed comm per stage per microbatch
 
-    # pipeline_time = step_time minus the exposed DP AR tail
-    pipeline_time = step.step_time - step.dp_ar_exposed
+    # pipeline_time excludes the exposed DP AR tail (which sits after cooldown)
+    _pipeline_time = step.step_time - step.dp_exposed
     comm_frac = (bot_comm / bot_total) if bot_total > 0 else 0.0
 
-    # Exposed comm from pipeline (uses same scale as step_time) + exposed DP AR
-    exposed_comm_excl_dp = pipeline_time * comm_frac
-    step.total_comm = exposed_comm_excl_dp + step.dp_ar_exposed
-    # compute_time is exact by construction: compute_time + total_comm == step_time
-    step.compute_time = step.step_time - step.total_comm
+    # ── Exposed comm ──────────────────────────────────────────────────────
+    exposed_comm_excl_dp = _pipeline_time * comm_frac
+    step.exposed_comm = exposed_comm_excl_dp + step.dp_exposed
+    # compute_time exact: compute_time + exposed_comm == _pipeline_time + dp_exposed == step_time(pre-opt)
+    step.compute_time = step.step_time - step.exposed_comm
 
-    # PP P2P exposed on critical path (pp_p2p per stage already baked into bot_comm;
-    # derive its critical-path contribution using the same comm_frac scaling)
-    pp_p2p_exposed = (pipeline_time * (2.0 * pp_p2p) / bot_total) if bot_total > 0 else 0.0
+    # PP P2P: pp_p2p already baked into bot_comm; scale to critical path via same ratio
+    pp_p2p_exposed = (_pipeline_time * (2.0 * pp_p2p) / bot_total) if bot_total > 0 else 0.0
 
-    # TP/CP/EP: proportional split of the remaining exposed comm.
-    # Apply TP exposure factor before proportioning (matches stage_time() logic).
+    # TP/CP/EP: proportional split of remaining exposed comm after PP P2P.
+    # TP exposure factor matches stage_time() logic (CoC=0.1, MC2=0.0, none=1.0).
     _tp_expose = (
         0.0 if strategy.tp_overlap == TPOverlap.MC2
         else (0.1 if strategy.tp_overlap == TPOverlap.COC else 1.0)
@@ -557,29 +584,37 @@ def pipeline_step_time(
 
     remain = max(0.0, exposed_comm_excl_dp - pp_p2p_exposed)
     if eff_total > 0 and remain > 0:
-        step.tp_comm = remain * eff_tp / eff_total
-        step.cp_comm = remain * raw_cp / eff_total
-        step.ep_comm = remain * raw_ep / eff_total
+        step.tp_exposed = remain * eff_tp / eff_total
+        step.cp_exposed = remain * raw_cp / eff_total
+        step.ep_exposed = remain * raw_ep / eff_total
     else:
-        step.tp_comm = 0.0
-        step.cp_comm = 0.0
-        step.ep_comm = 0.0
-    step.pp_comm = pp_p2p_exposed
-    step.dp_comm = step.dp_ar_exposed  # exposed DP AR (not total dp_ar_time)
+        step.tp_exposed = 0.0
+        step.cp_exposed = 0.0
+        step.ep_exposed = 0.0
+    step.pp_exposed = pp_p2p_exposed
+    # step.dp_exposed already set by composer / dual-batch
 
-    # Overlap = comm running in parallel with compute (not on critical path).
+    # ── Hidden comm ───────────────────────────────────────────────────────
     # DP AR hidden in pipeline bubble — independent, exact.
-    dp_hidden = max(0.0, dp_ar_time - step.dp_ar_exposed)
-    # TP hidden by MC2/CoC — derived from exposure factor and exposed TP.
-    if _tp_expose > 0 and step.tp_comm > 0:
-        tp_hidden = step.tp_comm * (1.0 - _tp_expose) / _tp_expose
+    step.dp_hidden = max(0.0, dp_ar_time - step.dp_exposed)
+
+    # TP hidden by CoC/MC2 — from exposure factor and exposed TP.
+    if _tp_expose > 0 and step.tp_exposed > 0:
+        step.tp_hidden = step.tp_exposed * (1.0 - _tp_expose) / _tp_expose
     elif _tp_expose == 0 and raw_tp > 0 and bot_total > 0:
-        # MC2: all TP comm is hidden; estimate from raw TP scaled via same comm ratio
-        raw_tp_per_stage = raw_tp / max(pp, 1)
-        tp_hidden = pipeline_time * raw_tp_per_stage / bot_total
+        # MC2: all TP hidden; scale raw TP per stage to critical path.
+        step.tp_hidden = _pipeline_time * (raw_tp / max(pp, 1)) / bot_total
     else:
-        tp_hidden = 0.0
-    step.overlap_time = dp_hidden + tp_hidden
+        step.tp_hidden = 0.0
+
+    # EP hidden by wave-overlap — from StageTime.ep_hidden, scaled to critical path.
+    if bot_total > 0 and s_bot.ep_hidden > 0:
+        step.ep_hidden = _pipeline_time * s_bot.ep_hidden / bot_total
+    else:
+        step.ep_hidden = 0.0
+
+    step.hidden_comm = step.dp_hidden + step.tp_hidden + step.ep_hidden
+    step.total_comm_volume = step.exposed_comm + step.hidden_comm
 
     # Optimizer time and communication
     opt_time = _compute_optimizer_time(model, system, strategy)
@@ -597,8 +632,11 @@ def pipeline_step_time(
     step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
 
     # Add optimizer time to step_time (per §5.5.2 of muon_optimizer_design.md)
-    # This must happen after MFU/HFU calculation so MFU excludes optimizer overhead
+    # This must happen after MFU/HFU calculation so MFU excludes optimizer overhead.
+    # pipeline_time is set after this addition to satisfy:
+    #   step_time = pipeline_time + optimizer_time + optimizer_comm
     step.step_time += opt_time + opt_comm
+    step.pipeline_time = step.step_time - step.optimizer_time - step.optimizer_comm
 
     return step
 

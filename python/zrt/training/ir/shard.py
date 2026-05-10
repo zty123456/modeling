@@ -180,14 +180,18 @@ def _insert_cp_collectives(
     Note: When TP is enabled, hidden dimension is already sharded by TP.
     CP communication should use hidden_tp = hidden / tp, not full hidden.
     """
-    if shard.cp_kind == CPKind.NONE:
-        return
-
     h = model.hidden
     if shard.tp > 1:
         h = h // shard.tp
     act_bytes = model.act_dtype.bytes
     cp = shard.cp
+
+    # If cp_kind is NONE, skip collective insertion but still apply
+    # CP sharding metadata for FLOPs calculation (cp > 1 but unspecified kind).
+    if shard.cp_kind == CPKind.NONE:
+        for layer_id, (start, end) in graph.layer_index.items():
+            _apply_cp_sharding(graph, start, end, shard, model.seq_len, model.hidden)
+        return
 
     for layer_id, (start, end) in graph.layer_index.items():
         # Note: Insert collectives BEFORE sharding metadata.
@@ -593,6 +597,35 @@ def _apply_cp_sharding(
         elif op.kind in ("ln", "rope", "swiglu", "add"):
             if "bytes_fwd" in op.meta:
                 op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.cp
+        elif op.kind == "compressor_pool":
+            # Sequence dimension is sharded by CP. Each rank pools its local
+            # chunk independently (m=4 pooling is local, no cross-rank comm).
+            s = op.meta.get("s", 0)
+            if s > 0:
+                op.meta["s"] = s // shard.cp
+                op.meta["world_factor"] = shard.cp
+            if "bytes_fwd" in op.meta:
+                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.cp
+        elif op.kind == "indexer_topk":
+            # In Ulysses CP, query sequence is split by CP. The compressed KV
+            # needs to be gathered via A2A before scoring, so kv_len stays
+            # global. FLOPs scale as 1/CP (s → s/cp, kv_len unchanged).
+            s = op.meta.get("s", 0)
+            if s > 0:
+                op.meta["s"] = s // shard.cp
+                op.meta["world_factor"] = shard.cp
+            # Scale bytes_fwd: idx_q, idx_w, and output are sharded by CP,
+            # but idx_kv stays global (gathered from all ranks).
+            kv_len = op.meta.get("kv_len", 0)
+            id_ = op.meta.get("id", 0)
+            topk = op.meta.get("topk", 0)
+            ih = op.meta.get("ih_local", op.meta.get("ih", 0))
+            s_local = s // shard.cp if s > 0 else 0
+            idx_q_bytes = s_local * ih * id_ * 2
+            idx_kv_bytes = kv_len * id_ * 2  # global
+            idx_w_bytes = s_local * ih * 2
+            idx_out_bytes = s_local * topk * 2
+            op.meta["bytes_fwd"] = idx_q_bytes + idx_kv_bytes + idx_w_bytes + idx_out_bytes
 
 
 def _apply_ep_sharding(

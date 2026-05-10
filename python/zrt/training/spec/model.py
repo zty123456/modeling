@@ -82,6 +82,9 @@ class ModelSpec:
     master_dtype: Dtype = Dtype.FP32
     act_dtype: Dtype = Dtype.BF16
 
+    # normalization kind: "rmsnorm" (DeepSeek) or "layernorm" (LLaMA variants)
+    norm_kind: str = "rmsnorm"
+
     # Muon optimizer specific fields (optional, from model YAML)
     muon_ns_steps: int | None = None
     model_type: str = "default"

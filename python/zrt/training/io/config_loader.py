@@ -140,6 +140,8 @@ def _parse_model(d: dict) -> ModelSpec:
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
         act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        # normalization
+        norm_kind=d.get("norm_kind", "rmsnorm"),
         model_type=d.get("model_type", "default"),
         muon_ns_steps=d.get("muon_ns_steps"),
     )

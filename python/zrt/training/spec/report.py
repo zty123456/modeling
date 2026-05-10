@@ -86,13 +86,20 @@ class TrainingReport:
     steady_steps: int = 0  # [Stack B]
     
     # Step time breakdown (milliseconds)
+    # Invariants:
+    #   step_time_ms     = pipeline_time_ms + optimizer_time_ms + optimizer_comm_ms
+    #   pipeline_time_ms = compute_time_ms + exposed_comm_ms
+    #   exposed_comm_ms  = Σ *_exposed_ms fields
+    #   hidden_comm_ms   = dp_hidden_ms + tp_hidden_ms + ep_hidden_ms
+    #   total_comm_volume_ms = exposed_comm_ms + hidden_comm_ms
+    pipeline_time_ms: float = 0.0
     warmup_ms: float = 0.0
     steady_ms: float = 0.0
     cooldown_ms: float = 0.0
-    dp_ar_exposed_ms: float = 0.0
+    dp_exposed_ms: float = 0.0
     optimizer_time_ms: float = 0.0
     optimizer_comm_ms: float = 0.0
-    
+
     # Fwd/Bwd breakdown per phase (milliseconds)
     warmup_fwd_ms: float = 0.0
     warmup_bwd_ms: float = 0.0
@@ -100,21 +107,31 @@ class TrainingReport:
     steady_bwd_ms: float = 0.0
     cooldown_fwd_ms: float = 0.0
     cooldown_bwd_ms: float = 0.0
-    
+
     # Per-microbatch time in steady phase (milliseconds)
     steady_fwd_per_mb_ms: float = 0.0
     steady_bwd_per_mb_ms: float = 0.0
     steady_per_mb_ms: float = 0.0
 
-    # Communication time breakdown (milliseconds)
-    tp_comm_ms: float = 0.0           # TP RS/AG time
-    cp_comm_ms: float = 0.0           # CP A2A time
-    ep_comm_ms: float = 0.0           # EP A2A time
-    pp_comm_ms: float = 0.0           # PP P2P time
-    dp_comm_ms: float = 0.0           # DP AR/RS time
-    total_comm_ms: float = 0.0        # Total communication time
-    compute_time_ms: float = 0.0      # Pure compute time
-    overlap_time_ms: float = 0.0      # Compute-comm overlap time
+    # Compute / comm breakdown (milliseconds)
+    compute_time_ms: float = 0.0        # Pure compute on critical path
+    exposed_comm_ms: float = 0.0        # Comm on critical path = Σ *_exposed_ms
+
+    # Per-group exposed comm (Σ = exposed_comm_ms)
+    tp_exposed_ms: float = 0.0          # TP RS/AG (after CoC/MC2 reduction)
+    cp_exposed_ms: float = 0.0          # CP A2A
+    ep_exposed_ms: float = 0.0          # EP A2A (after wave-overlap reduction)
+    pp_exposed_ms: float = 0.0          # PP P2P
+    # dp_exposed_ms declared above
+
+    # Hidden comm — NOT on critical path
+    hidden_comm_ms: float = 0.0         # Total hidden = Σ *_hidden_ms
+    dp_hidden_ms: float = 0.0           # DP AR absorbed in pipeline bubble
+    tp_hidden_ms: float = 0.0           # TP hidden by CoC/MC2
+    ep_hidden_ms: float = 0.0           # EP hidden by wave-overlap
+
+    # Total comm volume = exposed + hidden
+    total_comm_volume_ms: float = 0.0
 
     # Config info
     config_summary: str | dict = ""  # [Stack B] uses str, [Stack A] uses dict
@@ -138,6 +155,7 @@ class TrainingReport:
         """Convert report to JSON-serializable dict."""
         result = {
             "step_time_ms": self.step_time_ms,
+            "pipeline_time_ms": self.pipeline_time_ms,
             "mfu": self.mfu,
             "hfu": self.hfu,
             "total_flops": self.total_flops,
@@ -146,7 +164,7 @@ class TrainingReport:
             "warmup_ms": self.warmup_ms,
             "steady_ms": self.steady_ms,
             "cooldown_ms": self.cooldown_ms,
-            "dp_ar_exposed_ms": self.dp_ar_exposed_ms,
+            "dp_exposed_ms": self.dp_exposed_ms,
             "optimizer_time_ms": self.optimizer_time_ms,
             "optimizer_comm_ms": self.optimizer_comm_ms,
             "warmup_fwd_ms": self.warmup_fwd_ms,
@@ -155,6 +173,17 @@ class TrainingReport:
             "steady_bwd_ms": self.steady_bwd_ms,
             "cooldown_fwd_ms": self.cooldown_fwd_ms,
             "cooldown_bwd_ms": self.cooldown_bwd_ms,
+            "compute_time_ms": self.compute_time_ms,
+            "exposed_comm_ms": self.exposed_comm_ms,
+            "tp_exposed_ms": self.tp_exposed_ms,
+            "cp_exposed_ms": self.cp_exposed_ms,
+            "ep_exposed_ms": self.ep_exposed_ms,
+            "pp_exposed_ms": self.pp_exposed_ms,
+            "hidden_comm_ms": self.hidden_comm_ms,
+            "dp_hidden_ms": self.dp_hidden_ms,
+            "tp_hidden_ms": self.tp_hidden_ms,
+            "ep_hidden_ms": self.ep_hidden_ms,
+            "total_comm_volume_ms": self.total_comm_volume_ms,
         }
 
         # Add optional fields if present
