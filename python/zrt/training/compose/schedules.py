@@ -734,7 +734,11 @@ def compute_mfu(
 ) -> float:
     """Model FLOPs Utilization.
 
-    MFU = actual_training_flops / (world_size * peak_flops * step_time)
+    MFU = (total_training_flops / PP) / (per_gpu_peak * step_time)
+
+    total_training_flops is per-GPU (the graph models TP/EP-sharded computation),
+    so world_size cancels between numerator and denominator. We divide by PP
+    because the graph covers all layers but each GPU handles only 1/PP of them.
 
     Uses actual graph-level FLOP accounting (Σ op_fwd+op_dx+op_dw × M)
     instead of the 6P rule-of-thumb, which overestimates for MoE + low-rank
