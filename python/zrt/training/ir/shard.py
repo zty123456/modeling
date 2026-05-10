@@ -87,33 +87,6 @@ def insert_collectives(graph: Graph, model: ModelSpec, strategy: Strategy) -> No
 
     # Apply TP/CP sharding to global ops (layer_id < 0: lm_head, final_ln, etc.)
     # These are outside the per-layer ranges and would otherwise be skipped.
-    _apply_global_sharding(graph, shard, model)
-
-
-def _apply_global_sharding(
-    graph: Graph, shard: ShardPlan, model: ModelSpec,
-) -> None:
-    """Apply TP/CP sharding to global ops (layer_id < 0)."""
-    global_indices = [i for i, op in enumerate(graph.ops) if op.layer_id < 0]
-    if not global_indices:
-        return
-
-    # Find the layer range that contains the most global ops (usually the last layer)
-    # For lm_head/final_ln, they should get sharding similar to the last transformer layer
-    start = min(global_indices)
-    end = max(global_indices) + 1
-
-    if shard.tp > 1:
-        h = model.hidden
-        h_attn = model.num_heads * model.head_dim
-        h_kv = model.num_kv_heads * model.head_dim
-        ffn = model.ffn
-        seq = model.seq_len
-        act_bytes = model.act_dtype.bytes
-        _apply_tp_sharding(graph, start, end, shard, h, h_attn, h_kv, ffn, seq, act_bytes)
-
-    if shard.has_cp:
-        _apply_cp_sharding(graph, start, end, shard, model.seq_len, model.hidden)
 
 
 def _insert_tp_collectives(
