@@ -68,8 +68,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         metavar="FILE",
-        help="Write result to FILE. For --estimate-config: .xlsx for Excel report (default), "
-             ".json for JSON. For --search-config: writes Pareto frontier JSON.",
+        help="Write result to FILE. For --estimate-config: .xlsx for Excel, .html for interactive graph view, .json for JSON. For --search-config: writes Pareto frontier JSON.",
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -686,7 +685,7 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
     report = estimate(model, system, strategy, graph=graph)
 
     if output_path:
-        # If output ends with .xlsx, write Excel; otherwise JSON
+        # If output ends with .xlsx/.xls → Excel, .html → HTML, otherwise JSON
         if output_path.endswith((".xlsx", ".xls")):
             from python.zrt.training.io.excel_exporter import export_estimate_excel
             export_estimate_excel(
@@ -695,6 +694,14 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
                 op_costs=op_costs, output_path=output_path,
             )
             print(f"Excel report written to {output_path}")
+        elif output_path.endswith(".html"):
+            from python.zrt.training.io.html_exporter import export_estimate_html
+            export_estimate_html(
+                report=report, graph=graph, model=model,
+                system=system, strategy=strategy,
+                op_costs=op_costs, output_path=output_path,
+            )
+            print(f"HTML report written to {output_path}")
         else:
             report_to_json(report, output_path)
             print(f"Report written to {output_path}")
