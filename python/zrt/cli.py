@@ -59,6 +59,13 @@ def main() -> None:
              "Example: --search-config python/zrt/training/configs/llama3_70b_3d.yaml",
     )
     parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        default=False,
+        help="Print a structured per-component time breakdown alongside the estimate. "
+             "Shows compute, comm (by group), bubble, optimizer, and hidden comm.",
+    )
+    parser.add_argument(
         "--output",
         metavar="FILE",
         help="Write result to FILE. For --estimate-config: .xlsx for Excel report (default), "
@@ -223,7 +230,7 @@ def main() -> None:
     # 2. Grid search (--search-config)
     # 3. Graph capture + modelling (--model-id or --model)
     if args.estimate_config:
-        _run_estimate(args.estimate_config, args.output)
+        _run_estimate(args.estimate_config, args.output, breakdown=args.breakdown)
         return
 
     if args.search_config:
@@ -591,15 +598,18 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         logger.warning("Training report export failed: %s", exc)
 
 
-def _run_estimate(config_path: str, output_path: str | None) -> None:
+def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool = False) -> None:
     """Run spec-based training estimation from a YAML config."""
-    from python.zrt.training.io.config_loader import load_specs
+    from python.zrt.training.io.config_loader import load_specs, load_anchor_config
     from python.zrt.training.search.estimator import estimate
     from python.zrt.training.search.report import report_summary, report_to_json
     from python.zrt.training.ir.builders import build_graph
     from python.zrt.training.models.flops import op_cost as _op_cost, total_training_flops
 
-    model, system, strategy = load_specs(config_path)
+    try:
+        model, system, strategy = load_specs(config_path)
+    except (KeyError, TypeError):
+        model, system, strategy = load_anchor_config(config_path)
 
     # Build graph for op-level details, then reuse it in estimate()
     # to avoid duplicate build_graph() calls.
@@ -623,6 +633,9 @@ def _run_estimate(config_path: str, output_path: str | None) -> None:
         else:
             report_to_json(report, output_path)
             print(f"Report written to {output_path}")
+        if breakdown:
+            print()
+            print(report_summary(report))
     else:
         # Default: write Excel to output/estimate with timestamp
         from datetime import datetime

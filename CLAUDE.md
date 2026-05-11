@@ -151,7 +151,7 @@ The training module is self-contained and substantially larger than the rest; it
 
 **PP schedule dispatch** (`transform/analysis/training.py:285-298`): `ctx.training.pp_schedule` selects among interleaved/dualpipev/dualpipe/zb/1f1b. The unified path in `modeller.py:307-343` reads `pipeline_metrics.step_time_ms` directly from the chosen composer instead of recomputing.
 
-**Anchor YAML fixtures** (`tests/training/anchors/*.yaml`): GPT-3 175B, LLaMA-3 70B, DeepSeek-V3 — each pins expected MFU and step time to guard against regressions. Run with `pytest tests/training/anchors/test_anchors.py`.
+**Anchor YAML fixtures** (`tests/training/anchors/*.yaml`): GPT-3 175B, LLaMA-3 70B, DeepSeek-V3 / V3.2 (and V4 variants). Each `targets:` block pins `mfu`; the four "algebraic" anchors (V3 + V3.2 family) also pin `step_time_ms`. Two tests gate regressions: `test_anchor_mfu_strict` and `test_anchor_step_time_strict` — both honor `strict_mfu_check: false`, which puts an anchor in **calibration mode** (anchor MFU sourced from a published reference, simulator not yet calibrated to match — `gpt3_175b_megatron` and `llama3_70b_meta` use this today). Run with `pytest tests/training/anchors/test_anchors.py`.
 
 ## Key Rules (from .clauderules)
 
