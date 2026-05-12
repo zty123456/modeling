@@ -579,14 +579,11 @@ def _apply_cp_sharding(
 ) -> None:
     """Adjust tensor shape_local for CP sharding.
 
-    Ulysses-CP: sequence split by cp, heads multiplied by cp for attention.
-    Ring-CP: sequence split by cp, heads unchanged (KV chunks sent round-robin).
-    Hybrid-CP: both sequence and heads adjustments apply.
-
-    For attention core:
-      - Ulysses: heads_local = heads_tp * cp (heads gathered by A2A)
-      - Ring: heads_local = heads_tp (unchanged)
-      - seq_local = seq / cp for all CP kinds
+    Ulysses-CP: A2A1 scatters heads, gathers seq.
+      Per-rank attn work: s_local = full_seq, heads_local = heads_tp // cp.
+    Ring-CP: seq split across cp ranks, KV chunks streamed via P2P.
+      s_local = seq / cp, heads_local = heads_tp.
+    Hybrid-CP: Ulysses semantics for attention (scatter heads, gather seq).
     """
     if not shard.has_cp:
         return
@@ -605,16 +602,25 @@ def _apply_cp_sharding(
             if "m" in op.meta:
                 op.meta["m"] = op.meta["m"] // shard.cp
         elif op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
-            if "s" in op.meta:
-                op.meta["s"] = op.meta["s"] // shard.cp
-            if shard.cp_kind == CPKind.ULYSSES or shard.cp_kind == CPKind.HYBRID:
-                if "heads" in op.meta:
-                    heads_tp = op.meta.get("heads_tp", op.meta["heads"])
-                    op.meta["heads"] = heads_tp * shard.cp
-                    op.meta["heads_gathered_by_cp"] = True
-            if shard.cp_kind == CPKind.RING:
+            heads_tp = op.meta.get("heads_tp", op.meta.get("heads", 0))
+
+            if shard.cp_kind in (CPKind.ULYSSES, CPKind.HYBRID):
+                # Ulysses A2A1: scatter heads across CP ranks, gather seq.
+                # Per-rank attn work: full seq, heads_tp // cp heads.
+                op.meta["heads"] = max(1, heads_tp // shard.cp)
+                op.meta["heads_gathered_by_cp"] = False
+                # NOTE: do NOT divide op.meta["s"] — full seq is on this
+                # rank during attention.
+            elif shard.cp_kind == CPKind.RING:
+                if "s" in op.meta:
+                    op.meta["s"] = op.meta["s"] // shard.cp
+                # heads unchanged; ring tiles via cp rounds
                 op.meta["heads_gathered_by_cp"] = False
                 op.meta["cp_tiles"] = shard.cp
+            else:
+                # CPKind.NONE / COMPRESSED — preserve existing behavior
+                if "s" in op.meta:
+                    op.meta["s"] = op.meta["s"] // shard.cp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
             if "bytes_fwd" in op.meta:
                 op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.cp
