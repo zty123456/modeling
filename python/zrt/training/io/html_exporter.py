@@ -45,6 +45,9 @@ def _tensor_list_info(tensors: list, label: str = "") -> str:
 def _op_formula(op, cost):
     """Return (fwd_formula, bwd_formula, fwd_bytes_formula, bwd_bytes_formula) for an op."""
     m = op.meta
+    ff = _fwd_flops(cost)
+    df = _dx_flops(cost)
+    wf = _dw_flops(cost)
 
     if op.kind == "matmul" or op.kind == "lm_head":
         mm = m.get("m", 0)
@@ -52,14 +55,14 @@ def _op_formula(op, cost):
         kk = m.get("k_local", m.get("k", 0))
         mult = m.get("fwd_multiplier", 1.0)
         bpe = _bpe_from_op(op)
-        fwd_val = cost.fwd_flops
+        fwd_val = ff
         bytes_val = cost.fwd_bytes
 
         if mult != 1.0:
             fwd_str = f"2×m×n×k×{mult} = 2×{mm}×{nn}×{kk}×{mult} = {_fmt_e(fwd_val)}"
         else:
             fwd_str = f"2×m×n×k = 2×{mm}×{nn}×{kk} = {_fmt_e(fwd_val)}"
-        bwd_str = f"dx+dw = 2×fwd = {_fmt_e(cost.dx_flops + cost.dw_flops)}"
+        bwd_str = f"dx+dw = 2×fwd = {_fmt_e(df + wf)}"
         bytes_str = f"(m×k+k×n+m×n)×bpe = ({mm}×{kk}+{kk}×{nn}+{mm}×{nn})×{bpe} = {_fmt_e(bytes_val)}"
         return fwd_str, bwd_str, bytes_str, bytes_str
 
@@ -74,16 +77,16 @@ def _op_formula(op, cost):
 
         if topk > 0:
             eff = topk + swa
-            fwd_str = f"2×b×s×(topk+swa)×h×d = 2×{b}×{s}×{eff}×{h}×{d} = {_fmt_e(cost.fwd_flops)}"
+            fwd_str = f"2×b×s×(topk+swa)×h×d = 2×{b}×{s}×{eff}×{h}×{d} = {_fmt_e(ff)}"
         elif cr > 0:
             c_len = max(1, s // cr)
             eff = c_len + swa
-            fwd_str = f"2×b×s×(s/r+swa)×h×d = 2×{b}×{s}×{eff}×{h}×{d} = {_fmt_e(cost.fwd_flops)}"
+            fwd_str = f"2×b×s×(s/r+swa)×h×d = 2×{b}×{s}×{eff}×{h}×{d} = {_fmt_e(ff)}"
         elif swa > 0:
-            fwd_str = f"2×b×s×swa×h×d = 2×{b}×{s}×{swa}×{h}×{d} = {_fmt_e(cost.fwd_flops)}"
+            fwd_str = f"2×b×s×swa×h×d = 2×{b}×{s}×{swa}×{h}×{d} = {_fmt_e(ff)}"
         else:
-            fwd_str = f"2×b×s²×h×d = 2×{b}×{s}²×{h}×{d} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd (FlashAttn internal recompute) = {_fmt_e(cost.dx_flops)}"
+            fwd_str = f"2×b×s²×h×d = 2×{b}×{s}²×{h}×{d} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd (FlashAttn internal recompute) = {_fmt_e(df)}"
         kv_len = (topk + swa) if topk > 0 else (max(1, s // cr) + swa if cr > 0 else (swa if swa > 0 else s))
         bytes_str = f"(2×b×h×s×d + 2×b×h×kv_len×d)×bpe = (2×{b}×{h}×{s}×{d} + 2×{b}×{h}×{kv_len}×{d})×bpe = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"(3×b×h×s×d + 4×b×h×kv_len×d)×bpe = {_fmt_e(cost.dx_bytes)}"
@@ -92,40 +95,40 @@ def _op_formula(op, cost):
     if op.kind in ("rmsnorm", "ln"):
         n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
         fpe = 5 if op.kind == "rmsnorm" else 7
-        fwd_str = f"{fpe}×N = {fpe}×{n} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"{fpe}×N = {fpe}×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
         bytes_str = f"fwd_bytes = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind == "rope":
         n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
-        fwd_str = f"2×N (sin/cos mul) = 2×{n} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"2×N (sin/cos mul) = 2×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
         bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind == "swiglu":
         n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
-        fwd_str = f"5×N (sig+mul) = 5×{n} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"5×N (sig+mul) = 5×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
         bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind == "add":
         n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
-        fwd_str = f"1×N (add) = {n} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"1×N (add) = {n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
         bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind == "softmax":
         n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
-        fwd_str = f"4×N (max/sub/exp/div) = 4×{n} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"4×N (max/sub/exp/div) = 4×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
         bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
@@ -135,8 +138,8 @@ def _op_formula(op, cost):
         kv = m.get("kv_len", s)
         ih = m.get("ih_local", m.get("ih", 0))
         id_ = m.get("id", 0)
-        fwd_str = f"2×s×kv_len×ih×id_ = 2×{s}×{kv}×{ih}×{id_} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2×fwd (idx_q grad only) = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"2×s×kv_len×ih×id_ = 2×{s}×{kv}×{ih}×{id_} = {_fmt_e(ff)}"
+        bwd_str = f"2×fwd (idx_q grad only) = {_fmt_e(df)}"
         bytes_str = f"fwd_bytes = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = - (grad via matmul bwd)"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
@@ -146,8 +149,8 @@ def _op_formula(op, cost):
         mm_ = m.get("m", 4)
         co = m.get("coff", 1)
         dd = m.get("d_local", m.get("d", 0))
-        fwd_str = f"4×(s/m)×coff×m×d = 4×({s}//{mm_})×{co}×{mm_}×{dd} = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"= fwd = {_fmt_e(cost.dx_flops)}"
+        fwd_str = f"4×(s/m)×coff×m×d = 4×({s}//{mm_})×{co}×{mm_}×{dd} = {_fmt_e(ff)}"
+        bwd_str = f"= fwd = {_fmt_e(df)}"
         bytes_str = f"bytes = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
@@ -162,8 +165,8 @@ def _op_formula(op, cost):
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind in ("mhc_pre", "mhc_post", "mhc_head"):
-        fwd_str = f"fwd = {_fmt_e(cost.fwd_flops)}"
-        bwd_str = f"2.5×fwd = {_fmt_e(cost.dx_flops + cost.dw_flops)}"
+        fwd_str = f"fwd = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df + wf)}"
         bytes_str = f"= {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"= {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
@@ -172,7 +175,7 @@ def _op_formula(op, cost):
         return "negligible", "negligible", "negligible", "negligible"
 
     # Fallback
-    return f"fwd = {_fmt_e(cost.fwd_flops)}", f"bwd = {_fmt_e(cost.dx_flops + cost.dw_flops)}", \
+    return f"fwd = {_fmt_e(ff)}", f"bwd = {_fmt_e(df + wf)}", \
            f"bytes = {_fmt_e(cost.fwd_bytes)}", f"dx_bytes = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
 
 
@@ -201,6 +204,15 @@ def _fmt_e(v: float) -> str:
         return f"{v/1e3:.2f}K"
     return f"{v:.0f}"
 
+
+def _fwd_flops(cost) -> float:
+    return cost.fwd_cube_flops + cost.fwd_vector_flops
+
+def _dx_flops(cost) -> float:
+    return cost.dx_cube_flops + cost.dx_vector_flops
+
+def _dw_flops(cost) -> float:
+    return cost.dw_cube_flops + cost.dw_vector_flops
 
 def _op_detail(op, cost):
     """Return a dict with full op info for Excel/HTML."""
@@ -271,9 +283,9 @@ def _op_to_dict(op: Op, cost: OpCost, system) -> dict:
     return {
         "name": op.name,
         "kind": op.kind,
-        "fwd_flops": cost.fwd_flops,
-        "dx_flops": cost.dx_flops,
-        "dw_flops": cost.dw_flops,
+        "fwd_flops": _fwd_flops(cost),
+        "dx_flops": _dx_flops(cost),
+        "dw_flops": _dw_flops(cost),
         "fwd_bytes": cost.fwd_bytes,
         "dx_bytes": cost.dx_bytes,
         "dw_bytes": cost.dw_bytes,
