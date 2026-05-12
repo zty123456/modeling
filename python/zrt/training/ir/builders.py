@@ -477,6 +477,11 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
 
     # Shared expert FFN
     if model.n_shared_experts > 0:
+        if model.moe_ffn == 0:
+            raise ValueError(
+                f"Layer {layer_id}: moe_ffn=0 but n_shared_experts={model.n_shared_experts}>0. "
+                "Set moe_ffn to the per-expert FFN hidden size in the model spec."
+            )
         m = model.moe_ffn
         ops.append(Op(name=f"{prefix}.shared_up_proj", kind="matmul",
             inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
