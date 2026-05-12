@@ -146,8 +146,11 @@ def test_ring_cp_cp_tiles_marker():
             assert op.meta.get("heads_gathered_by_cp") is False
 
 
-def test_ulysses_cp_heads_gathered():
-    """Ulysses CP should set heads_gathered_by_cp=True and multiply heads by cp."""
+def test_ulysses_cp_heads_scattered():
+    """Ulysses CP A2A1 scatters heads across CP ranks, gathers seq.
+
+    Per-rank attn work: full seq, heads_tp // cp heads.
+    """
     from zrt.training.spec.strategy import CPKind
 
     model = ModelSpec(
@@ -161,11 +164,14 @@ def test_ulysses_cp_heads_gathered():
     for op in graph.ops:
         if op.kind == "attn_core":
             heads_tp = 32 // 2  # TP shards heads
-            heads_after_cp = heads_tp * 4  # CP gathers heads
+            heads_after_cp = max(1, heads_tp // 4)  # Ulysses scatters heads
             assert op.meta.get("heads") == heads_after_cp, (
-                f"Ulysses CP should multiply heads to {heads_after_cp}, got {op.meta.get('heads')}"
+                f"Ulysses CP should scatter heads to {heads_after_cp}, got {op.meta.get('heads')}"
             )
-            assert op.meta.get("heads_gathered_by_cp") is True
+            assert op.meta.get("s") == model.seq_len, (
+                f"Ulysses CP should keep full seq={model.seq_len}, got {op.meta.get('s')}"
+            )
+            assert op.meta.get("heads_gathered_by_cp") is False
 
 
 def test_ep_a2a_phase_both():
