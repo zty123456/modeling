@@ -143,6 +143,7 @@ def test_ring_cp_cp_tiles_marker():
             assert op.meta.get("cp_tiles") == 4, (
                 f"Ring CP should set cp_tiles=4, got {op.meta.get('cp_tiles')}"
             )
+            # Debug marker; FLOPs use s/heads/cp_tiles.
             assert op.meta.get("heads_gathered_by_cp") is False
 
 

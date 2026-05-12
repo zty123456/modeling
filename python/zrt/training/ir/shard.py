@@ -579,11 +579,12 @@ def _apply_cp_sharding(
 ) -> None:
     """Adjust tensor shape_local for CP sharding.
 
-    Ulysses-CP: A2A1 scatters heads, gathers seq.
+    Ulysses-CP: A2A scatters heads, gathers seq.
       Per-rank attn work: s_local = full_seq, heads_local = heads_tp // cp.
     Ring-CP: seq split across cp ranks, KV chunks streamed via P2P.
       s_local = seq / cp, heads_local = heads_tp.
-    Hybrid-CP: Ulysses semantics for attention (scatter heads, gather seq).
+    Hybrid-CP: Ulysses head sharding plus Ring sequence tiling.
+      s_local = seq / cp, heads_local = heads_tp // cp, cp_tiles = cp.
     """
     if not shard.has_cp:
         return
@@ -604,13 +605,19 @@ def _apply_cp_sharding(
         elif op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
             heads_tp = op.meta.get("heads_tp", op.meta.get("heads", 0))
 
-            if shard.cp_kind in (CPKind.ULYSSES, CPKind.HYBRID):
+            if shard.cp_kind == CPKind.ULYSSES:
                 # Ulysses A2A1: scatter heads across CP ranks, gather seq.
                 # Per-rank attn work: full seq, heads_tp // cp heads.
                 op.meta["heads"] = max(1, heads_tp // shard.cp)
                 op.meta["heads_gathered_by_cp"] = False
                 # NOTE: do NOT divide op.meta["s"] — full seq is on this
                 # rank during attention.
+            elif shard.cp_kind == CPKind.HYBRID:
+                if "s" in op.meta:
+                    op.meta["s"] = op.meta["s"] // shard.cp
+                op.meta["heads"] = max(1, heads_tp // shard.cp)
+                op.meta["heads_gathered_by_cp"] = False
+                op.meta["cp_tiles"] = shard.cp
             elif shard.cp_kind == CPKind.RING:
                 if "s" in op.meta:
                     op.meta["s"] = op.meta["s"] // shard.cp
