@@ -209,10 +209,10 @@ def export_estimate_excel(
         cost = op_costs.get(op.name)
         if cost is None:
             from zrt.training.models.flops import op_cost as _op_cost
-            cost = _op_cost(op, model)
+            cost = _op_cost(op, model, system)
 
-        fwd_flops = cost.fwd_flops
-        bwd_flops = cost.dx_flops + cost.dw_flops
+        fwd_flops = cost.fwd_cube_flops + cost.fwd_vector_flops
+        bwd_flops = cost.dx_cube_flops + cost.dx_vector_flops + cost.dw_cube_flops + cost.dw_vector_flops
         total_flops = fwd_flops + bwd_flops
         layer_k = _LAYER_KIND_MAP.get(op.layer_kind.value, op.layer_kind.value)
 

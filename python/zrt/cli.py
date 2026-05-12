@@ -680,7 +680,7 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
     graph = build_graph(model, strategy)
     op_costs: dict[str, object] = {}
     for op in graph.ops:
-        op_costs[op.name] = _op_cost(op, model)
+        op_costs[op.name] = _op_cost(op, model, system)
 
     report = estimate(model, system, strategy, graph=graph)
 

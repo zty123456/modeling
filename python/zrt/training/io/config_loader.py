@@ -161,6 +161,7 @@ def _parse_system(d: dict) -> SystemSpec:
         cube_tflops=hw.compute.cube_bf16_tflops,
         vector_tflops=hw.compute.vector_bf16_tflops,
         overlap_ratio=dict(hw.compute.overlap_ratio),
+        sram_kb_per_sm=hw.compute.sram_kb_per_sm,
     )
     return SystemSpec(
         gpu=gpu,

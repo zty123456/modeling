@@ -764,9 +764,7 @@ def compute_mfu(
     from zrt.training.models.flops import total_training_flops
 
     tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
-    actual_flops = total_training_flops(graph, model, strategy)
-
-    # Peak FLOP/s of single GPU (total_flops is per-GPU because the graph
+    actual_flops = total_training_flops(graph, model, strategy, system)
     # models sharded computation; cluster-wide FLOPs = per_gpu × world_size,
     # and cluster peak = per_gpu_peak × world_size — the world_size cancels).
     peak = system.gpu.flops_bf16 * 1e12
@@ -789,8 +787,10 @@ def compute_hfu(
     """
     from zrt.training.models.flops import total_training_flops, recompute_overhead_flops
 
-    actual_flops = total_training_flops(graph, model, strategy)
-    rc_overhead = recompute_overhead_flops(graph, model, strategy)
+    actual_flops = total_training_flops(graph, model, strategy, system)
+
+    # Peak FLOP/s of single GPU (total_flops is per-GPU because the graph
+    rc_overhead = recompute_overhead_flops(graph, model, strategy, system)
     peak = system.gpu.flops_bf16 * 1e12
 
     # Divide by PP (same rationale as compute_mfu)

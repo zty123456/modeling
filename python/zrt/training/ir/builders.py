@@ -187,9 +187,8 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
         meta={"bytes_fwd": seq * (h_rope + qk_rope) * act_dtype.bytes * 2},
         layer_id=layer_id, layer_kind=layer_kind))
 
-# Optional: Lightning Indexer for V3.2 DSA (index_topk > 0, no V4 attn, MOE layers only)
-    # Dense layers use full attention; Lightning Indexer only applies to MoE layers
-    if model.index_topk > 0 and not model.use_v4_attn and layer_kind == LayerKind.MOE:
+# Optional: Lightning Indexer for V3.2 DSA (all attention layers when index_topk > 0)
+    if model.index_topk > 0 and not model.use_v4_attn:
         ops.extend(_build_indexer_ops(model, layer_id, seq,
                                        prefix, layer_kind, act_dtype,
                                        q_input_name="q_a_normed"))
@@ -199,8 +198,8 @@ def _build_mla_attn(model: ModelSpec, layer_id: int, seq: int,
     attn_meta = {"b": 1, "s": seq, "heads": n_h,
                  "head_dim": effective_head_dim, "causal": True,
                  "v_head_dim": v_hd}
-    # V3.2: sparse attention over indexer topk KV (MoE layers only)
-    if model.index_topk > 0 and not model.use_v4_attn and layer_kind == LayerKind.MOE:
+    # V3.2: sparse attention over indexer topk KV (all attention layers)
+    if model.index_topk > 0 and not model.use_v4_attn:
         attn_meta["sparse_topk"] = model.index_topk
     ops.append(Op(name=f"{prefix}.attn_core", kind="attn_core",
         inputs=[_tensor("q_final", (seq, h_q), act_dtype),
