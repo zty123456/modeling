@@ -471,19 +471,24 @@ def _apply_tp_sharding(
 
             if col_parallel:
                 n_local = n // shard.tp
-                op.meta["n_local"] = n_local
+                updated = False
                 for t in op.outputs:
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
+                        updated = True
+                if not updated:
+                    op.meta["n_local"] = n_local
             elif row_parallel:
                 k_local = k // shard.tp
-                op.meta["k_local"] = k_local
+                updated = False
                 for t in op.inputs:
                     if t.shape_logical and t.shape_logical[-1] == k:
                         t.shape_local = (t.shape_logical[0], k_local)
+                        updated = True
+                if not updated:
+                    op.meta["k_local"] = k_local
             elif "router" in op.name:
                 n_local = n // shard.tp
-                op.meta["n_local"] = n_local
                 for t in op.outputs:
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
@@ -567,8 +572,6 @@ def _apply_tp_sharding(
                 if "bytes_fwd" in op.meta:
                     op.meta["bytes_fwd"] = op.meta["bytes_fwd"] // shard.tp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
-            if "bytes_fwd" in op.meta:
-                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.tp
             for t in op.inputs + op.outputs:
                 if t.shape_logical and t.shape_logical[-1] in (h, h_attn, h_kv, ffn):
                     t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))
@@ -597,10 +600,13 @@ def _apply_cp_sharding(
         for t in op.inputs + op.outputs:
             if t.shape_logical and len(t.shape_logical) > 0:
                 if t.shape_logical[0] == seq:
-                    t.shape_local = (seq_local,) + t.shape_logical[1:]
+                    t.shape_local = (seq_local,) + t.shape_local[1:]
 
         if op.kind == "matmul":
-            if "m" in op.meta:
+            # For meta-authoritative matmuls (grouped/fused where meta k != input shape),
+            # _matmul_cost reads m from meta — must divide it here.
+            meta_k = op.meta.get("k", 0)
+            if "m" in op.meta and meta_k > 0 and op.inputs and op.inputs[0].shape_logical[-1] != meta_k:
                 op.meta["m"] = op.meta["m"] // shard.cp
         elif op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
             heads_tp = op.meta.get("heads_tp", op.meta.get("heads", 0))
@@ -629,8 +635,7 @@ def _apply_cp_sharding(
                 if "s" in op.meta:
                     op.meta["s"] = op.meta["s"] // shard.cp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
-            if "bytes_fwd" in op.meta:
-                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.cp
+            pass  # shape_local already updated by the generic loop above
         elif op.kind == "compressor_pool":
             # Sequence dimension is sharded by CP. Each rank pools its local
             # chunk independently (m=4 pooling is local, no cross-rank comm).

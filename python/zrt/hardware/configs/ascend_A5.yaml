@@ -1,0 +1,46 @@
+name: "Ascend A5"
+vendor: "huawei"
+device_type: "npu"
+
+compute:
+  # Peak throughput (theoretical, no sparsity)
+  fp16_tflops: 419
+  bf16_tflops: 419
+  fp32_tflops: 209
+  int8_tops: 838
+  int4_tops: 1677
+  fp8_tops: 838
+
+  # Heterogeneous-core (DaVinci Cube/Vector split)
+  # Cube: matmul unit peak ~280 TFLOPS bf16 (primary AI-Core throughput)
+  # Vector: elementwise/norm unit peak ~40 TFLOPS bf16
+  cube_bf16_tflops: 419
+  vector_bf16_tflops: 52
+  sram_kb_per_sm: 192  # DaVinci AI Core L1 unified buffer (~192 KB)
+  overlap_ratio:
+    attn_core: 0.6   # ~60% pipeline overlap for fused attention
+
+memory:
+  capacity_gb: 96
+  hbm_bandwidth_gbps: 4000
+  l2_cache_mb: 131
+  tiers:
+    - { name: "L2",  bandwidth_gbps: 5300, capacity_mb: 131 }
+    - { name: "HBM", bandwidth_gbps: 4000, capacity_mb: 0  }
+
+interconnect:
+  intra_node:
+    type: "HCCS"
+    # 7 HCCS links per card, 56 GB/s unidirectional each
+    # Registry computes bidirectional total: 7 * 56 * 2 = 784 GB/s
+    unidirectional_bw_gbps: 504
+    num_links: 7
+    latency_us: 3.46
+    topology: "full_mesh"
+    num_devices: 64
+  inter_node:
+    type: "RoCE"
+    bandwidth_gbps: 50      # 200 GbE ≈ 25 GB/s per port; 8-port = 200 GB/s aggregate
+    latency_us: 4.66
+    topology: "fat_tree"
+    num_devices: 65536           # cluster-scale, no fixed upper bound

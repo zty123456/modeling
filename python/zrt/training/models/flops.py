@@ -92,12 +92,9 @@ def _embed_cost(op: Op) -> OpCost:
     Forward: read embedding table rows -> write embeddings
     Backward: read embeddings -> update embedding table rows (gradient scatter)
     """
-    # Get dimensions from op meta
-    seq = op.meta.get("m", 0)  # sequence length
-    hidden = op.meta.get("n", 0)  # embedding dimension
+    seq = op.inputs[0].shape_local[0] if op.inputs else op.meta.get("m", 0)
+    hidden = op.outputs[0].shape_local[-1] if op.outputs else op.meta.get("n", 0)
 
-    # Forward bytes: read seq * hidden elements from embedding table
-    # Backward bytes: same volume (gradient scatter)
     bpe = _bpe(op)
     fwd_bytes = seq * hidden * bpe
 
@@ -110,9 +107,23 @@ def _embed_cost(op: Op) -> OpCost:
 
 
 def _matmul_cost(op: Op) -> OpCost:
-    m = op.meta.get("m", 0)
-    n = op.meta.get("n_local", op.meta.get("n", 0))
-    k = op.meta.get("k_local", op.meta.get("k", 0))
+    # Fused ops (routed_expert) and grouped matmuls (wo_a) have meta
+    # dimensions that don't correspond to tensor shapes — must read from meta.
+    meta_k = op.meta.get("k", 0)
+    use_meta = (
+        op.meta.get("fused_weight_dims", False)
+        or not op.inputs
+        or not op.outputs
+        or (meta_k > 0 and op.inputs[0].shape_logical[-1] != meta_k)
+    )
+    if use_meta:
+        m = op.meta.get("m", 0)
+        n = op.meta.get("n_local", op.meta.get("n", 0))
+        k = op.meta.get("k_local", op.meta.get("k", 0))
+    else:
+        m = op.inputs[0].shape_local[0]
+        k = op.inputs[0].shape_local[-1]
+        n = op.outputs[0].shape_local[-1]
     bpe = _bpe(op)
     fwd = 2.0 * m * n * k * op.meta.get("fwd_multiplier", 1.0)
     # read A(m×k) + B(k×n), write C(m×n) — symmetric for fwd/dx/dw

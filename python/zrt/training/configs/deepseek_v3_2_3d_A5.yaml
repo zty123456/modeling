@@ -1,0 +1,26 @@
+# DeepSeek-V3.2 3D parallel training — Ascend 910C
+model: deepseek_v3_2new
+
+system:
+  hw: ascend_A5
+  nodes: 1024
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 2
+  cp: 64
+  pp: 16
+  ep: 8
+  dp: 4
+  cp_kind: "ulysses"
+  micro_batch: 1
+  global_batch: 4096
+  pp_schedule: 1f1b
+  zero_stage: 1
+  recompute:
+    per_layer:
+      moe: ["attn"]
+  optimizer: adam
+  tp_overlap: coc
+  ep_overlap: true
