@@ -512,7 +512,8 @@ def _build_moe_ffn_ops(model: ModelSpec, layer_id: int, seq: int,
         outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
         meta={"m": seq, "n": h, "k": model.moe_ffn,
               "fwd_multiplier": 3 * model.top_k,
-              "swiglu_clamp": model.swiglu_clamp},
+              "swiglu_clamp": model.swiglu_clamp,
+              "fused_weight_dims": True},
         layer_id=layer_id, layer_kind=layer_kind))
 
     # Expert aggregation
@@ -857,7 +858,8 @@ def _moe_block(
             name=f"{prefix}.routed_expert_ffn", kind="matmul",
             inputs=[_tensor("x_ln2", (seq, h), act_dtype)],
             outputs=[_tensor("routed_ffn_out", (seq, h), act_dtype)],
-            meta={"m": seq, "n": h, "k": moe_ffn, "fwd_multiplier": 3 * top_k},
+            meta={"m": seq, "n": h, "k": moe_ffn, "fwd_multiplier": 3 * top_k,
+                  "fused_weight_dims": True},
             layer_id=layer_id, layer_kind=LayerKind.MOE,
         ))
         if n_shared_experts > 0:
