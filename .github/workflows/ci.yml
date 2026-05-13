@@ -17,11 +17,16 @@ env:
 
 jobs:
   # ── 门禁 1: 代码规范 (ruff) ──────────────────────────────────────────────
+  # PR 阶段：只检查 PR 实际改动的 .py 文件，避免历史欠账阻塞新 PR
+  # main push 阶段：全量扫描但 soft-fail，给历史欠账可视化展示窗口
+  # 历史欠账清理见单独 issue/PR；清理完后可移除 push 分支的 continue-on-error
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # diff 需要 base 历史
 
       - uses: actions/setup-python@v5
         with:
@@ -30,7 +35,23 @@ jobs:
       - name: Install ruff
         run: pip install ruff
 
-      - name: Check code style
+      - name: Lint changed Python files (PR only — hard fail)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          CHANGED=$(git diff --name-only --diff-filter=AM \
+                      origin/${{ github.base_ref }}...HEAD -- '*.py')
+          if [ -z "$CHANGED" ]; then
+            echo "No Python file changes — skipping lint."
+            exit 0
+          fi
+          echo "Linting changed files:"
+          echo "$CHANGED"
+          ruff check $CHANGED
+
+      - name: Lint full tree (push to main — soft fail, surface historical debt)
+        if: github.event_name == 'push'
+        continue-on-error: true
         run: ruff check python/ tests/
 
   # ── 门禁 2: 单元测试 + 全局覆盖率 ≥65%（历史代码基线，后续逐步提升）────
