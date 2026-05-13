@@ -10,7 +10,6 @@ from python.zrt.simulator.result import SimResult
 from python.zrt.report.report_builder import (
     build_report_context,
     _build_metadata, _build_bound,
-    _build_blocks, _build_sub_structures, _build_op_families,
 )
 from python.zrt.report.report_types import ReportContext
 
