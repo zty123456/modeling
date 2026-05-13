@@ -14,6 +14,10 @@ concurrency:
 env:
   PYTHONPATH: python
   PYTHON_VERSION: "3.12"
+  # 覆盖率门禁阈值 — 单点定义，修改后所有作业和 job name 一并更新
+  # 历史欠账还清后建议把 GLOBAL_COVERAGE_THRESHOLD 上调至 80
+  GLOBAL_COVERAGE_THRESHOLD: "65"
+  PATCH_COVERAGE_THRESHOLD: "80"
 
 jobs:
   # ── 门禁 1: 代码规范 (ruff) ──────────────────────────────────────────────
@@ -117,9 +121,9 @@ jobs:
         continue-on-error: true
         run: ruff check python/ tests/
 
-  # ── 门禁 2: 单元测试 + 全局覆盖率 ≥65%（历史代码基线，后续逐步提升）────
+  # ── 门禁 2: 单元测试 + 全局覆盖率门槛（历史代码基线，后续逐步提升）────────
   test:
-    name: Test & Global Coverage Gate (≥65%)
+    name: Test & Global Coverage Gate (≥${{ env.GLOBAL_COVERAGE_THRESHOLD }}%)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -145,7 +149,7 @@ jobs:
             --cov=python/zrt \
             --cov-report=xml:coverage.xml \
             --cov-report=term-missing \
-            --cov-fail-under=65 \
+            --cov-fail-under=${{ env.GLOBAL_COVERAGE_THRESHOLD }} \
             -q
 
       - name: Upload coverage artifact
@@ -156,12 +160,12 @@ jobs:
           path: coverage.xml
           retention-days: 7
 
-  # ── 门禁 3: PR 新增/修改代码必须有测试覆盖（patch coverage ≥80%）────────
+  # ── 门禁 3: PR 新增/修改代码必须有测试覆盖（patch coverage 门槛）─────────
   # 防止"全局达标但新增代码全部没测试"的搭便车情形。
   # 仅源码（python/zrt/**.py）参与计算；纯文档/配置/重命名等无源码改动的 PR
   # 会因 diff 不包含可测行而被 diff-cover 自动放行。
   patch-coverage:
-    name: Patch Coverage Gate (≥80% on PR diff)
+    name: Patch Coverage Gate (≥${{ env.PATCH_COVERAGE_THRESHOLD }}% on PR diff)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: test
@@ -185,12 +189,12 @@ jobs:
       - name: Ensure base branch is available
         run: git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
 
-      - name: Enforce patch coverage ≥80%
+      - name: Enforce patch coverage threshold
         run: |
           diff-cover coverage.xml \
             --compare-branch=origin/${{ github.base_ref }} \
             --include "python/zrt/**/*.py" \
-            --fail-under=80 \
+            --fail-under=${{ env.PATCH_COVERAGE_THRESHOLD }} \
             --html-report=patch-coverage.html \
             --markdown-report=patch-coverage.md
 

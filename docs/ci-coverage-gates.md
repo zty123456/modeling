@@ -83,7 +83,8 @@ pip install pytest pytest-cov diff-cover
 当前未配置 label/路径白名单豁免。如确有特殊需要（例如纯生成代码、第三方代码引入），请在 PR 描述中说明，由 reviewer 评估后用管理员权限 override。**不要**通过 `# pragma: no cover` 大面积逃避检查。
 
 **Q4：全局 65% 何时上调？**
-跟踪 issue：每月评估一次历史欠账清偿进度，达到 70% 后下调宽限。
+跟踪 issue [#67](https://github.com/laksjdf/modeling/issues/67)。每月评估一次实际覆盖率，稳定 ≥ 阈值 + 5pp 后上调一档（65 → 70 → 75 → 80）。
+调整方法：改 `.github/workflows/ci.yml::env.GLOBAL_COVERAGE_THRESHOLD` 单点即可，所有作业、job name、文档自动跟随。
 
 ---
 
