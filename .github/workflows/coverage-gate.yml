@@ -1,0 +1,80 @@
+name: Coverage No-Regression
+
+# 只在 PR 时运行，防止合并后整体覆盖率下降。
+# 与 ci.yml 的三道闸互补：
+#   1) ci.yml::test           — 全局覆盖率 ≥65%（绝对下限）
+#   2) ci.yml::patch-coverage — PR 新增/修改代码覆盖率 ≥80%（防搭便车）
+#   3) 本工作流              — 整体覆盖率不得低于 base 分支（防慢性退化）
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: python
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  coverage-regression:
+    name: Coverage No-Regression Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 需要完整历史才能切换到 base 分支
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      # ── 步骤 1：在 base 分支（main）跑测试，记录覆盖率 ────────────────────
+      - name: Measure base branch coverage
+        run: |
+          git checkout ${{ github.base_ref }}
+          pytest tests/ -m "not network" \
+            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/base.txt || true
+          python - <<'EOF'
+          import re, pathlib
+          txt = pathlib.Path("/tmp/base.txt").read_text()
+          m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", txt)
+          pct = m.group(1) if m else "0"
+          pathlib.Path("/tmp/base_pct.txt").write_text(pct)
+          print(f"Base coverage: {pct}%")
+          EOF
+
+      # ── 步骤 2：切回 PR 分支，跑测试，记录覆盖率 ─────────────────────────
+      - name: Measure PR branch coverage
+        run: |
+          git checkout ${{ github.head_ref }}
+          pytest tests/ -m "not network" \
+            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/pr.txt
+          python - <<'EOF'
+          import re, pathlib
+          txt = pathlib.Path("/tmp/pr.txt").read_text()
+          m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", txt)
+          pct = m.group(1) if m else "0"
+          pathlib.Path("/tmp/pr_pct.txt").write_text(pct)
+          print(f"PR coverage: {pct}%")
+          EOF
+
+      # ── 步骤 3：对比，PR 覆盖率不得低于 base ────────────────────────────
+      - name: Enforce no regression
+        run: |
+          BASE=$(cat /tmp/base_pct.txt)
+          PR=$(cat /tmp/pr_pct.txt)
+          echo "Base branch: ${BASE}%  |  This PR: ${PR}%"
+          if [ "$PR" -lt "$BASE" ]; then
+            echo "❌ Coverage regression: ${PR}% < ${BASE}% (base branch)"
+            exit 1
+          fi
+          echo "✅ Coverage did not regress: ${PR}% >= ${BASE}%"

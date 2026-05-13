@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 取消同一 PR 的前一次运行，节省 CI 分钟数
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: python
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ── 门禁 1: 代码规范 (ruff) ──────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Check code style
+        run: ruff check python/ tests/
+
+  # ── 门禁 2: 单元测试 + 全局覆盖率 ≥65%（历史代码基线，后续逐步提升）────
+  test:
+    name: Test & Global Coverage Gate (≥65%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # diff-cover 需要完整历史以对比 base 分支
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest pytest-cov diff-cover
+
+      - name: Run tests (skip network tests)
+        run: |
+          pytest tests/ \
+            -m "not network" \
+            --cov=python/zrt \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=65 \
+            -q
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ── 门禁 3: PR 新增/修改代码必须有测试覆盖（patch coverage ≥80%）────────
+  # 防止"全局达标但新增代码全部没测试"的搭便车情形。
+  # 仅源码（python/zrt/**.py）参与计算；纯文档/配置/重命名等无源码改动的 PR
+  # 会因 diff 不包含可测行而被 diff-cover 自动放行。
+  patch-coverage:
+    name: Patch Coverage Gate (≥80% on PR diff)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install diff-cover
+        run: pip install diff-cover
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+
+      - name: Ensure base branch is available
+        run: git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+
+      - name: Enforce patch coverage ≥80%
+        run: |
+          diff-cover coverage.xml \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --include "python/zrt/**/*.py" \
+            --fail-under=80 \
+            --html-report=patch-coverage.html \
+            --markdown-report=patch-coverage.md
+
+      - name: Upload patch coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-coverage-report
+          path: |
+            patch-coverage.html
+            patch-coverage.md
+          retention-days: 7
+
+  # ── 预留门禁 3: 类型检查 (mypy) ─────────────────────────────────────────
+  # 取消下方注释即可启用；建议先修复现有类型错误后再开启
+  #
+  # type-check:
+  #   name: Type Check (mypy)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+  #     - name: Install mypy
+  #       run: pip install mypy torch --index-url https://download.pytorch.org/whl/cpu
+  #     - name: Run mypy
+  #       run: mypy python/zrt/ --ignore-missing-imports
+
+  # ── 预留门禁 4: 安全扫描 (pip-audit + bandit) ────────────────────────────
+  # 取消下方注释即可启用
+  #
+  # security:
+  #   name: Security Scan
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+  #     - name: Install scanners
+  #       run: pip install bandit pip-audit
+  #     - name: bandit (source code SAST)
+  #       run: bandit -r python/zrt/ -ll -x python/zrt/training/configs
+  #     - name: pip-audit (dependency CVE scan)
+  #       run: pip-audit -r requirements.txt
+
+  # ── 预留门禁 5: 慢速集成测试（可选，仅 main push 触发）───────────────────
+  # 取消下方注释即可启用
+  #
+  # integration-test:
+  #   name: Integration Tests (slow)
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+  #         cache: pip
+  #     - name: Install dependencies
+  #       run: |
+  #         pip install torch --index-url https://download.pytorch.org/whl/cpu
+  #         pip install -r requirements.txt pytest pytest-cov
+  #     - name: Run slow tests
+  #       run: |
+  #         pytest tests/ -m "slow" -q
