@@ -76,7 +76,7 @@ def test_build_graph_with_tp():
     swiglu = next(op for op in layer_ops if op.kind == "swiglu")
     assert attn.meta["heads"] == 16
     assert attn.inputs[0].shape_local == (2048, 2048)
-    assert swiglu.meta["bytes_fwd"] == 2048 * 16384 * Dtype.BF16.bytes * 3 // 2
+    assert swiglu.meta["bytes_fwd"] == 2048 * 16384 * Dtype.BF16.bytes * 3
     assert isinstance(swiglu.meta["bytes_fwd"], int)
 
 
@@ -143,6 +143,7 @@ def test_ring_cp_cp_tiles_marker():
             assert op.meta.get("cp_tiles") == 4, (
                 f"Ring CP should set cp_tiles=4, got {op.meta.get('cp_tiles')}"
             )
+            # Debug marker; FLOPs use s/heads/cp_tiles.
             assert op.meta.get("heads_gathered_by_cp") is False
 
 
