@@ -8,6 +8,7 @@
 
 | 门禁 | 工作流 / 作业 | 检查范围 | 阈值 | 解决的搭便车问题 |
 |------|---------------|----------|------|------------------|
+| ⓪ Lint | `ci.yml` · `lint` | PR：仅 PR 改动行；push to main：全树 soft-fail | ruff 0 violation on diff | 防止新增代码风格劣化（历史欠账不阻塞 PR） |
 | ① 全局下限 | `ci.yml` · `test` | 仓库全量覆盖率 | **≥ 65%** | 防止整体测试体量被拆穿 |
 | ② Patch coverage | `ci.yml` · `patch-coverage` | 本次 PR 新增/修改的行 | **≥ 80%** | 防止"全局达标但新增代码不带测试"搭便车 |
 | ③ 无回退 | `coverage-gate.yml` · `coverage-regression` | 整体覆盖率 vs `main` | PR ≥ base | 防止覆盖率被慢性蚕食 |

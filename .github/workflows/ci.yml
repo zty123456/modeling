@@ -17,9 +17,9 @@ env:
 
 jobs:
   # ── 门禁 1: 代码规范 (ruff) ──────────────────────────────────────────────
-  # PR 阶段：只检查 PR 实际改动的 .py 文件，避免历史欠账阻塞新 PR
+  # PR 阶段：只检查 PR 实际改动的【行】（不是整个文件），避免历史欠账阻塞新 PR
   # main push 阶段：全量扫描但 soft-fail，给历史欠账可视化展示窗口
-  # 历史欠账清理见单独 issue/PR；清理完后可移除 push 分支的 continue-on-error
+  # 历史欠账清理后可改为 push 也硬失败、并移除 PR 路径的行号过滤
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -35,19 +35,82 @@ jobs:
       - name: Install ruff
         run: pip install ruff
 
-      - name: Lint changed Python files (PR only — hard fail)
+      - name: Lint PR-changed lines only (PR — hard fail)
         if: github.event_name == 'pull_request'
+        shell: bash
         run: |
-          git fetch origin ${{ github.base_ref }}
-          CHANGED=$(git diff --name-only --diff-filter=AM \
-                      origin/${{ github.base_ref }}...HEAD -- '*.py')
+          set -e
+          git fetch origin "${{ github.base_ref }}"
+          BASE="origin/${{ github.base_ref }}"
+
+          CHANGED=$(git diff --name-only --diff-filter=AM "${BASE}...HEAD" -- '*.py')
           if [ -z "$CHANGED" ]; then
             echo "No Python file changes — skipping lint."
             exit 0
           fi
-          echo "Linting changed files:"
+          echo "Files in PR diff:"
           echo "$CHANGED"
-          ruff check $CHANGED
+
+          # ruff 整文件扫描（输出 JSON），随后用 git diff 算出改动行号、只保留落在改动行上的违规
+          echo "$CHANGED" | xargs ruff check --output-format=json > ruff_violations.json || true
+
+          export BASE
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          base = os.environ["BASE"]
+
+          # 1. 解析 unified diff，得到 {file: set(改动后的行号)}
+          diff = subprocess.check_output(
+              ["git", "diff", "--unified=0", "--diff-filter=AM",
+               f"{base}...HEAD", "--", "*.py"],
+              text=True,
+          )
+          changed_lines = {}
+          cur = None
+          for line in diff.splitlines():
+              if line.startswith("+++ b/"):
+                  cur = line[6:]
+                  changed_lines[cur] = set()
+              elif line.startswith("@@") and cur is not None:
+                  # @@ -old,oldcount +new,newcount @@
+                  new_part = line.split()[2].lstrip("+")
+                  if "," in new_part:
+                      start, count = map(int, new_part.split(","))
+                  else:
+                      start, count = int(new_part), 1
+                  for ln in range(start, start + max(count, 1)):
+                      changed_lines[cur].add(ln)
+
+          # 2. 过滤 ruff 违规，只保留行号在 PR 改动行集合里的
+          with open("ruff_violations.json") as f:
+              violations = json.load(f)
+
+          cwd = Path.cwd()
+          bad = []
+          for v in violations:
+              fp = Path(v["filename"])
+              try:
+                  rel = str(fp.relative_to(cwd))
+              except ValueError:
+                  rel = str(fp)
+              row = v["location"]["row"]
+              if row in changed_lines.get(rel, set()):
+                  bad.append(v)
+
+          if bad:
+              print(f"::error::{len(bad)} lint error(s) on PR-changed lines:")
+              for v in bad:
+                  print(f"  {v['filename']}:{v['location']['row']}:"
+                        f"{v['location']['column']} {v['code']} {v['message']}")
+              sys.exit(1)
+          print(f"OK: no lint errors on PR-changed lines "
+                f"(filtered from {len(violations)} file-level violations).")
+          PY
 
       - name: Lint full tree (push to main — soft fail, surface historical debt)
         if: github.event_name == 'push'
