@@ -163,7 +163,6 @@ class TestTrainingConfigManager:
     def test_generate_static_configs_basic(self):
         manager = TrainingConfigManager(
             param_grid={"world_size": [1], "tp": [1], "cp": [1], "pp": [1], "dp": [1]},
-            neg_metrics=["tp"],
         )
         configs = manager.generate_static_configs()
 
@@ -185,16 +184,6 @@ class TestTrainingConfigManager:
         valid = [(c["tp"], c["pp"]) for c in configs]
         assert (4, 1) in valid
         assert (2, 2) in valid
-
-    def test_generate_static_configs_sorts_by_neg_metrics(self):
-        manager = TrainingConfigManager(
-            param_grid={"tp": [2, 1], "pp": [1, 2]},
-            neg_metrics=["tp", "pp"],
-        )
-        configs = manager.generate_static_configs()
-
-        assert configs[0]["tp"] == 1
-        assert configs[0]["pp"] == 1
 
     def test_generate_static_configs_filters_invalid_world_size(self):
         manager = TrainingConfigManager(
@@ -229,70 +218,12 @@ class TestTrainingConfigManager:
             product = cfg["tp"] * cfg["cp"] * cfg["pp"] * cfg["dp"]
             assert ws == product, f"world_size={ws} != tp*cp*pp*dp={product}"
 
-    def test_get_fingerprint_excludes_neg_metrics(self):
-        manager = TrainingConfigManager(
-            param_grid={"tp": [1], "pp": [1]},
-            neg_metrics=["seq_len", "micro_batch"],
-        )
-        cfg = {"tp": 1, "pp": 1, "seq_len": 4096, "micro_batch": 4}
-
-        fp = manager._get_fingerprint(cfg)
-
-        assert ("tp", 1) in fp
-        assert ("pp", 1) in fp
-        assert ("seq_len", 4096) not in fp
-        assert ("micro_batch", 4) not in fp
-
-    def test_get_metric_vals(self):
-        manager = TrainingConfigManager(
-            param_grid={},
-            neg_metrics=["seq_len", "micro_batch"],
-        )
-        cfg = {"seq_len": 4096, "micro_batch": 4, "tp": 8}
-
-        vals = manager._get_metric_vals(cfg)
-
-        assert vals == (4096, 4)
-
-    def test_is_pruned_empty_blacklist(self):
-        manager = TrainingConfigManager(param_grid={})
-        cfg = {"tp": 1, "pp": 1}
-
-        assert manager.is_pruned(cfg) is False
-
-    def test_is_pruned_with_blacklist(self):
-        manager = TrainingConfigManager(
-            param_grid={},
-            neg_metrics=["seq_len"],
-        )
-        cfg = {"tp": 1, "seq_len": 4096}
-        fp = manager._get_fingerprint(cfg)
-
-        manager.black_list_dict[fp] = [(2048,)]
-
-        assert manager.is_pruned(cfg) is True
-
-    def test_update_black_list(self):
-        manager = TrainingConfigManager(
-            param_grid={},
-            neg_metrics=["seq_len"],
-        )
-        cfg = {"tp": 1, "seq_len": 4096}
-
-        manager.update_black_list(cfg, "test_error")
-
-        fp = manager._get_fingerprint(cfg)
-        assert fp in manager.black_list_dict
-        assert (4096,) in manager.black_list_dict[fp]
-
     def test_output_path_generation(self):
         manager = TrainingConfigManager(
             param_grid={"model": ["test_model"]},
-            thresholds={"max_memory_gb": 80.0},
         )
 
         assert "test_model" in manager.output_path
-        assert "max_memory_gb_80.0" in manager.output_path
 
     def test_output_path_with_world_size(self):
         manager = TrainingConfigManager(

@@ -5,10 +5,9 @@ import itertools
 import logging
 import multiprocessing
 import os
-import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Generator
 
@@ -120,17 +119,10 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
 @dataclass
 class TrainingConfigManager:
     param_grid: Dict[str, List[Any]]
-    neg_metrics: List[str] = field(default_factory=lambda: ["seq_len", "micro_batch"])
-    black_list_dict: Dict = field(default_factory=dict)
-    best_dict: Dict = field(default_factory=dict)
-    lock: Any = None
     save_all_result: bool = False
     output_path: str = ""
 
     def __post_init__(self):
-        if self.lock is None:
-            self.lock = multiprocessing.get_context("spawn").Lock()
-
         model = self.param_grid.get("model", "unknown")
         if isinstance(model, list):
             model = model[0] if model else "unknown"
@@ -145,54 +137,77 @@ class TrainingConfigManager:
         """
         核心优化：基于已知维度的最小值，动态裁剪并收紧 auto 变量的选择范围。
         避免盲目扩展成全量 world_size 的约数，将 auto 并行搜索空间缩减 90% 以上。
+        
+        注意：EP 不占用额外 rank，world_size = TP*CP*PP*DP
         """
-        parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
+        rank_keys = ["tp", "cp", "pp", "dp"]
+        all_keys = ["tp", "cp", "pp", "ep", "dp"]
+
+        # 确保所有并行维度都有默认值
+        for key in all_keys:
+            if key not in grid:
+                grid[key] = [1]
 
         # 1. 整理出哪些键是固定值或具体范围，哪些键被设为了 "auto"
-        explicit_keys = []
-        auto_keys = []
-        for key in parallel_keys:
-            vals = grid.get(key, [1])
-            if vals == "auto" or vals == ["auto"] or "auto" in vals:
-                auto_keys.append(key)
+        explicit_rank_keys = []
+        auto_rank_keys = []
+        auto_ep = False
+        
+        for key in all_keys:
+            vals = grid[key]
+            is_auto = vals == "auto" or vals == ["auto"] or "auto" in vals
+            if key == "ep":
+                auto_ep = is_auto
+            elif is_auto:
+                auto_rank_keys.append(key)
             else:
-                explicit_keys.append(key)
+                if key in rank_keys:
+                    explicit_rank_keys.append(key)
 
-        if not auto_keys:
+        if not auto_rank_keys and not auto_ep:
             return
 
-        # 2. 计算其他已知显式并行维度的乘积最小值
+        # 2. 计算已知 rank 维度的乘积最小值（不包括 EP）
         min_explicit_prod = 1
-        for key in explicit_keys:
+        for key in explicit_rank_keys:
             vals = [v for v in grid[key] if v != "auto"]
             if vals:
                 min_explicit_prod *= min(vals)
 
-        # 3. 动态推导当前 auto 变量所允许的最大上限边界值
-        # auto_max = world_size / min(其他固定维度的乘积)
+        # 3. 动态推导 auto rank 变量所允许的最大上限边界值
         max_allowed_val = world_size // min_explicit_prod
 
         # 提取当前合法边界内所有符合物理整除条件的约数
         all_divisors = self._get_divisors(world_size)
         optimized_divisors = [d for d in all_divisors if d <= max_allowed_val]
 
-        # 4. 回填至参数网格中，精准替换掉 'auto' 占位符
-        for key in auto_keys:
+        # 4. 回填 rank 参数网格（tp, cp, pp, dp）
+        for key in auto_rank_keys:
             vals = grid[key]
             if isinstance(vals, list):
-                # 兼容混合配置如 [1, 2, "auto"]
                 clean_vals = [v for v in vals if v != "auto"]
                 grid[key] = sorted(list(set(clean_vals + optimized_divisors)))
             else:
                 grid[key] = optimized_divisors
 
+        # 5. EP 特殊处理：EP 独立扩展，不参与 rank 计算
+        if auto_ep:
+            vals = grid["ep"]
+            if isinstance(vals, list):
+                clean_vals = [v for v in vals if v != "auto"]
+                # EP 可以是任意值，通常基于 num_experts 的约束
+                grid["ep"] = sorted(list(set(clean_vals + optimized_divisors)))
+            else:
+                grid["ep"] = optimized_divisors
+
     def get_valid_parallel_combos(self, grid: Dict[str, List[Any]], target_ws: int) -> List[Tuple[int, ...]]:
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
-        p_grids = [grid[k] for k in parallel_keys]
+        p_grids = [grid.get(k, [1]) for k in parallel_keys]
 
         valid_combos = []
         for tp, cp, pp, ep, dp in itertools.product(*p_grids):
-            if tp * cp * pp * ep * dp == target_ws:
+            # EP 不占用额外 rank，world_size = tp*cp*pp*dp
+            if tp * cp * pp * dp == target_ws:
                 valid_combos.append((tp, cp, pp, ep, dp))
         return valid_combos
 
@@ -235,64 +250,15 @@ class TrainingConfigManager:
             for p_vals in valid_parallel_combos:
                 config = base_config.copy()
                 config.update(dict(zip(parallel_keys, p_vals)))
-
-                if self.is_pruned(config):
-                    continue
                 yield config
 
     def generate_static_configs(self) -> List[Dict[str, Any]]:
-        configs = list(self.generate_static_configs_stream())
-        configs.sort(key=lambda x: [x.get(m, 0) for m in self.neg_metrics])
-        return configs
-
-    def _get_fingerprint(self, config: Dict) -> Tuple:
-        return tuple(sorted((k, v) for k, v in config.items() if k not in self.neg_metrics))
-
-    def _get_metric_vals(self, config: Dict) -> Tuple:
-        return tuple(config.get(m, 0) for m in self.neg_metrics)
-
-    def is_pruned(self, config: Dict) -> bool:
-        if not self.black_list_dict:
-            return False
-        fp = self._get_fingerprint(config)
-        with self.lock:
-            recorded_list = self.black_list_dict.get(fp)
-
-        if not recorded_list:
-            return False
-
-        curr_vals = self._get_metric_vals(config)
-        for recorded_vals in recorded_list:
-            if all(c >= r for c, r in zip(curr_vals, recorded_vals)):
-                return True
-        return False
-
-    def update_black_list(self, config: Dict, error_type: str):
-        fp = self._get_fingerprint(config)
-        vals = self._get_metric_vals(config)
-        with self.lock:
-            if fp not in self.black_list_dict:
-                self.black_list_dict[fp] = []
-            if vals not in self.black_list_dict[fp]:
-                self.black_list_dict[fp].append(vals)
+        return list(self.generate_static_configs_stream())
 
 
-def run_training_task_wrapper(config: Dict, black_list_snapshot: dict, neg_metrics: list) -> Optional[Dict]:
+def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
     from zrt.training.ir.builders import build_graph
     from zrt.training.models.flops import op_cost as _op_cost
-
-    def _get_fingerprint(cfg: Dict) -> Tuple:
-        return tuple(sorted((k, v) for k, v in cfg.items() if k not in neg_metrics))
-
-    def _get_metric_vals(cfg: Dict) -> Tuple:
-        return tuple(cfg.get(m, 0) for m in neg_metrics)
-
-    fp = _get_fingerprint(config)
-    if fp in black_list_snapshot:
-        curr_vals = _get_metric_vals(config)
-        for recorded_vals in black_list_snapshot[fp]:
-            if all(c >= r for c, r in zip(curr_vals, recorded_vals)):
-                return {"status": "pruned", "config": config}
 
     model_name = config.get("model", "deepseek_v3_2")
     try:
@@ -300,8 +266,8 @@ def run_training_task_wrapper(config: Dict, black_list_snapshot: dict, neg_metri
         strategy = _make_strategy_from_config(config)
         system = _make_system_from_config(config)
         strategy.validate(model, system)
-    except Exception:
-        return {"status": "error", "config": config, "type": "validation_error"}
+    except Exception as e:
+        return {"status": "error", "config": config, "type": "validation_error", "message": str(e)}
 
     try:
         graph = build_graph(model, strategy)
@@ -323,28 +289,31 @@ def run_training_task_wrapper(config: Dict, black_list_snapshot: dict, neg_metri
         return {"status": "error", "config": config, "type": "runtime_error"}
 
 
-def execute_training_tasks_stream(
+def execute_training_tasks_batched(
         manager: TrainingConfigManager,
         workers: int,
-) -> List[Dict]:
-    results = []
+        batch_size: int = 1000,
+) -> Generator[List[Dict], None, None]:
+    """
+    分批执行训练任务，每完成 batch_size 个配置后 yield 一批结果，
+    避免内存累积导致崩溃。
+    """
+    batch_results = []
+    error_count = 0
+    total_yielded = 0
 
-    # 获取优化收紧后的总配置项数
     total_configs = manager.count_total_configs()
-    logger.info(f"Total structured configuration items to traverse (Optimized): {total_configs}")
+    logger.info(f"Total configurations to traverse: {total_configs}, batch_size={batch_size}")
 
     config_generator = manager.generate_static_configs_stream()
-    MAX_QUEUE_SIZE = workers * 2
+    MAX_QUEUE_SIZE = workers * 3
     futures_map = {}
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         for _ in range(MAX_QUEUE_SIZE):
             try:
                 cfg = next(config_generator)
-                if manager.is_pruned(cfg):
-                    continue
-                snapshot = dict(manager.black_list_dict)
-                fut = executor.submit(run_training_task_wrapper, cfg, snapshot, manager.neg_metrics)
+                fut = executor.submit(run_training_task_wrapper, cfg)
                 futures_map[fut] = cfg
             except StopIteration:
                 break
@@ -362,25 +331,30 @@ def execute_training_tasks_stream(
                         continue
 
                     if res["status"] == "success":
-                        results.append(res)
+                        batch_results.append(res)
                     elif res["status"] == "error":
-                        manager.update_black_list(res["config"], res["type"])
-                    elif res["status"] == "pruned":
-                        pass
+                        error_count += 1
+
+                    if len(batch_results) >= batch_size:
+                        total_yielded += len(batch_results)
+                        logger.info(f"Yielding batch: {len(batch_results)} results (total yielded: {total_yielded})")
+                        yield batch_results
+                        batch_results = []
 
                 while len(futures_map) < MAX_QUEUE_SIZE:
                     try:
                         cfg = next(config_generator)
-                        if manager.is_pruned(cfg):
-                            pbar.update(1)
-                            continue
-                        snapshot = dict(manager.black_list_dict)
-                        new_fut = executor.submit(run_training_task_wrapper, cfg, snapshot, manager.neg_metrics)
-                        futures_map[new_fut] = cfg
+                        fut = executor.submit(run_training_task_wrapper, cfg)
+                        futures_map[fut] = cfg
                     except StopIteration:
                         break
 
-    return results
+    if batch_results:
+        total_yielded += len(batch_results)
+        logger.info(f"Yielding final batch: {len(batch_results)} results (total yielded: {total_yielded})")
+        yield batch_results
+
+    logger.info(f"Completed: {total_yielded} success, {error_count} errors")
 
 
 def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.DataFrame:
@@ -420,13 +394,16 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     return df
 
 
-def save_results(df: pd.DataFrame, frontier_results: List[Dict], output_path: str):
+def save_results(df: pd.DataFrame, frontier_results: List[Dict], output_path: str, mode: str = "write"):
     from zrt.training.io.excel_exporter import export_estimate_excel
     os.makedirs(output_path, exist_ok=True)
 
     csv_path = os.path.join(output_path, "results_summary.csv")
-    df.to_csv(csv_path, index=False)
-    logger.info(f"Results saved to: {csv_path}")
+    if mode == "append" and os.path.exists(csv_path):
+        df.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        df.to_csv(csv_path, index=False)
+    logger.info(f"Results saved to: {csv_path} (mode={mode})")
 
     xlsx_dir = os.path.join(output_path, "xlsx")
     os.makedirs(xlsx_dir, exist_ok=True)
@@ -469,47 +446,63 @@ def save_results(df: pd.DataFrame, frontier_results: List[Dict], output_path: st
 
 def run_training_search_parallel(
         param_grid: Dict[str, List[Any]],
-        neg_metrics: List[str] = None,
-        workers: int = 16,
+        workers: int = 8,
         save_all_result: bool = False,
+        batch_size: int = 500,
 ) -> pd.DataFrame:
-    neg_metrics = neg_metrics or ["seq_len", "micro_batch"]
+    manager = TrainingConfigManager(
+        param_grid=param_grid,
+        save_all_result=save_all_result,
+    )
 
-    with multiprocessing.Manager() as mp_manager:
-        manager = TrainingConfigManager(
-            param_grid=param_grid,
-            neg_metrics=neg_metrics,
-            black_list_dict=mp_manager.dict(),
-            best_dict=mp_manager.dict(),
-            lock=mp_manager.Lock(),
-            save_all_result=save_all_result,
-        )
+    start_time = time.time()
+    logger.info(f"Starting batched stream-search with {workers} workers, batch_size={batch_size}...")
 
-        start_time = time.time()
-        logger.info(f"Starting parallel stream-search with {workers} workers...")
+    all_results = []
+    frontier_results = []
+    is_first_batch = True
 
-        results = execute_training_tasks_stream(manager, workers)
+    for batch in execute_training_tasks_batched(manager, workers, batch_size=batch_size):
+        all_results.extend(batch)
 
-        elapsed = time.time() - start_time
-        logger.info(f"Search completed in {elapsed:.2f} seconds")
+        reports = [r["report"] for r in batch]
+        batch_frontier = pareto_frontier(reports)
+        batch_frontier_results = [batch[reports.index(rp)] for rp in batch_frontier]
+        frontier_results.extend(batch_frontier_results)
 
-        if not results:
-            logger.error("No valid configurations found.")
-            return pd.DataFrame()
+        batch_df = format_results(batch_frontier, [r["config"] for r in batch_frontier_results])
+        save_mode = "write" if is_first_batch else "append"
+        save_results(batch_df, batch_frontier_results, manager.output_path, mode=save_mode)
+        is_first_batch = False
 
-        reports = [r["report"] for r in results]
-        frontier_reports = pareto_frontier(reports)
-        frontier_results = [results[reports.index(rp)] for rp in frontier_reports]
+        del batch
+        del reports
+        del batch_frontier
+        del batch_frontier_results
 
-        df = format_results(frontier_reports, [r["config"] for r in frontier_results])
-        save_results(df, frontier_results, manager.output_path)
+    elapsed = time.time() - start_time
+    logger.info(f"Search completed in {elapsed:.2f} seconds, total results: {len(all_results)}")
 
-        return df
+    if not all_results:
+        logger.error("No valid configurations found.")
+        return pd.DataFrame()
+
+    all_reports = [r["report"] for r in all_results]
+    final_frontier_reports = pareto_frontier(all_reports)
+    final_frontier_results = [all_results[all_reports.index(rp)] for rp in final_frontier_reports]
+
+    final_df = format_results(final_frontier_reports, [r["config"] for r in final_frontier_results])
+    save_results(final_df, final_frontier_results, manager.output_path, mode="write")
+
+    return final_df
 
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
+    # 注意：global_batch 必须 >= micro_batch * dp 的最大值
+    # 当 world_size=8192, tp=1, cp=1, pp=1 时，dp 最大可达 8192
+    # 因此 global_batch 应设置较大值如 65536
     training_param_grid = {
         "model": ["deepseek_v3_2"],
         "hw": ["nvidia_h100_sxm"],
@@ -517,7 +510,7 @@ if __name__ == "__main__":
         "tp": [1, 2, 4, 8, 16],
         "cp": "auto",
         "pp": [1, 2, 4, 8],
-        "ep": [256, 512],
+        "ep": [256],
         "dp": "auto",
         "micro_batch": [1,16, 32,],
         "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
@@ -534,4 +527,4 @@ if __name__ == "__main__":
         "optimizer": ["adam"],
     }
 
-    df = run_training_search_parallel(param_grid=training_param_grid, workers=48)
+    df = run_training_search_parallel(param_grid=training_param_grid, workers=32, batch_size=1000)
