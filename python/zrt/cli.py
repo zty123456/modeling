@@ -180,6 +180,11 @@ def main() -> None:
              "Other models: 'ulysses' (default), 'ring', or 'hybrid'.",
     )
     parser.add_argument(
+        "--cp-kind", default="ulysses",
+        choices=["ulysses", "ring", "hybrid", "compressed", "none"],
+        help="Context-parallel strategy for graph-native training modelling.",
+    )
+    parser.add_argument(
         "--quant", default=None,
         metavar="DTYPE",
         help="Weight quantization dtype for analysis: int4, int8, fp8 (default: no quantization)",
@@ -638,6 +643,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         ep=args.ep,
         dp=args.dp,
         cp=args.cp,
+        cp_kind=getattr(args, "cp_kind", "ulysses"),
         zero_stage=args.zero_stage,
         optimizer=args.optimizer,
         muon_rotation=args.muon_rotation,

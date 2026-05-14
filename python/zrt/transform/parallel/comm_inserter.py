@@ -616,6 +616,47 @@ annotations={
 
         graph._rebuild_adjacency()
 
+            if cp_kind == "compressed":
+                stage1_id = f"comm_p2p_cp_compressed_stage1_{node.id}"
+                stage2_id = f"comm_ag_cp_compressed_stage2_{node.id}"
+                if stage1_id not in g.nodes:
+                    stage1 = OpNode(
+                        id=stage1_id,
+                        op_type="comm.send_recv",
+                        inputs=copy.deepcopy(node.inputs),
+                        outputs=copy.deepcopy(node.inputs),
+                        attrs={"group_size": cp, "collective": "send_recv",
+                               "role": "cp_compressed_stage1",
+                               "message_size_bytes": ring_msg_bytes,
+                               "msg_bytes": ring_msg_bytes,
+                               "scope": node.scope, "layer": node.layer},
+                        scope=node.scope,
+                        layer=node.layer,
+                        category="communication",
+                    )
+                    stage1.annotations["inserted_by"] = "cp_pass"
+                    stage1.annotations["overlap_target"] = f"fa_tile:{node.id}"
+                    g.nodes[stage1.id] = stage1
+                    _prepend_comm(g, node.id, stage1)
+
+                if stage2_id not in g.nodes:
+                    stage2 = OpNode(
+                        id=stage2_id,
+                        op_type="comm.all_gather",
+                        inputs=copy.deepcopy(node.inputs),
+                        outputs=copy.deepcopy(node.inputs),
+                        attrs={"group_size": cp, "collective": "all_gather",
+                               "role": "cp_compressed_stage2",
+                               "message_size_bytes": ulysses_msg_bytes,
+                               "msg_bytes": ulysses_msg_bytes},
+                        scope=node.scope,
+                        layer=node.layer,
+                        category="communication",
+                    )
+                    stage2.annotations["inserted_by"] = "cp_pass"
+                    g.nodes[stage2.id] = stage2
+                    _prepend_comm(g, node.id, stage2)
+
 
 def _moe_scope_root(scope: str) -> str:
     """Return the scope prefix up to (not including) the expert index."""
