@@ -270,10 +270,19 @@ def _recompute_time(
     ops: list[Op], model: ModelSpec, system: SystemSpec,
     strategy: Strategy, gpu_name: str,
 ) -> float:
-    """Extra forward time for recomputed ops (Korthikanti-style)."""
+    """Extra forward time for recomputed ops (Korthikanti-style).
+
+    Mirrors ``recompute_overhead_flops`` (FLOPs side) — same category
+    mapping, same FA-kernel dedup. The category mapping is imported from
+    flops.py so the two sides stay in sync.
+    """
+    from zrt.training.models.flops import _op_recompute_categories as _flops_op_cats
+
     policy = strategy.recompute.per_layer
     if not policy:
         return 0.0
+
+    FA_KERNEL_KINDS = {"attn_core", "sparse_attn", "hca_attn", "swa_attn"}
 
     t = 0.0
     for op in ops:
@@ -284,8 +293,12 @@ def _recompute_time(
         if not cats:
             continue
 
-        op_cats = _op_recompute_categories(op)
+        op_cats = _flops_op_cats(op)
         if "full" in cats or (op_cats & cats):
+            if op.kind in FA_KERNEL_KINDS:
+                # FA backward already pays the recompute time via the
+                # 2.5×fwd convention — see recompute_overhead_flops.
+                continue
             cost = op_cost(op, model, system)
             overlap = system.gpu.overlap_ratio.get(op.kind, 0.0)
             t += _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
@@ -320,22 +333,11 @@ def _ep_parallel_fraction(
     return t_ep / t_total
 
 
-def _op_recompute_categories(op: Op) -> set[str]:
-    """Map an op to its recompute category set."""
-    if op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
-        return {"attn"}
-    if op.kind == "matmul":
-        name = op.name.lower()
-        if "qkv" in name or "o_proj" in name:
-            return {"attn"}
-        if "up_proj" in name or "gate_proj" in name or "down_proj" in name:
-            return {"ffn_swiglu"}
-        return set()
-    if op.kind == "swiglu":
-        return {"ffn_swiglu"}
-    if op.kind == "ln":
-        return {"ln"}
-    return set()
+# NOTE: the canonical _op_recompute_categories lives in zrt.training.models.flops.
+# stage.py and flops.py used to keep duplicate copies that drifted (this one
+# was missing V3 MLA / V4 matmul names and the compressor/indexer pool entries),
+# silently undercounting backward-stage recompute time for those ops. The
+# single source of truth is now imported above in _recompute_time().
 
 
 def _wave_overlap_saved(comm_time: float, gemm_time: float, K: int = 4) -> float:

@@ -23,8 +23,24 @@ class MemBreakdown:
     comm_buffers: float = 0.0  # bytes
     hc_overhead_bytes: float = 0.0  # bytes from HC residual replication
 
+    # Phase-specific peaks (bytes). Each is what the GPU holds simultaneously
+    # during that phase of one training step. peak_overall is the max — that's
+    # the OOM-relevant number. ``total`` (sum of components) is the conservative
+    # upper bound; in reality activations and opt_state never coexist.
+    peak_forward: float = 0.0     # weights + activations + comm_buffers
+    peak_backward: float = 0.0    # weights + activations + grads + comm_buffers
+    peak_optimizer: float = 0.0   # weights + grads + opt_state
+    peak_overall: float = 0.0     # max of the three above
+
     @property
     def total(self) -> float:
+        """Conservative upper bound — algebraic sum of all components.
+
+        Real GPU memory at any moment is bounded by ``peak_overall``; ``total``
+        is always ≥ ``peak_overall`` because it pretends activations and
+        opt_state coexist (they don't — opt_state is alive only during the
+        optimizer step, after activations are released).
+        """
         return self.weights + self.grads + self.opt_state + self.activations + self.comm_buffers
 
     def to_gb(self) -> dict[str, float]:
@@ -37,6 +53,10 @@ class MemBreakdown:
             "comm_buffers_gb": self.comm_buffers / GB,
             "hc_overhead_gb": self.hc_overhead_bytes / GB,
             "total_gb": self.total / GB,
+            "peak_gb": self.peak_overall / GB,
+            "peak_forward_gb": self.peak_forward / GB,
+            "peak_backward_gb": self.peak_backward / GB,
+            "peak_optimizer_gb": self.peak_optimizer / GB,
         }
 
 
@@ -105,7 +125,7 @@ def memory_breakdown(
         if off.params:
             weights = int(weights * (1 - off.pct))
 
-    return MemBreakdown(
+    mb = MemBreakdown(
         weights=weights,
         grads=grads,
         opt_state=opt_state,
@@ -113,6 +133,15 @@ def memory_breakdown(
         comm_buffers=comm_buffers,
         hc_overhead_bytes=hc_overhead,
     )
+    # Phase peaks: real GPU residency in each phase of one training step.
+    # peak_overall is the OOM-relevant number; .total is a conservative
+    # upper bound that adds opt_state on top of activations even though
+    # they never coexist.
+    mb.peak_forward = weights + activations + comm_buffers
+    mb.peak_backward = weights + activations + grads + comm_buffers
+    mb.peak_optimizer = weights + grads + opt_state
+    mb.peak_overall = max(mb.peak_forward, mb.peak_backward, mb.peak_optimizer)
+    return mb
 
 
 def _params_on_rank(model: ModelSpec, strategy: Strategy) -> int:
@@ -308,12 +337,15 @@ def _activation_memory(
 
         # Apply recompute policy reduction
         cats_to_recompute = recompute_policy.get(lk.value, set())
+        attn_cats = {"attn", "attn_core", "attn_block"}
+        attn_recomputed = bool(cats_to_recompute & (attn_cats | {"full"}))
+
         if "full" in cats_to_recompute:
             # Full checkpoint: only save input + output
             coeff = COEFF_FULL_CHECKPOINT
         else:
             coeff = base_coeff
-            if "attn" in cats_to_recompute:
+            if cats_to_recompute & attn_cats:
                 coeff -= REDUCE_ATTN
             if "ffn_swiglu" in cats_to_recompute:
                 coeff -= REDUCE_FFN_SWIGLU
@@ -323,6 +355,14 @@ def _activation_memory(
         layer_act = s * h * act_bytes * coeff
         hc_layer = (hc_mult - 1) * s * h * act_bytes * COEFF_HC_RESIDUAL
         layer_act += hc_layer
+
+        # Korthikanti attention-scores term: 5·a·s²·bytes per layer.
+        # Dominates memory at long sequence (s²·a >> s·h·coeff once s > h/a).
+        # Eliminated when attention is recomputed (the whole point of selective
+        # attention recompute is to avoid materializing this score matrix).
+        if not attn_recomputed:
+            num_heads = max(1, getattr(model, "num_heads", 1))
+            layer_act += 5 * num_heads * s * s * act_bytes
 
         layer_act = layer_act // total_seq_shard
         hc_layer = hc_layer // total_seq_shard
@@ -334,11 +374,44 @@ def _activation_memory(
     total_hc *= strategy.micro_batch
 
     if strategy.pp > 1:
-        in_flight = max(1, strategy.pp // 2)
+        in_flight = _pp_in_flight(strategy)
         total_act *= in_flight
         total_hc *= in_flight
 
     return total_act, total_hc
+
+
+def _pp_in_flight(strategy: Strategy) -> int:
+    """Worst-rank in-flight microbatch count for the configured PP schedule.
+
+    Activations of in-flight microbatches all coexist on the worst-loaded
+    rank; sizing for that rank is what determines OOM. The previous code
+    used a fixed ``pp // 2`` (1F1B mid-rank approximation), which under-
+    counts most schedules.
+
+    - 1F1B / ZeroBubble: worst rank (rank 0) holds ~``pp`` microbatches at
+      the end of warmup.
+    - Interleaved (VPP, ``vpp_chunks = v``): ~``pp · (v + 1) / 2``.
+    - DualPipe / DualPipeV: two-direction chunks per rank, peak ≈ ``pp``.
+    """
+    from zrt.training.spec.strategy import PPSched
+
+    pp = max(1, strategy.pp)
+    if pp == 1:
+        return 1
+    sched = getattr(strategy, "pp_schedule", PPSched.ONE_F_ONE_B)
+
+    if sched == PPSched.ONE_F_ONE_B:
+        return pp
+    if sched == PPSched.INTERLEAVED:
+        vpp = max(1, getattr(strategy, "vpp_chunks", 1))
+        return max(1, (pp * (vpp + 1)) // 2)
+    if sched == PPSched.ZERO_BUBBLE:
+        return pp
+    if sched in (PPSched.DUALPIPE, PPSched.DUALPIPE_V):
+        return pp
+    # Unknown schedule: fall back to the (lossy) historical default.
+    return max(1, pp // 2)
 
 
 def _comm_buffer_memory(model: ModelSpec, strategy: Strategy) -> int:

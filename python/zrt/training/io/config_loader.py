@@ -2,9 +2,52 @@
 
 from __future__ import annotations
 
+import warnings as _warnings
 from pathlib import Path
 
 import yaml
+
+# Canonical recompute categories. Updating here propagates to the loader's
+# validation. Keep in sync with the docstring in
+# ``zrt/training/spec/strategy.py::RecomputePolicy``.
+_CANONICAL_RECOMPUTE_CATS = {
+    "full", "attn_core", "attn_block", "ffn_swiglu", "ln", "hc",
+}
+
+# Deprecated → canonical alias map. We resolve at load time and emit a
+# DeprecationWarning so users have time to migrate their YAMLs.
+_RECOMPUTE_ALIASES = {"attn": "attn_block"}
+
+
+def _normalize_recompute_categories(layer_kind: str, raw) -> set[str]:
+    """Validate + alias-resolve a YAML recompute spec for one layer kind.
+
+    Accepts either a single string or a list of strings. Unknown categories
+    raise ``ValueError`` rather than being silently ignored.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    out: set[str] = set()
+    for cat in raw:
+        if cat in _RECOMPUTE_ALIASES:
+            new = _RECOMPUTE_ALIASES[cat]
+            _warnings.warn(
+                f"recompute category {cat!r} is deprecated; use {new!r}. "
+                f"(layer kind: {layer_kind!r})",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+            out.add(new)
+        elif cat in _CANONICAL_RECOMPUTE_CATS:
+            out.add(cat)
+        else:
+            raise ValueError(
+                f"Unknown recompute category {cat!r} for layer kind "
+                f"{layer_kind!r}. Valid: "
+                f"{sorted(_CANONICAL_RECOMPUTE_CATS)} "
+                f"(plus deprecated alias 'attn' → 'attn_block')."
+            )
+    return out
 
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -178,7 +221,7 @@ def _parse_strategy(d: dict) -> Strategy:
         rc = d["recompute"]
         per_layer = {}
         for kind_str, tiers in rc.get("per_layer", {}).items():
-            per_layer[kind_str] = set(tiers) if isinstance(tiers, list) else {tiers}
+            per_layer[kind_str] = _normalize_recompute_categories(kind_str, tiers)
         recompute = RecomputePolicy(per_layer=per_layer)
 
     offload = OffloadPolicy()
