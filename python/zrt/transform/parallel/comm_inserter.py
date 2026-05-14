@@ -201,7 +201,6 @@ class CommInserterPass(GraphPass):
         3. Each group only inserts communication at first/last node
         4. Topological sort within each group to identify entry/exit
 
-        Reference: docs/superpowers/specs/2025-05-12-cp-shape-split-design.md (Lines 362-469)
         """
         cp = ctx.parallel.cp
         if cp <= 1:
@@ -209,6 +208,7 @@ class CommInserterPass(GraphPass):
 
         seq_len = ctx.training.seq_len if ctx.training else 2048
         hidden = ctx.training.hidden if ctx.training else 7168
+        micro_batch = ctx.training.micro_batch if ctx.training else 1
         
         # Resolve cp_kind based on model type
         if ctx.training:
@@ -246,20 +246,20 @@ class CommInserterPass(GraphPass):
 
             if cp_kind == "ulysses":
                 pre_comm, post_comm = self._create_ulysses_comm_nodes(
-                    first_node, last_node, seq_len, cp, hidden, phase="fwd"
+                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
                 _prepend_comm(g, first_node.id, pre_comm)
                 self._insert_after(g, last_node, post_comm)
 
             elif cp_kind == "ring":
                 ring_comm = self._create_ring_comm_node(
-                    first_node, seq_len, cp, hidden, phase="fwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
                 _prepend_comm(g, first_node.id, ring_comm)
 
             elif cp_kind == "hybrid":
                 a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
-                    first_node, seq_len, cp, hidden, phase="fwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
                 _prepend_comm(g, first_node.id, a2a_pre)
                 self._insert_after(g, last_node, p2p)
@@ -267,7 +267,7 @@ class CommInserterPass(GraphPass):
 
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
-                    g, first_node, last_node, seq_len, cp, hidden, phase="fwd"
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
                 )
 
         for layer, nodes in layer_bwd_groups.items():
@@ -282,20 +282,20 @@ class CommInserterPass(GraphPass):
 
             if cp_kind == "ulysses":
                 pre_comm, post_comm = self._create_ulysses_comm_nodes(
-                    first_node, last_node, seq_len, cp, hidden, phase="bwd"
+                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
                 _prepend_comm(g, first_node.id, pre_comm)
                 self._insert_after(g, last_node, post_comm)
 
             elif cp_kind == "ring":
                 ring_comm = self._create_ring_comm_node(
-                    first_node, seq_len, cp, hidden, phase="bwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
                 _prepend_comm(g, first_node.id, ring_comm)
 
             elif cp_kind == "hybrid":
                 a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
-                    first_node, seq_len, cp, hidden, phase="bwd"
+                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
                 _prepend_comm(g, first_node.id, a2a_pre)
                 self._insert_after(g, last_node, p2p)
@@ -303,12 +303,12 @@ class CommInserterPass(GraphPass):
 
             elif cp_kind == "compressed":
                 self._insert_compressed_cp_comm_block(
-                    g, first_node, last_node, seq_len, cp, hidden, phase="bwd"
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
                 )
 
     def _create_ulysses_comm_nodes(
         self, first_node: OpNode, last_node: OpNode,
-        seq_len: int, cp: int, hidden: int, phase: str
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
     ) -> tuple[OpNode, OpNode]:
         """创建Ulysses pre/post A2A通信节点。"""
         seq_local = seq_len // cp
@@ -318,10 +318,10 @@ class CommInserterPass(GraphPass):
         if first_node.inputs:
             pre_in_shape = first_node.inputs[0].shape
         else:
-            pre_in_shape = (seq_local, hidden)
+            pre_in_shape = (micro_batch, seq_local, hidden)
 
         pre_out_shape = pre_in_shape
-        a2a_bytes = seq_local * hidden * 2
+        a2a_bytes = micro_batch * seq_local * hidden * 2
 
         pre_comm = OpNode(
             id=f"comm_a2a_cp_pre_layer_{layer}_{phase_suffix}",
@@ -372,18 +372,18 @@ class CommInserterPass(GraphPass):
         return pre_comm, post_comm
 
     def _create_ring_comm_node(
-        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, phase: str
+        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
     ) -> OpNode:
         """创建Ring CP的P2P通信节点。"""
         seq_local = seq_len // cp
-        p2p_bytes = seq_local * hidden * 2
+        p2p_bytes = micro_batch * seq_local * hidden * 2
         layer = first_node.layer or "root"
         phase_suffix = phase
 
         if first_node.inputs:
             ring_shape = first_node.inputs[0].shape
         else:
-            ring_shape = (seq_local, hidden)
+            ring_shape = (micro_batch, seq_local, hidden)
 
         ring_comm = OpNode(
             id=f"comm_p2p_ring_layer_{layer}_{phase_suffix}",
@@ -399,11 +399,11 @@ class CommInserterPass(GraphPass):
                 "overlap": True,
                 "layer": layer,
             },
-annotations={
+            annotations={
                 "overlap_target": "attention_block",
                 "phase": phase,
                 "inserted_by": "cp_pass",
-                "mask": True,  # P2P can be overlapped with flash attention tiles
+                "mask": True,
                 "mask_type": "p2p_overlap",
             },
             scope=first_node.scope,
@@ -414,19 +414,19 @@ annotations={
         return ring_comm
 
     def _create_hybrid_comm_nodes(
-        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, phase: str
+        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
     ) -> tuple[OpNode, OpNode, OpNode]:
         """创建Hybrid CP通信节点组（A2A pre + P2P + A2A post）。"""
         seq_local = seq_len // cp
-        a2a_bytes = seq_local * hidden * 2
-        p2p_bytes = seq_local * hidden * 2
+        a2a_bytes = micro_batch * seq_local * hidden * 2
+        p2p_bytes = micro_batch * seq_local * hidden * 2
         layer = first_node.layer or "root"
         phase_suffix = phase
 
         if first_node.inputs:
             shape = first_node.inputs[0].shape
         else:
-            shape = (seq_local, hidden)
+            shape = (micro_batch, seq_local, hidden)
 
         a2a_pre = OpNode(
             id=f"comm_a2a_hybrid_pre_layer_{layer}_{phase_suffix}",
@@ -465,11 +465,11 @@ annotations={
                 "overlap": True,
                 "layer": layer,
             },
-annotations={
+            annotations={
                 "overlap_target": "attention_block",
                 "phase": phase,
                 "inserted_by": "cp_pass",
-                "mask": True,  # P2P can be overlapped with flash attention tiles
+                "mask": True,
                 "mask_type": "p2p_overlap",
             },
             scope=first_node.scope,
@@ -504,10 +504,14 @@ annotations={
 
     def _insert_compressed_cp_comm_block(
         self, g: "OpGraph", first_node: OpNode, last_node: OpNode,
-        seq_len: int, cp: int, hidden: int, phase: str
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
     ) -> None:
         """DeepSeek-V4两段式Compressed CP，只在block边界插入。"""
-        layer = first_node.layer or "0"
+        layer = first_node.layer or "root"
+
+        cp_split_info = first_node.annotations.get("cp_split", {})
+        if cp_split_info.get("skip_comm", False):
+            return
 
         if "swa" in layer.lower() or "sliding" in first_node.scope.lower():
             return
@@ -518,11 +522,11 @@ annotations={
         if first_node.inputs:
             shape = first_node.inputs[0].shape
         else:
-            shape = (seq_local, hidden)
+            shape = (micro_batch, seq_local, hidden)
 
         compression_ratio = 4
 
-        p2p_bytes = seq_local * hidden * 2
+        p2p_bytes = micro_batch * seq_local * hidden * 2
         p2p_comm = OpNode(
             id=f"comm_p2p_compressed_stage1_layer_{layer}_{phase_suffix}",
             op_type="comm.send_recv",
@@ -536,7 +540,7 @@ annotations={
                 "bytes": p2p_bytes,
                 "layer": layer,
             },
-annotations={
+            annotations={
                 "phase": phase,
                 "inserted_by": "cp_pass",
                 "mask": True,
@@ -615,47 +619,6 @@ annotations={
             ))
 
         graph._rebuild_adjacency()
-
-            if cp_kind == "compressed":
-                stage1_id = f"comm_p2p_cp_compressed_stage1_{node.id}"
-                stage2_id = f"comm_ag_cp_compressed_stage2_{node.id}"
-                if stage1_id not in g.nodes:
-                    stage1 = OpNode(
-                        id=stage1_id,
-                        op_type="comm.send_recv",
-                        inputs=copy.deepcopy(node.inputs),
-                        outputs=copy.deepcopy(node.inputs),
-                        attrs={"group_size": cp, "collective": "send_recv",
-                               "role": "cp_compressed_stage1",
-                               "message_size_bytes": ring_msg_bytes,
-                               "msg_bytes": ring_msg_bytes,
-                               "scope": node.scope, "layer": node.layer},
-                        scope=node.scope,
-                        layer=node.layer,
-                        category="communication",
-                    )
-                    stage1.annotations["inserted_by"] = "cp_pass"
-                    stage1.annotations["overlap_target"] = f"fa_tile:{node.id}"
-                    g.nodes[stage1.id] = stage1
-                    _prepend_comm(g, node.id, stage1)
-
-                if stage2_id not in g.nodes:
-                    stage2 = OpNode(
-                        id=stage2_id,
-                        op_type="comm.all_gather",
-                        inputs=copy.deepcopy(node.inputs),
-                        outputs=copy.deepcopy(node.inputs),
-                        attrs={"group_size": cp, "collective": "all_gather",
-                               "role": "cp_compressed_stage2",
-                               "message_size_bytes": ulysses_msg_bytes,
-                               "msg_bytes": ulysses_msg_bytes},
-                        scope=node.scope,
-                        layer=node.layer,
-                        category="communication",
-                    )
-                    stage2.annotations["inserted_by"] = "cp_pass"
-                    g.nodes[stage2.id] = stage2
-                    _prepend_comm(g, node.id, stage2)
 
 
 def _moe_scope_root(scope: str) -> str:
