@@ -316,6 +316,25 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     rows = []
     for cfg, report in zip(configs, reports):
         d = cfg.copy()
+        if report.memory:
+            memory_gb = round(report.memory.total / 1e9, 2)
+            hw_name = cfg.get("hw", "nvidia_h100_sxm")
+            hw = load_hw(hw_name)
+            gpu_capacity_gb = hw.memory.capacity_gb
+            if memory_gb > gpu_capacity_gb:
+                continue
+        else:
+            memory_gb = None
+
+        d["fwd_compute_ms"] = round(report.fwd_compute_ms, 2)
+        d["bwd_compute_ms"] = round(report.bwd_compute_ms, 2)
+        d["exposed_comm_ms"] = round(report.exposed_comm_ms, 2)
+        d["tp_exposed_ms"] = round(report.tp_exposed_ms, 2)
+        d["cp_exposed_ms"] = round(report.cp_exposed_ms, 2)
+        d["ep_exposed_ms"] = round(report.ep_exposed_ms, 2)
+        d["pp_exposed_ms"] = round(report.pp_exposed_ms, 2)
+        d["optimizer_time_ms(compute)"] = round(report.optimizer_time_ms, 2)
+        d["optimizer_comm_ms"] = round(report.optimizer_comm_ms, 2)
         d["step_time_ms"] = round(report.step_time_ms, 3)
         d["pipeline_time_ms"] = round(report.pipeline_time_ms, 3)
         d["mfu"] = round(report.mfu, 4)
@@ -323,15 +342,32 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["bubble_fraction"] = round(report.bubble_fraction, 4)
         d["tokens_per_sec"] = round(report.tokens_per_sec, 1)
         if report.memory:
-            d["memory_gb"] = round(report.memory.total / 1e9, 2)
+            d["weights_gb"] = round(report.memory.weights / 1e9, 2)
+            d["grads_gb"] = round(report.memory.grads / 1e9, 2)
+            d["opt_state_gb"] = round(report.memory.opt_state / 1e9, 2)
+            d["activations_gb"] = round(report.memory.activations / 1e9, 2)
+            d["comm_buffers_gb"] = round(report.memory.comm_buffers / 1e9, 2)
+            d["memory_gb"] = memory_gb
         rows.append(d)
 
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("mfu", ascending=False)
 
-    config_cols = [k for k in rows[0].keys() if k not in ["step_time_ms", "pipeline_time_ms", "mfu", "hfu", "bubble_fraction", "tokens_per_sec", "memory_gb"]] if rows else []
-    metric_cols = ["step_time_ms", "pipeline_time_ms", "mfu", "hfu", "bubble_fraction", "tokens_per_sec", "memory_gb"]
+    config_cols = [k for k in rows[0].keys() if k not in ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
+                                                          "tp_exposed_ms", "cp_exposed_ms", "ep_exposed_ms",
+                                                          "pp_exposed_ms", "optimizer_time_ms(compute)",
+                                                          "optimizer_comm_ms", "step_time_ms", "pipeline_time_ms",
+                                                          "mfu", "hfu", "bubble_fraction", "tokens_per_sec",
+                                                          "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
+                                                          "comm_buffers_gb", "memory_gb"]] if rows else []
+    metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
+                                                          "tp_exposed_ms", "cp_exposed_ms", "ep_exposed_ms",
+                                                          "pp_exposed_ms", "optimizer_time_ms(compute)",
+                                                          "optimizer_comm_ms", "step_time_ms", "pipeline_time_ms",
+                                                          "mfu", "hfu", "bubble_fraction", "tokens_per_sec",
+                                                          "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
+                                                          "comm_buffers_gb", "memory_gb"]
     cols = config_cols + [c for c in metric_cols if c in df.columns]
     df = df[[c for c in cols if c in df.columns]]
     return df
@@ -461,19 +497,19 @@ if __name__ == "__main__":
         "pp": [1, 2, 4, 8],
         "ep": [256],
         "dp": "auto",
-        "micro_batch": [1,16, 32,],
-        "global_batch": [512,  65536],
-        "seq_len": [8192,1048576],
-        "zero_stage": [1, 2, 3],
-        "pp_schedule": ["dualpipe", "dualpipev"],
+        "micro_batch": [1,16, 32],
+        "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
+        "seq_len": [8192, 65536, 131072, 262144, 52488, 1048576],
+        "zero_stage": [3],
+        "pp_schedule": ["dualpipe"],
         "vpp_chunks": [1, 2],
-        "cp_kind": ["ulysses", "ring"],
+        "cp_kind": ["ulysses"],
         "tp_overlap": ["coc"],
         "ep_overlap": [True],
         "dualbatch": [True],
         "dp_overlap_in_bubble": [True],
-        "recompute": ["selective"],
-        "optimizer": ["adam"],
+        "recompute": ["none"],
+        "optimizer": ["muon"],
     }
 
     df = run_training_search_parallel(
