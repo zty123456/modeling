@@ -176,7 +176,7 @@ def main() -> None:
         choices=["none", "ulysses", "ring", "hybrid", "compressed"],
         metavar="KIND",
         help="Context parallel strategy (default: auto-select by model type). "
-             "DSV4/DV3.2: 'compressed' only. "
+             "DSV4: 'compressed' only. "
              "Other models: 'ulysses' (default), 'ring', or 'hybrid'.",
     )
     parser.add_argument(
@@ -468,7 +468,7 @@ def _validate_cp_kind(model_id: str, cp_kind: str, cp: int) -> str:
         return "none"
     
     model_slug = _make_model_slug(model_id).lower()
-    is_dsv4 = any(x in model_slug for x in ["deepseek_v4", "deepseek_v3_2", "dsv4", "dv32"])
+    is_dsv4 = any(x in model_slug for x in ["deepseek_v4", "dsv4"])
     
     if is_dsv4:
         if cp_kind not in ("none", "compressed"):
@@ -480,7 +480,7 @@ def _validate_cp_kind(model_id: str, cp_kind: str, cp: int) -> str:
     
     if cp_kind == "compressed":
         raise ValueError(
-            f"cp_kind='compressed' is reserved for DeepSeek-V4/V3.2. "
+            f"cp_kind='compressed' is reserved for DeepSeek-V4. "
             f"Model '{model_id}' should use 'ulysses', 'ring', or 'hybrid'."
         )
     
