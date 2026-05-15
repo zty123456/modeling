@@ -1,8 +1,6 @@
 """Tests for EP routed-expert FFN compute scaling under uniform routing."""
 
-import pytest
 from zrt.training.compose.stage import _ep_gemm_time
-from zrt.training.compose.schedules import _assign_stages
 from zrt.training.ir.builders import build_graph
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import Strategy
