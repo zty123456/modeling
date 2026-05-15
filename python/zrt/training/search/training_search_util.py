@@ -428,11 +428,26 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         if model is None:
             model = _load_model_spec(model_name)
             _WORKER_MODEL_CACHE[model_name] = model
+        # Per-config seq_len override: the cached ModelSpec carries the YAML
+        # default, but the grid varies seq_len, and Strategy does not own this
+        # field. Mutating the cached object is safe — each worker is a single
+        # process running one task at a time.
+        seq_len = config.get("seq_len")
+        if seq_len is not None:
+            model.seq_len = int(seq_len)
 
-        system = _WORKER_HW_CACHE.get(hw_name)
+        # System cache must key on world_size / gpus_per_node, not just hw_name,
+        # because nodes is derived from those — otherwise multi-world_size grids
+        # silently reuse the first config's SystemSpec.
+        sys_key = (
+            hw_name,
+            int(config.get("world_size", 0)),
+            int(config.get("gpus_per_node", 8)),
+        )
+        system = _WORKER_HW_CACHE.get(sys_key)
         if system is None:
             system = _make_system_from_config(config)
-            _WORKER_HW_CACHE[hw_name] = system
+            _WORKER_HW_CACHE[sys_key] = system
 
         strategy = _make_strategy_from_config(config)
         strategy.validate(model, system)
