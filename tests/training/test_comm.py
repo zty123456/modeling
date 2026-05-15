@@ -91,3 +91,59 @@ def test_tier_selection_inter():
     system = _make_system()
     link = tier_for_group("DP", 32, system)
     assert link.type == "IB"
+
+
+def test_dp_grad_reduce_zero3_uses_full_per_rank_volume():
+    """ZeRO-3 RS payload S in alpha-beta should be the per-rank pre-shard volume,
+    not post-shard owner slice. The formula (N-1)*(α + S/N*β) already divides by N.
+
+    Regression for: comm.py:275-277 incorrectly divided total by dp for ZeRO>=2,
+    producing ~N× underestimate (1.62 ms vs textbook 154 ms for DSV4-pro DP=512).
+    """
+    from zrt.training.spec.model import ModelSpec, LayerKind
+    from zrt.training.spec.strategy import Strategy
+    from zrt.training.models.comm import total_comm_time
+    from zrt.training.ir.builders import build_graph
+
+    model = ModelSpec(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE] * 8,
+    )
+    system = _make_system()
+    strategy_z1 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8, zero_stage=1)
+    strategy_z3 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8, zero_stage=3)
+
+    g1 = build_graph(model, strategy_z1)
+    g3 = build_graph(model, strategy_z3)
+    t_z1 = total_comm_time(g1, model, system, strategy_z1)["dp_grad_reduce"]
+    t_z3 = total_comm_time(g3, model, system, strategy_z3)["dp_grad_reduce"]
+
+    # ZeRO-3 RS bytes ≈ ZeRO-1 AR bytes / 2 (RS is half of AR, both formulas use same S).
+    # Before fix: t_z3 was ~N× smaller than t_z1 due to double-divide.
+    # After fix: t_z3 should be roughly t_z1 / 2 (kind difference only).
+    assert t_z3 > t_z1 / 4, (
+        f"ZeRO-3 dp_grad_reduce={t_z3*1000:.3f}ms looks bug-divided by dp; "
+        f"expected ≈ ZeRO-1 AR / 2 ≈ {t_z1*1000/2:.3f}ms"
+    )
+
+
+def test_params_on_rank_for_dp_independent_of_zero_stage():
+    """_params_on_rank_for_dp should return the same per-rank gradient quantity
+    regardless of zero_stage (1/2/3). ZeRO sharding affects how that volume is
+    split during the collective, not the input payload to the collective."""
+    from zrt.training.spec.model import ModelSpec, LayerKind
+    from zrt.training.spec.strategy import Strategy
+    from zrt.training.models.comm import _params_on_rank_for_dp
+
+    model = ModelSpec(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE] * 8,
+    )
+    s_z1 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8, zero_stage=1)
+    s_z3 = Strategy(tp=1, pp=1, dp=8, micro_batch=1, global_batch=8, zero_stage=3)
+
+    assert _params_on_rank_for_dp(model, s_z1) == _params_on_rank_for_dp(model, s_z3), (
+        "ZeRO stage should not change the per-rank pre-RS gradient volume"
+    )

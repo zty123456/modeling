@@ -272,6 +272,10 @@ def _params_on_rank_for_dp(model: ModelSpec, strategy: Strategy) -> int:
         non_embed = int(non_embed * (n_layers / strategy.pp) / n_layers)
         total = non_embed + embed_params // strategy.pp
 
-    if strategy.zero_stage >= 2:
-        total //= strategy.dp
+    # NOTE: do NOT divide by dp here. The alpha-beta formula
+    #   T_RS = (N-1)·(α + S/N·β)
+    # in collective_time() already divides S by N. Passing S = full_per_rank
+    # gradient volume is what the textbook expects. ZeRO stage only changes
+    # whether the collective is AR (zero=0) or RS (zero>=1); the input volume
+    # to the collective is the same per-rank gradient produced by backward.
     return total
