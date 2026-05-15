@@ -5,6 +5,8 @@ Per-collective cost using topology-aware latency and bandwidth.
 
 from __future__ import annotations
 
+import math
+
 from zrt.hardware.spec import LinkSpec
 from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import ModelSpec
@@ -49,6 +51,14 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
         return 2 * (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "A2A":
+        if full_connectivity:
+            # NVSwitch-class: single-step A2A
+            return alpha + (S / N) * beta
+        # NCCL/HCCL use Bruck (log2 rounds) above ~16 ranks; below that,
+        # pairwise-exchange is competitive and matches the legacy formula.
+        if N > 16:
+            rounds = max(1, math.ceil(math.log2(N)))
+            return rounds * alpha + ((N - 1) / N) * S * beta
         return (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "P2P":
@@ -272,6 +282,10 @@ def _params_on_rank_for_dp(model: ModelSpec, strategy: Strategy) -> int:
         non_embed = int(non_embed * (n_layers / strategy.pp) / n_layers)
         total = non_embed + embed_params // strategy.pp
 
-    if strategy.zero_stage >= 2:
-        total //= strategy.dp
+    # NOTE: do NOT divide by dp here. The alpha-beta formula
+    #   T_RS = (N-1)·(α + S/N·β)
+    # in collective_time() already divides S by N. Passing S = full_per_rank
+    # gradient volume is what the textbook expects. ZeRO stage only changes
+    # whether the collective is AR (zero=0) or RS (zero>=1); the input volume
+    # to the collective is the same per-rank gradient produced by backward.
     return total
