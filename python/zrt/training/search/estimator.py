@@ -122,6 +122,12 @@ def estimate(
         tp_hidden_ms=s.tp_hidden * 1000,
         ep_hidden_ms=s.ep_hidden * 1000,
         total_comm_volume_ms=s.total_comm_volume * 1000,
+        # Per-strategy total comm
+        tp_total_ms=(s.tp_exposed + s.tp_hidden) * 1000,
+        cp_total_ms=s.cp_exposed * 1000,
+        ep_total_ms=(s.ep_exposed + s.ep_hidden) * 1000,
+        pp_total_ms=s.pp_exposed * 1000,
+        dp_total_ms=(s.dp_exposed + s.dp_hidden) * 1000,
         # Derived metrics
         tokens_per_sec=tokens_per_sec,
         effective_params=model.effective_params_for_flops(),

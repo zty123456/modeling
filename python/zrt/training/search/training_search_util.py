@@ -473,10 +473,16 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["fwd_compute_ms"] = round(report.fwd_compute_ms, 2)
         d["bwd_compute_ms"] = round(report.bwd_compute_ms, 2)
         d["exposed_comm_ms"] = round(report.exposed_comm_ms, 2)
+        d["tp_total_ms"] = round(report.tp_total_ms, 2)
         d["tp_exposed_ms"] = round(report.tp_exposed_ms, 2)
+        d["cp_total_ms"] = round(report.cp_total_ms, 2)
         d["cp_exposed_ms"] = round(report.cp_exposed_ms, 2)
+        d["ep_total_ms"] = round(report.ep_total_ms, 2)
         d["ep_exposed_ms"] = round(report.ep_exposed_ms, 2)
+        d["pp_total_ms"] = round(report.pp_total_ms, 2)
         d["pp_exposed_ms"] = round(report.pp_exposed_ms, 2)
+        d["dp_total_ms"] = round(report.dp_total_ms, 2)
+        d["dp_exposed_ms"] = round(report.dp_exposed_ms, 2)
         d["optimizer_time_ms(compute)"] = round(report.optimizer_time_ms, 2)
         d["optimizer_comm_ms"] = round(report.optimizer_comm_ms, 2)
         d["step_time_ms"] = round(report.step_time_ms, 3)
@@ -499,15 +505,17 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         df = df.sort_values("mfu", ascending=False)
 
     config_cols = [k for k in rows[0].keys() if k not in ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
-                                                          "tp_exposed_ms", "cp_exposed_ms", "ep_exposed_ms",
-                                                          "pp_exposed_ms", "optimizer_time_ms(compute)",
+                                                          "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
+                                                          "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
+                                                          "dp_total_ms", "dp_exposed_ms", "optimizer_time_ms(compute)",
                                                           "optimizer_comm_ms", "step_time_ms", "pipeline_time_ms",
                                                           "mfu", "hfu", "bubble_fraction", "tokens_per_sec",
                                                           "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
                                                           "comm_buffers_gb", "memory_gb"]] if rows else []
     metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
-                                                          "tp_exposed_ms", "cp_exposed_ms", "ep_exposed_ms",
-                                                          "pp_exposed_ms", "optimizer_time_ms(compute)",
+                                                          "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
+                                                          "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
+                                                          "dp_total_ms", "dp_exposed_ms", "optimizer_time_ms(compute)",
                                                           "optimizer_comm_ms", "step_time_ms", "pipeline_time_ms",
                                                           "mfu", "hfu", "bubble_fraction", "tokens_per_sec",
                                                           "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
