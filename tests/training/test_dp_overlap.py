@@ -38,9 +38,10 @@ class TestSteadyBwdOverlap:
     def test_ratio_extends_hide_window_in_dualpipe(self):
         """DualPipe cooldown is small; with ratio>0, steady_bwd contributes
         and dp_exposed shrinks."""
-        # Two equal stages, fwd=10, bwd=20 → t_stage=30
-        # pp=2 → cooldown = (pp-1)/2 * t_stage = 15
-        # M=4 → steady_bwd_per_mb = bwd = 20, steady_bwd = M*bwd = 80
+        # Two equal stages, fwd=10, bwd=20 → t_stage_max = 30
+        # pp=2 DualPipe: bubble = (pp-1)/2 * t_stage_max = 15
+        #                cooldown = bubble / 2 = 7.5
+        # steady_bwd_total = M * t_stage_max / 2 = 4 * 30 / 2 = 60
         stages = [StageTime(fwd=10.0, bwd=20.0), StageTime(fwd=10.0, bwd=20.0)]
         s_no = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                         pp_schedule=PPSched.DUALPIPE, dp_steady_overlap_ratio=0.0)
@@ -50,10 +51,10 @@ class TestSteadyBwdOverlap:
         r_no = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_no)
         r_half = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_half)
 
-        # ratio=0: hide = min(cooldown=15, 100) = 15 → exposed = 85
-        # ratio=0.5: hide = min(cooldown=15 + 0.5*80=55, 100) = 55 → exposed = 45
-        assert r_no.dp_exposed == pytest.approx(85.0)
-        assert r_half.dp_exposed == pytest.approx(45.0)
+        # ratio=0: window = 7.5 → hide = 7.5 → exposed = 92.5
+        # ratio=0.5: window = 7.5 + 0.5*60 = 37.5 → hide = 37.5 → exposed = 62.5
+        assert r_no.dp_exposed == pytest.approx(92.5)
+        assert r_half.dp_exposed == pytest.approx(62.5)
 
     def test_ratio_zero_matches_legacy_behavior(self):
         """ratio=0 should reproduce the previous cooldown-only window exactly,
@@ -144,7 +145,7 @@ class TestHideWindowConsistency:
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE]*4)
-        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=16,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
                      dp_steady_overlap_ratio=1.0)
         graph = build_graph(model, s)
