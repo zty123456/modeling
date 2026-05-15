@@ -22,6 +22,7 @@ class MemBreakdown:
     activations: float = 0.0   # bytes (includes hc_overhead_bytes)
     comm_buffers: float = 0.0  # bytes
     hc_overhead_bytes: float = 0.0  # bytes from HC residual replication
+    muon_ns_buffer: float = 0.0     # bytes — transient AG + A=XᵀX during NS step
 
     # Phase-specific peaks (bytes). Each is what the GPU holds simultaneously
     # during that phase of one training step. peak_overall is the max — that's
@@ -37,11 +38,12 @@ class MemBreakdown:
         """Conservative upper bound — algebraic sum of all components.
 
         Real GPU memory at any moment is bounded by ``peak_overall``; ``total``
-        is always ≥ ``peak_overall`` because it pretends activations and
-        opt_state coexist (they don't — opt_state is alive only during the
-        optimizer step, after activations are released).
+        is always ≥ ``peak_overall``. Includes ``muon_ns_buffer`` (the transient
+        AllGather + scratch that lives only during the NS step) so the invariant
+        holds even when that spike exceeds activation memory.
         """
-        return self.weights + self.grads + self.opt_state + self.activations + self.comm_buffers
+        return (self.weights + self.grads + self.opt_state + self.activations
+                + self.comm_buffers + self.muon_ns_buffer)
 
     def to_gb(self) -> dict[str, float]:
         GB = 1024 ** 3
@@ -52,12 +54,55 @@ class MemBreakdown:
             "activations_gb": self.activations / GB,
             "comm_buffers_gb": self.comm_buffers / GB,
             "hc_overhead_gb": self.hc_overhead_bytes / GB,
+            "muon_ns_buffer_gb": self.muon_ns_buffer / GB,
             "total_gb": self.total / GB,
             "peak_gb": self.peak_overall / GB,
             "peak_forward_gb": self.peak_forward / GB,
             "peak_backward_gb": self.peak_backward / GB,
             "peak_optimizer_gb": self.peak_optimizer / GB,
         }
+
+
+def _muon_ns_peak_buffer(model: ModelSpec, strategy: Strategy) -> int:
+    """Transient memory spike during Muon Newton-Schulz orthogonalization.
+
+    Two sources:
+    1. AllGather momentum: ZeRO shards momentum by DP, but NS needs the full
+       un-sharded matrix. Spike = P_muon × 4B × (DP-1)/DP.
+    2. Intermediate A = XₖᵀXₖ ∈ R^{n×n}: computed per weight matrix
+       sequentially. Peak = max_short_dim² × 4B (largest weight matrix on rank).
+    """
+    if strategy.optimizer.value != "muon":
+        return 0
+
+    muon_config = strategy.muon_config
+    f_muon = (
+        muon_config.muon_param_fraction
+        if muon_config and muon_config.muon_param_fraction is not None
+        else 0.85
+    )
+
+    P = _params_on_rank(model, strategy)
+    P_muon = int(P * f_muon)
+
+    # Buffer 1: AllGather momentum spike (ZeRO-1/2/3 only)
+    if strategy.dp > 1 and strategy.zero_stage >= 1:
+        # Rank normally holds P_muon × 4B / DP; AllGather brings it to P_muon × 4B
+        ag_extra = int(P_muon * 4 * (strategy.dp - 1) / strategy.dp)
+    else:
+        ag_extra = 0
+
+    # Buffer 2: Intermediate A = XₖᵀXₖ (largest TP-sharded weight matrix, FP32)
+    # A = XᵀX where X ∈ R^{m×n} → A ∈ R^{short×short}, short = min(m, n).
+    # After TP column-sharding the short dim is min(hidden, col_dim/tp).
+    tp = max(1, strategy.tp)
+    attn_short = model.hidden // tp                              # q/k/v/o: (hidden, hidden/tp)
+    ffn_short  = min(model.hidden, model.ffn    // tp)          # up/gate/down: min(h, ffn/tp)
+    moe_short  = min(model.hidden, model.moe_ffn // tp) if model.num_experts > 0 else 0
+    max_short  = max(attn_short, ffn_short, moe_short)
+    a_matrix = max_short * max_short * 4     # FP32, one matrix at a time
+
+    return ag_extra + a_matrix
 
 
 def memory_breakdown(
@@ -125,6 +170,9 @@ def memory_breakdown(
         if off.params:
             weights = int(weights * (1 - off.pct))
 
+    # ── Muon NS transient buffer ─────────────────────────────────────────────
+    muon_ns_buf = _muon_ns_peak_buffer(model, strategy)
+
     mb = MemBreakdown(
         weights=weights,
         grads=grads,
@@ -132,6 +180,7 @@ def memory_breakdown(
         activations=activations,
         comm_buffers=comm_buffers,
         hc_overhead_bytes=hc_overhead,
+        muon_ns_buffer=muon_ns_buf,
     )
     # Phase peaks: real GPU residency in each phase of one training step.
     # peak_overall is the OOM-relevant number; .total is a conservative
@@ -139,7 +188,7 @@ def memory_breakdown(
     # they never coexist.
     mb.peak_forward = weights + activations + comm_buffers
     mb.peak_backward = weights + activations + grads + comm_buffers
-    mb.peak_optimizer = weights + grads + opt_state
+    mb.peak_optimizer = weights + grads + opt_state + muon_ns_buf
     mb.peak_overall = max(mb.peak_forward, mb.peak_backward, mb.peak_optimizer)
     return mb
 
