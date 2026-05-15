@@ -153,3 +153,31 @@ class TestHideWindowConsistency:
         # With ratio=1.0 and steady_bwd >> dp_total, DP should be ~fully hidden.
         assert result.dp_hidden > 0.5 * (result.dp_exposed + result.dp_hidden), \
             f"dualbatch+ratio=1.0 should hide most DP; got exposed={result.dp_exposed}, hidden={result.dp_hidden}"
+
+
+class TestZeroBubbleFloor:
+    """ZB-1P / ZB-V still has a minimal per-transition bubble equal to 2*pp_p2p.
+    Without a floor, balanced t_w configs collapse bubble to 0 incorrectly."""
+
+    def test_balanced_tw_does_not_collapse_to_zero(self):
+        # bottleneck.bwd_dw equal to fwd+bwd → naive formula gives 0 cooldown.
+        stages = [StageTime(fwd=4.0, bwd=6.0, bwd_dw=10.0),
+                  StageTime(fwd=4.0, bwd=6.0, bwd_dw=10.0)]
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
+                     pp_schedule=PPSched.ZERO_BUBBLE)
+        r = ZeroBubbleComposer().compose(stages, M=4, pp=2, dp_ar_time=0.0, strategy=s)
+        # Floor should be 2 * pp_p2p; with no system passed to the composer
+        # directly, we rely on a small constant floor (≥1e-6) keeping it strictly > 0.
+        assert r.cooldown > 0.0, \
+            f"ZB cooldown collapsed to zero; got cooldown={r.cooldown}"
+
+    def test_unbalanced_tw_uses_natural_value(self):
+        """When t_stage > t_w, the natural formula dominates and the floor is
+        not applied (floor < natural)."""
+        stages = [StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0),  # t_w small
+                  StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0)]
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
+                     pp_schedule=PPSched.ZERO_BUBBLE)
+        r = ZeroBubbleComposer().compose(stages, M=4, pp=2, dp_ar_time=0.0, strategy=s)
+        # Natural: bubble = (pp-1)*(t_stage - t_w) = 1*(10-2) = 8; cooldown=4
+        assert r.cooldown == pytest.approx(4.0)

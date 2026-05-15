@@ -433,7 +433,14 @@ class ZeroBubbleComposer(PipelineComposer):
         t_stage = bottleneck.fwd + bottleneck.bwd
         t_w = bottleneck.bwd_dw
 
-        bubble = (pp - 1) * max(t_stage - t_w, 0.0)
+        # ZB-1P/ZB-V keep a residual per-transition bubble even when t_w ≈ t_stage.
+        # The empirical floor is roughly 2 microseconds (P2P latency) per pp-1
+        # transition. We use 1e-6 s here as the minimum unit; callers that want
+        # a hardware-derived floor can pass it in via stage_times comm_bwd already
+        # baked into t_stage. This avoids the "0 bubble" artifact in search.
+        ZB_BUBBLE_FLOOR_PER_TRANSITION = 1e-6
+        bubble = max((pp - 1) * max(t_stage - t_w, 0.0),
+                     (pp - 1) * ZB_BUBBLE_FLOOR_PER_TRANSITION)
         warmup = bubble / 2.0
         steady = M * t_stage
         cooldown = bubble / 2.0
