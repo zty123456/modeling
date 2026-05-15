@@ -66,7 +66,7 @@ def test_ar_time_is_2x_ag():
 
 
 def test_a2a_time():
-    """A2A: (N-1) * (alpha + S/N * beta), same as AG."""
+    """A2A on NVSwitch (full_connectivity): single-step (alpha + S/N * beta)."""
     link = _intra_link()
     N = 4
     S = 20 * 1024 * 1024
@@ -75,7 +75,8 @@ def test_a2a_time():
 
     alpha = 1e-6
     beta = 1.0 / (900e9 / 8)
-    expected = (N - 1) * (alpha + (S / N) * beta)
+    # full_connectivity topology uses single-step A2A
+    expected = alpha + (S / N) * beta
     assert t == pytest.approx(expected, rel=0.01)
 
 
@@ -146,4 +147,49 @@ def test_params_on_rank_for_dp_independent_of_zero_stage():
 
     assert _params_on_rank_for_dp(model, s_z1) == _params_on_rank_for_dp(model, s_z3), (
         "ZeRO stage should not change the per-rank pre-RS gradient volume"
+    )
+
+
+def test_a2a_large_n_uses_log2_latency():
+    """A2A on fat-tree with N > 16 should use Bruck-style log2(N) latency,
+    not pairwise-exchange (N-1)·α. NCCL switches to Bruck at scale.
+
+    For N=384, α=2µs: pairwise=766µs, Bruck=9·2µs=18µs."""
+    from zrt.hardware.spec import LinkSpec
+    from zrt.training.ir.training_graph import Collective
+    link = LinkSpec(type="IB", bandwidth_gbps=400, latency_us=2.0, topology="fat_tree")
+    N = 384
+    S = 1024 * 1024  # 1 MB
+    c = Collective("test_a2a", "A2A", "EP", S, "op1")
+    t = collective_time(c, N, link)
+
+    # Bandwidth term: (N-1)/N * S * β ≈ S * β for large N
+    beta = 1.0 / (400e9 / 8)
+    bandwidth = (N - 1) / N * S * beta
+    # Latency: log2(384) ≈ 9 rounds × 2µs = 18 µs
+    expected_max = 12 * 2e-6 + bandwidth  # allow ceil + small margin
+    assert t < expected_max, (
+        f"A2A on N=384 should use log2 latency, got {t*1e6:.1f}µs "
+        f"(expected < {expected_max*1e6:.1f}µs)"
+    )
+    # Sanity: still > pure bandwidth
+    assert t > bandwidth, "should have non-zero latency"
+
+
+def test_a2a_small_n_keeps_legacy_formula():
+    """Small N (≤16) keeps pairwise-exchange (N-1)·(α+S/N·β) for backward-compat
+    with intra-node A2A tests."""
+    from zrt.hardware.spec import LinkSpec
+    from zrt.training.ir.training_graph import Collective
+    link = LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0,
+                    topology="fat_tree", num_devices=8)  # not full_connectivity
+    N = 8
+    S = 1024 * 1024
+    c = Collective("test_a2a", "A2A", "TP", S, "op1")
+    t = collective_time(c, N, link)
+    alpha = 1e-6
+    beta = 1.0 / (900e9 / 8)
+    expected_legacy = (N - 1) * (alpha + (S / N) * beta)
+    assert t == pytest.approx(expected_legacy, rel=1e-3), (
+        f"Small N should keep legacy formula; got {t} vs {expected_legacy}"
     )

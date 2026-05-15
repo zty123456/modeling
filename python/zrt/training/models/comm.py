@@ -5,6 +5,8 @@ Per-collective cost using topology-aware latency and bandwidth.
 
 from __future__ import annotations
 
+import math
+
 from zrt.hardware.spec import LinkSpec
 from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import ModelSpec
@@ -49,6 +51,14 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
         return 2 * (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "A2A":
+        if full_connectivity:
+            # NVSwitch-class: single-step A2A
+            return alpha + (S / N) * beta
+        # NCCL/HCCL use Bruck (log2 rounds) above ~16 ranks; below that,
+        # pairwise-exchange is competitive and matches the legacy formula.
+        if N > 16:
+            rounds = max(1, math.ceil(math.log2(N)))
+            return rounds * alpha + ((N - 1) / N) * S * beta
         return (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "P2P":
