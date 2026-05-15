@@ -95,3 +95,60 @@ class TestDualbatchRecoversWithSteadyOverlap:
         # With ratio>0, dp_hidden > 0 even though dualbatch zeroed cooldown
         assert result.dp_hidden > 0.0, \
             f"steady-bwd window should recover some DP hide, got dp_hidden={result.dp_hidden}"
+
+
+class TestHideWindowConsistency:
+    """All composers should use the same hide-window formula:
+    hide = cooldown + ratio * steady_bwd."""
+
+    def _stages(self):
+        return [StageTime(fwd=5.0, bwd=10.0), StageTime(fwd=5.0, bwd=10.0)]
+
+    @pytest.mark.parametrize("composer_cls,sched", [
+        (OneF1BComposer, PPSched.ONE_F_ONE_B),
+        (DualPipeComposer, PPSched.DUALPIPE),
+        (ZeroBubbleComposer, PPSched.ZERO_BUBBLE),
+    ])
+    def test_hide_window_includes_steady_bwd(self, composer_cls, sched):
+        stages = self._stages()
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
+                     pp_schedule=sched, dp_steady_overlap_ratio=0.5)
+        # M=4 → steady_bwd ≈ 4 * 10 = 40, plus per-composer cooldown
+        # Set dp_ar_time deliberately larger than cooldown alone to detect that
+        # the steady_bwd term contributes.
+        r = composer_cls().compose(stages, M=4, pp=2, dp_ar_time=200.0, strategy=s)
+        assert r.dp_exposed < 200.0, \
+            f"{sched}: no steady-bwd contribution detected (dp_exposed={r.dp_exposed})"
+        # Sanity: with ratio=0 it should be larger (more exposed).
+        s0 = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
+                      pp_schedule=sched, dp_steady_overlap_ratio=0.0)
+        r0 = composer_cls().compose(stages, M=4, pp=2, dp_ar_time=200.0, strategy=s0)
+        assert r0.dp_exposed > r.dp_exposed, \
+            f"{sched}: ratio=0 should expose more DP than ratio=0.5"
+
+    def test_onef1b_pp1_consistent_with_helper(self):
+        """The OneF1B pp=1 special case used st.bwd*M directly. After the
+        refactor, the same number should fall out of the unified helper when
+        cooldown=0 and ratio=1.0."""
+        stages = [StageTime(fwd=1.0, bwd=2.0)]
+        s = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4,
+                     dp_steady_overlap_ratio=1.0)
+        # Pre-refactor: pp=1 uses bwd*M = 2*4 = 8; with dp_ar_time=3 → fully hidden.
+        r = OneF1BComposer().compose(stages, M=4, pp=1, dp_ar_time=3.0, strategy=s)
+        assert r.dp_exposed == pytest.approx(0.0)
+
+    def test_dualbatch_uses_same_helper(self):
+        """After fix #3, dualbatch's new_dp_exposed should go through the same
+        helper (cooldown + ratio*steady_bwd), so it can still hide DP in steady_bwd
+        even when cooldown collapses to 0."""
+        model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                          head_dim=128, vocab=32000, seq_len=1024,
+                          layers=[LayerKind.DENSE]*4)
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
+                     pp_schedule=PPSched.DUALPIPE, dualbatch=True,
+                     dp_steady_overlap_ratio=1.0)
+        graph = build_graph(model, s)
+        result = pipeline_step_time(graph, model, _make_system(), s)
+        # With ratio=1.0 and steady_bwd >> dp_total, DP should be ~fully hidden.
+        assert result.dp_hidden > 0.5 * (result.dp_exposed + result.dp_hidden), \
+            f"dualbatch+ratio=1.0 should hide most DP; got exposed={result.dp_exposed}, hidden={result.dp_hidden}"

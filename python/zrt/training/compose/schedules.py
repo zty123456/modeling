@@ -98,6 +98,31 @@ class StepResult:
     total_comm_volume: float = 0.0  # All comm in step
 
 
+def _dp_hide_window(
+    cooldown: float,
+    steady_bwd_total: float,
+    strategy: Strategy,
+) -> float:
+    """Time window in which DP grad-reduce can be hidden.
+
+    cooldown      — explicit pipeline drain phase (composer-specific).
+    steady_bwd_total — total steady-state backward compute on the critical path
+                       (for pp=1: bwd · M; for pp>1: bottleneck stage's bwd · M).
+
+    Behavior:
+      - If dp_overlap_in_bubble is False → return 0 (DP fully exposed).
+      - Else return cooldown + ratio · steady_bwd_total, with ratio drawn from
+        strategy.dp_steady_overlap_ratio (default 0.5).
+
+    The caller is responsible for clamping with dp_ar_time:
+        hide = min(_dp_hide_window(...), dp_ar_time)
+    """
+    if not strategy.dp_overlap_in_bubble:
+        return 0.0
+    ratio = max(0.0, min(1.0, strategy.dp_steady_overlap_ratio))
+    return cooldown + ratio * steady_bwd_total
+
+
 class PipelineComposer(ABC):
 
     @abstractmethod
@@ -134,10 +159,10 @@ class OneF1BComposer(PipelineComposer):
             # No pipeline: just fwd + bwd for single stage
             st = stage_times[0] if stage_times else StageTime()
             step = st.fwd + st.bwd
-            dp_exposed = dp_ar_time
-            if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-                hidden = min(st.bwd * M, dp_ar_time)
-                dp_exposed = dp_ar_time - hidden
+            steady_bwd_total = st.bwd * M
+            window = _dp_hide_window(0.0, steady_bwd_total, strategy)
+            hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+            dp_exposed = dp_ar_time - hidden
 
             ideal_step = M * (st.fwd + st.bwd)
             bubble_frac = 0.0
@@ -174,10 +199,10 @@ class OneF1BComposer(PipelineComposer):
 
         # DP AR: hide in cooldown (backward drain phase) if enabled
         bubble = warmup + cooldown
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_bwd_max
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         ideal_step = M * t_stage_max
@@ -238,10 +263,10 @@ class Interleaved1F1BComposer(PipelineComposer):
         cooldown = (pp - 1) * t_bwd_max / V
 
         bubble = warmup + cooldown
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_bwd_max
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = (warmup + cooldown) / step if step > 0 else 0.0
@@ -296,10 +321,10 @@ class DualPipeComposer(PipelineComposer):
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_stage_max / 2
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
@@ -353,10 +378,10 @@ class DualPipeVComposer(PipelineComposer):
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_stage_max / 2
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
@@ -413,10 +438,10 @@ class ZeroBubbleComposer(PipelineComposer):
         steady = M * t_stage
         cooldown = bubble / 2.0
 
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * (t_stage / 2)
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
@@ -532,9 +557,12 @@ def pipeline_step_time(
         residual_bubble = max(original_bubble - step.steady, 0.0)
         bubble_saved = original_bubble - residual_bubble
         new_cooldown = residual_bubble / 2.0
-        # Recompute DP AR exposure against the shrunk cooldown window
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            new_dp_exposed = dp_ar_time - min(new_cooldown, dp_ar_time)
+        # Recompute DP exposure through the same helper used by composers,
+        # so steady-BWD overlap is still available when dualbatch zeros the cooldown.
+        steady_bwd_total_bot = max(0.0, step.steady_bwd_per_mb * M)
+        window = _dp_hide_window(new_cooldown, steady_bwd_total_bot, strategy)
+        if dp_ar_time > 0:
+            new_dp_exposed = dp_ar_time - min(window, dp_ar_time)
         else:
             new_dp_exposed = step.dp_exposed
         dp_delta = new_dp_exposed - step.dp_exposed
