@@ -415,7 +415,10 @@ class ZeroBubbleComposer(PipelineComposer):
     be delayed to fill pipeline bubbles, so the exposed bubble is reduced by
     the bottleneck stage's dW time:
 
-        step = M * t_stage + (pp - 1) * max(t_stage - t_w, 0)
+        step = M * t_stage + (pp - 1) * max(t_stage - t_w, ZB_BUBBLE_FLOOR)
+
+    where ZB_BUBBLE_FLOOR represents the residual per-transition P2P latency
+    that ZB-1P/ZB-V cannot eliminate.
     """
 
     def compose(
@@ -438,7 +441,7 @@ class ZeroBubbleComposer(PipelineComposer):
         # transition. We use 1e-6 s here as the minimum unit; callers that want
         # a hardware-derived floor can pass it in via stage_times comm_bwd already
         # baked into t_stage. This avoids the "0 bubble" artifact in search.
-        ZB_BUBBLE_FLOOR_PER_TRANSITION = 1e-6
+        ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6  # 2 µs P2P latency per pp transition
         bubble = max((pp - 1) * max(t_stage - t_w, 0.0),
                      (pp - 1) * ZB_BUBBLE_FLOOR_PER_TRANSITION)
         warmup = bubble / 2.0
