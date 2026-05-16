@@ -86,6 +86,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         recompute.per_layer = {"moe": {"attn"}, "dense": {"attn"}}
     elif rc_str == "full":
         recompute.per_layer = {"moe": {"full"}, "dense": {"full"}}
+    elif rc_str == "mhc":
+        recompute.per_layer = {"moe": {"hc"}}
 
     muon_config = None
     opt_str = config.get("optimizer", "adam")
@@ -150,6 +152,8 @@ class TrainingConfigManager:
             recompute.per_layer = {"moe": {"attn"}, "dense": {"attn"}}
         elif rc_str == "full":
             recompute.per_layer = {"moe": {"full"}, "dense": {"full"}}
+        elif rc_str == "mhc":
+            recompute.per_layer = {"moe": {"hc"}}
 
         muon_config = None
         opt_str = other_config.get("optimizer", "adam")
