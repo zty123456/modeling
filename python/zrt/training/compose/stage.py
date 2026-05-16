@@ -231,7 +231,8 @@ def stage_time(
     # Also separate EP comm into fwd/bwd portions instead of treating them
     # as a single pool.
     t_ep_hidden = 0.0
-    if strategy.ep_overlap and strategy.ep > 1 and model.num_experts > 0:
+    if (strategy.ep_overlap and strategy.ep > 1 and model.num_experts > 0
+            and gpu.ep_overlap_waves > 0):
         # Separate EP comm into fwd and bwd portions
         t_comm_ep_fwd = 0.0
         t_comm_ep_bwd = 0.0
@@ -249,7 +250,7 @@ def stage_time(
                 t_comm_ep_fwd += ct * 0.5
                 t_comm_ep_bwd += ct * 0.5
 
-        K = 4  # number of overlap waves
+        K = gpu.ep_overlap_waves  # hardware-specific wave count (NVIDIA: 4)
 
         # Fwd overlap: use fwd GEMM time
         t_ep_gemm_fwd = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
@@ -264,14 +265,54 @@ def stage_time(
         for op in stage_ops:
             if op.kind == "matmul" and "routed_expert" in op.name:
                 cost = op_cost(op, model, system)
-                dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap)
-                dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap)
+                op_overlap = gpu.overlap_ratio.get(op.kind, 0.0)
+                dx_t = _cost_phase_time(cost, "dx", system, gpu_name, op_overlap)
+                dw_t = _cost_phase_time(cost, "dw", system, gpu_name, op_overlap)
                 t_ep_gemm_bwd += dx_t + dw_t
         saved_bwd = _wave_overlap_saved(t_comm_ep_bwd, t_ep_gemm_bwd, K)
         saved_bwd = min(saved_bwd, t_comm_bwd)
         t_bwd_dx -= saved_bwd
         t_comm_bwd -= saved_bwd
         t_ep_hidden += saved_bwd
+
+        # Inter-batch EP overlap: when dual_batch=True and pp>1, two microbatches
+        # run simultaneously. Batch A's residual EP A2A (after K-wave overlap)
+        # can be hidden by batch B's non-EP compute.
+        #
+        # Non-EP compute = total pure compute minus expert GEMM.
+        # We subtract ep_gemm to avoid double-counting: batch B's expert GEMM is
+        # already consumed by its own intra-batch wave-overlap and cannot
+        # simultaneously hide batch A's EP A2A.
+        #
+        # Head/tail correction: warmup and cooldown pipeline slots have no paired
+        # microbatch, so inter-batch hiding does not apply there. DualPipe(V) has
+        # bubble = (pp-1)/(2V) * t_stage. Scaling inter_saved by the steady-state
+        # fraction M/(M + bubble_slots) makes the aggregate step saving exactly
+        # M * inter_saved (steady only), not (M + bubble_slots) * inter_saved.
+        if strategy.dualbatch and strategy.pp > 1:
+            residual_ep_fwd = max(0.0, t_comm_ep_fwd - saved_fwd)
+            residual_ep_bwd = max(0.0, t_comm_ep_bwd - saved_bwd)
+
+            # Non-EP compute available as overlap window (exclude ep_gemm)
+            non_ep_compute_fwd = max(0.0, t_fwd - t_comm_fwd - t_ep_gemm_fwd)
+            non_ep_compute_bwd = max(0.0, (t_bwd_dx + t_bwd_dw) - t_comm_bwd - t_ep_gemm_bwd)
+
+            inter_saved_fwd = min(residual_ep_fwd, non_ep_compute_fwd)
+            inter_saved_bwd = min(residual_ep_bwd, non_ep_compute_bwd)
+
+            V = max(1, strategy.vpp_chunks)
+            M_mb = strategy.num_microbatches()
+            bubble_slots = (strategy.pp - 1) / (2.0 * V)
+            denom = M_mb + bubble_slots
+            steady_fraction = M_mb / denom if denom > 0 else 1.0
+            inter_saved_fwd *= steady_fraction
+            inter_saved_bwd *= steady_fraction
+
+            t_fwd -= inter_saved_fwd
+            t_comm_fwd -= inter_saved_fwd
+            t_bwd_dx -= inter_saved_bwd
+            t_comm_bwd -= inter_saved_bwd
+            t_ep_hidden += inter_saved_fwd + inter_saved_bwd
 
     t_bwd = t_bwd_dx + t_bwd_dw
     return StageTime(

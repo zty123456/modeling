@@ -40,6 +40,11 @@ class ComputeSpec:
     # 0 = tile model disabled.
     sram_kb_per_sm: float = 0.0
 
+    # Number of EP A2A overlap waves (K-wave technique, e.g. DeepSeek V3).
+    # 0 = hardware does not support K-wave EP overlap (e.g. Ascend HCCS).
+    # NVIDIA CUDA-capable hardware: typically 4.
+    ep_overlap_waves: int = 0
+
 
 @dataclass
 class MemoryTier:

@@ -24,6 +24,10 @@ class GPU:
     # 0 = tile model disabled (preserve current single-read byte formula).
     sram_kb_per_sm: float = 0.0
 
+    # Number of EP A2A overlap waves. 0 = hardware does not support K-wave EP
+    # overlap (e.g. Ascend HCCS). Mirrors HardwareSpec.compute.ep_overlap_waves.
+    ep_overlap_waves: int = 0
+
 
 @dataclass
 class SystemSpec:

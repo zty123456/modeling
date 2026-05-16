@@ -521,8 +521,8 @@ def pipeline_step_time(
         stage_colls = [
             c for c in graph.collectives
             if any(
-                (c.inserted_after and c.inserted_after.startswith(f"L{lid}")) or
-                (c.inserted_before and c.inserted_before.startswith(f"L{lid}"))
+                (c.inserted_after and c.inserted_after.startswith(f"L{lid}.")) or
+                (c.inserted_before and c.inserted_before.startswith(f"L{lid}."))
                 for lid in layer_ids
             )
         ]
