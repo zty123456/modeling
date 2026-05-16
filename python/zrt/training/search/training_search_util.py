@@ -306,7 +306,13 @@ class TrainingConfigManager:
         self._expand_auto_values_optimized(grid, target_ws)
 
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
+        
+        total_token_vals = grid.get("total_token", [])
+        has_total_token = total_token_vals and any(v is not None and v > 0 for v in total_token_vals)
+        
         other_keys = [k for k in grid.keys() if k not in parallel_keys and k != "world_size"]
+        if has_total_token and "seq_len" in other_keys:
+            other_keys.remove("seq_len")
 
         model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
@@ -361,7 +367,13 @@ class TrainingConfigManager:
         self._expand_auto_values_optimized(grid, target_ws)
 
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
+        
+        total_token_vals = grid.get("total_token", [])
+        has_total_token = total_token_vals and any(v is not None and v > 0 for v in total_token_vals)
+        
         other_keys = [k for k in grid.keys() if k not in parallel_keys and k != "world_size"]
+        if has_total_token and "seq_len" in other_keys:
+            other_keys.remove("seq_len")
 
         model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
@@ -400,6 +412,19 @@ class TrainingConfigManager:
         for other_vals in itertools.product(*other_grids):
             base_config = dict(zip(other_keys, other_vals))
             base_config["world_size"] = target_ws
+
+            total_token = base_config.get("total_token")
+            if total_token is not None and total_token > 0:
+                global_batch = base_config.get("global_batch", 0)
+                if global_batch > 0:
+                    seq_len = int(total_token / global_batch)
+                    base_config["seq_len"] = seq_len
+                    if model is not None:
+                        model.seq_len = seq_len
+            else:
+                seq_len = base_config.get("seq_len")
+                if seq_len is not None and model is not None:
+                    model.seq_len = seq_len
 
             for p_vals in self._enumerate_valid_parallel_configs(
                     grid, target_ws, model, system, base_config
@@ -745,7 +770,8 @@ if __name__ == "__main__":
         "dp": "auto",
         "micro_batch": [1, 16, 32],
         "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
-        "seq_len": [8192, 65536, 131072, 262144, 52488, 1048576],
+        "seq_len": [8192, 65536, 131072, 262144,52488,1048576],
+        "total_token": [536870912],
         "zero_stage": [1, 2, 3],
         "pp_schedule": ["dualpipev"],
         "vpp_chunks": [2, 4],
