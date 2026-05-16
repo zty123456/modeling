@@ -101,7 +101,16 @@ def total_comm_time(
     # DP gradient reduction (at step end)
     if strategy.dp > 1:
         P = _params_on_rank_for_dp(model, strategy)
-        grad_bytes = P * model.grad_dtype.bytes
+        # Routed expert grads stay in the EP group (no DP AR) when EP > 1.
+        # Subtract their per-rank contribution so the DP volume reflects only
+        # non-expert + shared-expert grads.
+        if strategy.ep > 1 and model.num_experts > 0:
+            from zrt.training.models.memory import _routed_expert_params_on_rank
+            P_expert_on_rank = _routed_expert_params_on_rank(model, strategy)
+            P_dp = max(0, P - P_expert_on_rank)
+        else:
+            P_dp = P
+        grad_bytes = int(P_dp * model.grad_dtype.bytes)
         dp_c = Collective(
             name="dp_grad_reduce", kind="AR" if strategy.zero_stage == 0 else "RS",
             group="DP", bytes_=grad_bytes, inserted_after="optimizer_step",
