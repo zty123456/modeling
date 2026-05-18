@@ -15,7 +15,7 @@ from zrt.training.models.flops import total_training_flops, forward_backward_flo
 from zrt.training.models.memory import MemBreakdown
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.report import TrainingReport
-from zrt.training.spec.strategy import Strategy
+from zrt.training.spec.strategy import Strategy, rank_product
 from zrt.training.spec.system import SystemSpec
 
 
@@ -58,7 +58,7 @@ def estimate(
         "model": f"hidden={model.hidden}, layers={len(model.layers)}, heads={model.num_heads}",
         "system": f"{system.gpu.name} x {system.world_size}",
         "strategy": f"TP={strategy.tp} CP={strategy.cp} PP={strategy.pp} EP={strategy.ep} DP={strategy.dp}",
-        "parallelism": f"TP*CP*PP*EP*DP = {strategy.tp * strategy.cp * strategy.pp * strategy.ep * strategy.dp}",
+        "parallelism": f"TP*CP*PP*DP = {rank_product(strategy.tp, strategy.cp, strategy.pp, strategy.ep, strategy.dp)} (EP={strategy.ep} shares ranks)",
         "micro_batch": strategy.micro_batch,
         "global_batch": strategy.global_batch,
         "num_microbatches": strategy.num_microbatches(),
@@ -91,6 +91,7 @@ def estimate(
         warnings=warnings,
         config_summary=config_summary,
         bubble_fraction=s.bubble_fraction,
+        bubble_time_ms=(s.warmup + s.cooldown) * 1000,
         schedule_name=s.schedule_name,
         warmup_steps=s.warmup_steps,
         cooldown_steps=s.cooldown_steps,
@@ -101,6 +102,7 @@ def estimate(
         dp_exposed_ms=s.dp_exposed * 1000,
         optimizer_time_ms=s.optimizer_time * 1000,
         optimizer_comm_ms=s.optimizer_comm * 1000,
+        optimizer_comm_hidden_ms=s.optimizer_comm_hidden * 1000,
         warmup_fwd_ms=s.warmup_fwd * 1000,
         warmup_bwd_ms=s.warmup_bwd * 1000,
         steady_fwd_ms=s.steady_fwd * 1000,
@@ -113,6 +115,8 @@ def estimate(
         compute_time_ms=s.compute_time * 1000,
         fwd_compute_ms=s.fwd_compute * 1000,
         bwd_compute_ms=s.bwd_compute * 1000,
+        recompute_time_ms=s.recompute_time * 1000,
+        recompute_time_raw_ms=s.recompute_time_raw * 1000,
         exposed_comm_ms=s.exposed_comm * 1000,
         tp_exposed_ms=s.tp_exposed * 1000,
         cp_exposed_ms=s.cp_exposed * 1000,
@@ -170,12 +174,16 @@ def grid_search(
 
 
 def pareto_frontier(reports: list[TrainingReport]) -> list[TrainingReport]:
-    """Extract Pareto frontier (step_time_ms, peak_hbm) with deterministic ordering.
+    """Extract Pareto frontier (step_time_ms, total_memory) with deterministic ordering.
 
     A config is on the Pareto frontier if no other config has both:
-      - lower step_time_ms AND lower peak_hbm
+      - lower step_time_ms AND lower total_memory
 
-    Deterministic ordering: sort by (step_time_ms, peak_hbm) to ensure
+    Note: total_memory is the algebraic sum of components (MemBreakdown.total),
+    not peak_overall which is the OOM-relevant metric. The frontier uses total
+    for consistency with the sorting behavior established in the codebase.
+
+    Deterministic ordering: sort by (step_time_ms, total_memory) to ensure
     reproducible frontier construction. When two configs have identical
     step_time and memory, the first one in sorted order is preferred.
 

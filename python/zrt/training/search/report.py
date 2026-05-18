@@ -20,12 +20,14 @@ def report_to_dict(report: Report) -> dict:
         "config_summary": report.config_summary,
         "schedule_name": report.schedule_name,
         "bubble_fraction": round(report.bubble_fraction, 4),
+        "bubble_time_ms": round(report.bubble_time_ms, 3),
         "warmup_ms": round(report.warmup_ms, 3),
         "steady_ms": round(report.steady_ms, 3),
         "cooldown_ms": round(report.cooldown_ms, 3),
         "dp_exposed_ms": round(report.dp_exposed_ms, 3),
         "optimizer_time_ms": round(report.optimizer_time_ms, 3),
         "optimizer_comm_ms": round(report.optimizer_comm_ms, 3),
+        "optimizer_comm_hidden_ms": round(report.optimizer_comm_hidden_ms, 3),
         "warmup_fwd_ms": round(report.warmup_fwd_ms, 3),
         "warmup_bwd_ms": round(report.warmup_bwd_ms, 3),
         "steady_fwd_ms": round(report.steady_fwd_ms, 3),
@@ -94,7 +96,7 @@ def report_summary(report: Report) -> str:
 
     lines.append(f"  Step time:  {report.step_time_ms:.1f} ms")
     lines.append(f"  Schedule:   {report.schedule_name}")
-    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}")
+    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}  ({report.bubble_time_ms:.1f} ms)")
     lines.append(f"  MFU:        {report.mfu:.1%}")
     lines.append(f"  HFU:        {report.hfu:.1%}")
 
@@ -133,6 +135,8 @@ def report_summary(report: Report) -> str:
             lines.append(f"  {'Optimizer (compute)':<38s} {report.optimizer_time_ms:>10.2f} {report.optimizer_time_ms/st*100:>7.1f}%")
         if report.optimizer_comm_ms > 0:
             lines.append(f"  {'Optimizer (comm)':<38s} {report.optimizer_comm_ms:>10.2f} {report.optimizer_comm_ms/st*100:>7.1f}%")
+        if report.optimizer_comm_hidden_ms > 0:
+            lines.append(f"  {'Optimizer (comm hidden)':<38s} {report.optimizer_comm_hidden_ms:>10.2f} {report.optimizer_comm_hidden_ms/st*100:>7.1f}%")
 
         lines.append(f"  {'─' * 38} {'─' * 10} {'─' * 8}")
         lines.append(f"  {'TOTAL STEP TIME':<38s} {st:>10.2f} {100.0:>7.1f}%")
@@ -167,6 +171,8 @@ def report_summary(report: Report) -> str:
             lines.append(f"  Per-microbatch (steady): FWD={report.steady_fwd_per_mb_ms:.2f}ms  BWD={report.steady_bwd_per_mb_ms:.2f}ms  Total={report.steady_per_mb_ms:.2f}ms  ({mb_count} microbatches)")
 
     # ── Memory ──────────────────────────────────────────────────────
+    # Note: to_gb() uses GiB (1024**3), while search surfaces use decimal GB (1e9).
+    # Difference is ~7%. peak_gb is the OOM-relevant metric (max of forward/backward/optimizer phases).
     if report.memory is not None:
         gb = report.memory.to_gb()
         lines.append("")
@@ -177,6 +183,7 @@ def report_summary(report: Report) -> str:
         lines.append(f"    activations: {gb['activations_gb']:.2f} GB")
         lines.append(f"    comm_buf:    {gb['comm_buffers_gb']:.2f} GB")
         lines.append(f"    TOTAL:       {gb['total_gb']:.2f} GB")
+        lines.append(f"    PEAK:        {gb['peak_gb']:.2f} GB  (OOM-relevant)")
 
     # ── Per-stage times ─────────────────────────────────────────────
     if report.per_stage:

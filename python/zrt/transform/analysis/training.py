@@ -398,6 +398,7 @@ class PipelineStepMetrics:
     cooldown_steps: int = 0
     steady_steps: int = 0
     bubble_fraction: float = 0.0
+    bubble_time_ms: float = 0.0  # Absolute pipeline bubble time in ms
     mfu: float = 0.0  # Model FLOPs Utilization
     hfu: float = 0.0  # Hardware FLOPs Utilization (includes recompute overhead)
     exposed_comm_ms: float = 0.0
@@ -414,6 +415,7 @@ class PipelineStepMetrics:
             "cooldown_steps": self.cooldown_steps,
             "steady_steps": self.steady_steps,
             "bubble_fraction": self.bubble_fraction,
+            "bubble_time_ms": self.bubble_time_ms,
             "mfu": self.mfu,
             "hfu": self.hfu,
             "exposed_comm_ms": self.exposed_comm_ms,
@@ -489,6 +491,42 @@ class TrainingPipelinePass(GraphPass):
 
                 stage_fwd[s_id] = fwd
                 stage_bwd[s_id] = bwd
+
+            # --- Fix: redistribute bwd when traced bwd ops lack layer annotations ---
+            # Real traced backward ops have layer='' (no module-context tracking during
+            # autograd), so PipelineParallelPass assigns all of them to stage_id=0.
+            # Step 1: if >85% of bwd time is in one stage, redistribute proportionally
+            # to fwd load (fwd stages correctly reflect per-layer cost ratios).
+            total_bwd_us = sum(stage_bwd.values())
+            if total_bwd_us > 0:
+                max_bwd = max(stage_bwd.values())
+                if max_bwd > 0.85 * total_bwd_us:
+                    total_fwd_us_inner = sum(stage_fwd.values())
+                    if total_fwd_us_inner > 0:
+                        for s in range(pp):
+                            stage_bwd[s] = total_bwd_us * stage_fwd.get(s, 0.0) / total_fwd_us_inner
+                    else:
+                        for s in range(pp):
+                            stage_bwd[s] = total_bwd_us / pp
+
+            # Step 2: homogeneous fallback when too few traced layers cover all pp stages.
+            # E.g. DeepSeek-V3 with --layers 4 traces only 2 representative layers but
+            # pp=4, so stages 2-3 are empty. Distribute total evenly across all stages.
+            stages_with_fwd = sum(1 for s in range(pp) if stage_fwd.get(s, 0.0) > 0)
+            if 0 < stages_with_fwd < pp:
+                total_fwd_us_h = sum(stage_fwd.values())
+                total_bwd_us_h = sum(stage_bwd.values())
+                per_fwd_h = total_fwd_us_h / pp
+                per_bwd_h = total_bwd_us_h / pp
+                logger.debug(
+                    "TrainingPipelinePass: %d/%d stages have fwd ops "
+                    "(too few traced layers for pp=%d); applying homogeneous fallback "
+                    "per_fwd=%.1fms per_bwd=%.1fms",
+                    stages_with_fwd, pp, pp, per_fwd_h / 1000, per_bwd_h / 1000,
+                )
+                for s in range(pp):
+                    stage_fwd[s] = per_fwd_h
+                    stage_bwd[s] = per_bwd_h
 
             g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
             g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
@@ -671,6 +709,7 @@ class TrainingPipelinePass(GraphPass):
             cooldown_steps=cooldown_steps,
             steady_steps=steady_steps,
             bubble_fraction=step_result.bubble_fraction,
+            bubble_time_ms=(step_result.warmup + step_result.cooldown) * 1000,
             mfu=min(mfu, 1.0),
             hfu=min(hfu, 1.0),
             exposed_comm_ms=exposed_comm_ms,

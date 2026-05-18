@@ -14,6 +14,11 @@ from typing import Any, Dict, List, Optional, Tuple, Generator
 import pandas as pd
 from tqdm import tqdm
 
+# Unit conventions:
+# - Search filtering uses decimal GB (/1e9) for consistency with max_memory_gb parameter
+# - report_to_dict() uses GiB (1024**3) via MemBreakdown.to_gb()
+# - Difference: 1000 bytes / 1e9 = 1.00 decimal GB, 1000 bytes / 1024**3 = 0.93 GiB (~7%)
+
 from zrt.hardware.registry import load as load_hw
 from zrt.training.io.config_loader import _parse_model, _parse_system, _parse_strategy
 from zrt.training.search.estimator import estimate
@@ -122,6 +127,7 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         cp_kind=CPKind(config.get("cp_kind", "none")),
         dualbatch=config.get("dualbatch", False),
         dp_overlap_in_bubble=config.get("dp_overlap_in_bubble", True),
+        dp_grad_buckets=config.get("dp_grad_buckets", 25),
     )
 
 
@@ -179,6 +185,7 @@ class TrainingConfigManager:
             cp_kind=CPKind(other_config.get("cp_kind", "none")),
             dualbatch=other_config.get("dualbatch", False),
             dp_overlap_in_bubble=other_config.get("dp_overlap_in_bubble", True),
+            dp_grad_buckets=other_config.get("dp_grad_buckets", 25),
         )
 
     def _expand_auto_values_optimized(self, grid: Dict[str, List[Any]], world_size: int) -> None:
@@ -547,14 +554,16 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["pp_exposed_ms"] = round(report.pp_exposed_ms, 2)
         d["dp_total_ms"] = round(report.dp_total_ms, 2)
         d["dp_exposed_ms"] = round(report.dp_exposed_ms, 2)
-        d["optimizer_time_ms(compute)"] = round(report.optimizer_time_ms, 2)
-        d["optimizer_comm_ms"] = round(report.optimizer_comm_ms, 2)
+        d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 2)
+        d["optimizer_comm_ms"] = round(report.optimizer_comm_ms + report.optimizer_comm_hidden_ms, 2)
+        d["optimizer_exposed_ms"] = round(report.optimizer_comm_ms, 2)
         d["step_time_ms"] = round(report.step_time_ms, 3)
         d["pipeline_time_ms"] = round(report.pipeline_time_ms, 3)
         d["mfu"] = round(report.mfu, 4)
         d["mfu_native"] = round(report.mfu_native, 4)
         d["hfu"] = round(report.hfu, 4)
         d["bubble_fraction"] = round(report.bubble_fraction, 4)
+        d["bubble_time_ms"] = round(report.bubble_time_ms, 2)
         d["tokens_per_sec"] = round(report.tokens_per_sec, 1)
         if report.memory:
             # Per-rank weight/grad/opt-state can drop to single-digit MB after
@@ -572,22 +581,16 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     if not df.empty:
         df = df.sort_values("mfu", ascending=False)
 
-    config_cols = [k for k in rows[0].keys() if k not in ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
-                                                          "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
-                                                          "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
-                                                          "dp_total_ms", "dp_exposed_ms", "optimizer_time_ms(compute)",
-                                                          "optimizer_comm_ms", "step_time_ms", "pipeline_time_ms",
-                                                          "mfu", "mfu_native", "hfu", "bubble_fraction", "tokens_per_sec",
-                                                          "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
-                                                          "comm_buffers_gb", "memory_gb"]] if rows else []
     metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
-                                                          "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
-                                                          "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
-                                                          "dp_total_ms", "dp_exposed_ms", "optimizer_time_ms(compute)",
-                                                          "optimizer_comm_ms", "step_time_ms", "pipeline_time_ms",
-                                                          "mfu", "mfu_native", "hfu", "bubble_fraction", "tokens_per_sec",
-                                                          "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
-                                                          "comm_buffers_gb", "memory_gb"]
+                   "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
+                   "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
+                   "dp_total_ms", "dp_exposed_ms",
+                   "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms",
+                   "step_time_ms", "pipeline_time_ms",
+                   "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",
+                   "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
+                   "comm_buffers_gb", "memory_gb"]
+    config_cols = [k for k in rows[0].keys() if k not in metric_cols] if rows else []
     cols = config_cols + [c for c in metric_cols if c in df.columns]
     df = df[[c for c in cols if c in df.columns]]
     return df

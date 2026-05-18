@@ -128,7 +128,7 @@ def test_zero_bubble_uses_weight_grad_to_reduce_bubble():
 
     t_stage = 0.03
     t_w = 0.01
-    expected = M * t_stage + (4 - 1) * (t_stage - t_w)
+    expected = M * t_stage + (4 - 1) * max(t_stage - 2 * t_w, 0.0)
     assert zb.step_time == pytest.approx(expected, rel=1e-9)
     f1b = OneF1BComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
     assert zb.bubble_fraction < f1b.bubble_fraction
@@ -150,5 +150,64 @@ def test_zero_bubble_uses_bottleneck_stage_weight_grad():
 
     bottleneck_stage = 0.04
     bottleneck_dw = 0.0
-    expected = M * bottleneck_stage + (4 - 1) * (bottleneck_stage - bottleneck_dw)
+    expected = M * bottleneck_stage + (4 - 1) * max(bottleneck_stage - 2 * bottleneck_dw, 0.0)
     assert zb.step_time == pytest.approx(expected, rel=1e-9)
+
+
+def test_dualpipe_pp2_zero_bubble():
+    """DualPipe pp=2: two anti-parallel streams perfectly fill each other — zero bubble."""
+    st = _make_stage_times(2)
+    s = _make_strategy(pp=2)
+    M = s.num_microbatches()
+
+    result = DualPipeComposer().compose(st, M, 2, 0.0, s)
+
+    assert result.bubble_fraction == pytest.approx(0.0, abs=1e-12)
+    assert result.warmup == pytest.approx(0.0, abs=1e-12)
+    assert result.cooldown == pytest.approx(0.0, abs=1e-12)
+
+
+def test_dualpipev_pp2_zero_bubble():
+    """DualPipeV pp=2: same zero-bubble property holds regardless of vpp_chunks."""
+    st = _make_stage_times(2)
+    s = _make_strategy(pp=2, vpp_chunks=2, schedule=PPSched.DUALPIPE_V)
+    M = s.num_microbatches()
+
+    result = DualPipeVComposer().compose(st, M, 2, 0.0, s)
+
+    assert result.bubble_fraction == pytest.approx(0.0, abs=1e-12)
+    assert result.warmup == pytest.approx(0.0, abs=1e-12)
+    assert result.cooldown == pytest.approx(0.0, abs=1e-12)
+
+
+def test_dualpipe_pp3_half_stage_bubble():
+    """DualPipe pp=3: odd pipeline degree produces half-stage bubble, not zero."""
+    st = _make_stage_times(3)
+    s = _make_strategy(pp=3)
+    M = s.num_microbatches()
+
+    result = DualPipeComposer().compose(st, M, 3, 0.0, s)
+
+    # pp=3: (3/2 - 1) = 0.5 stages of bubble, split evenly between warmup/cooldown
+    # Each stage is 0.03 ms (0.01 fwd + 0.02 bwd)
+    # Bubble = 0.5 * 0.03 = 0.015 ms, warmup = cooldown = 0.0075 ms
+    expected_bubble = 0.5 * 0.03  # half-stage bubble
+    assert result.bubble_fraction > 0.0  # Should NOT be zero
+    assert result.warmup == pytest.approx(expected_bubble / 2, abs=1e-9)
+    assert result.cooldown == pytest.approx(expected_bubble / 2, abs=1e-9)
+
+
+def test_dualpipev_pp3_half_stage_bubble():
+    """DualPipeV pp=3: odd pipeline degree produces half-stage bubble divided by V."""
+    st = _make_stage_times(3)
+    s = _make_strategy(pp=3, vpp_chunks=2, schedule=PPSched.DUALPIPE_V)
+    M = s.num_microbatches()
+
+    result = DualPipeVComposer().compose(st, M, 3, 0.0, s)
+
+    # pp=3, V=2: (3/2 - 1) / 2 = 0.25 stages of bubble
+    # Each stage is 0.03 ms, so bubble = 0.25 * 0.03 = 0.0075 ms
+    expected_bubble = (1.5 - 1) / 2 * 0.03  # (pp/2 - 1) / V * t_stage
+    assert result.bubble_fraction > 0.0  # Should NOT be zero
+    assert result.warmup == pytest.approx(expected_bubble / 2, abs=1e-9)
+    assert result.cooldown == pytest.approx(expected_bubble / 2, abs=1e-9)

@@ -178,7 +178,8 @@ def test_dualpipe_composer_reduces_bubble_vs_1f1b():
     dp = _run_pass(pp=4, pp_schedule="dualpipe")
     assert dp.step_time_ms < f1b.step_time_ms
     assert dp.bubble_fraction < f1b.bubble_fraction
-    assert dp.warmup_steps == 2 and dp.cooldown_steps == 2
+    # pp=4: warmup_steps = cooldown_steps = pp//2 - 1 = 1 (corrected formula)
+    assert dp.warmup_steps == 1 and dp.cooldown_steps == 1
 
 
 def test_dualpipev_composer_matches_or_beats_dualpipe():
@@ -197,7 +198,8 @@ def test_zero_bubble_uses_dw_split_to_reduce_dualpipe_bubble():
     M = 8
     t_stage_ms = 3.0
     t_w_ms = 1.0
-    expected_step_ms = M * t_stage_ms + (pp - 1) * (t_stage_ms - t_w_ms)
+    # Corrected formula: subtract 2*t_w instead of t_w
+    expected_step_ms = M * t_stage_ms + (pp - 1) * max(t_stage_ms - 2 * t_w_ms, 0.0)
 
     assert metadata["stage_timelines_bwd_dw"] == {
         0: pytest.approx(1000.0),
