@@ -669,7 +669,7 @@ class TrainingPipelinePass(GraphPass):
             return node.annotations.get("phase", "") in _BWD_PHASES
 
         fwd_compute_ms = sum(
-            n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
+            n.annotations.get("latency_us", 0.0)
             for n in g.nodes.values()
             if not _is_bwd_node(n) and n.category != "communication"
         ) / 1000.0

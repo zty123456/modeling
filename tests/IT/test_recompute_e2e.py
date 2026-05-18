@@ -83,6 +83,23 @@ def _excel_summary_map(path):
     return result
 
 
+def _sheet_rows(path, sheet_name):
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ws = wb[sheet_name]
+        header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        rows = []
+        for values in ws.iter_rows(min_row=2, values_only=True):
+            if not any(v is not None for v in values):
+                continue
+            rows.append(dict(zip(header, values)))
+        return rows
+    finally:
+        wb.close()
+
+
 def _header_index(header, prefix):
     for idx, name in enumerate(header):
         if str(name).startswith(prefix):
@@ -154,6 +171,25 @@ def full_excel(tmp_path_factory, full_all):
         training_summary=report,
     )
     return paths["excel"], graph, report
+
+
+@pytest.fixture(scope="module")
+def full_final_excel(tmp_path_factory, full_all):
+    from python.zrt.transform.exporter import export_training_graphs
+
+    report, ctx, transformed = full_all
+    graph = transformed["unified"]
+    recompute_ms = graph.metadata.get("recompute_compute_ms", 0.0)
+    assert recompute_ms > 0
+    out = tmp_path_factory.mktemp("recompute_full_final_report")
+    paths = export_training_graphs(
+        fwd_graph=graph,
+        bwd_graph=None,
+        ctx=ctx,
+        output_dir=out,
+        training_summary=report,
+    )
+    return paths["excel"], graph
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -283,16 +319,17 @@ class TestRecomputeE2E:
                    for n in g.nodes.values()
                    if n.annotations.get("phase") == phase)
 
-    def test_fwd_latency_unchanged(self, none_all, full_all, sel_all):
+    def test_fwd_latency_includes_checkpoint_memory(self, none_all, full_all, sel_all):
         u_none = none_all[2]["unified"]
         u_full = full_all[2]["unified"]
         u_sel  = sel_all[2]["unified"]
         f_none = self._phase_latency_sum(u_none, "fwd")
         f_full = self._phase_latency_sum(u_full, "fwd")
         f_sel  = self._phase_latency_sum(u_sel, "fwd")
-        # Forward phase should be identical — recompute doesn't change forward pass
-        assert f_none == f_full == f_sel, \
+        assert f_none <= f_sel <= f_full, \
             f"fwd latency differs: none={f_none} full={f_full} sel={f_sel}"
+        assert sum(n.annotations.get("checkpoint_memory_us", 0) for n in _forward_nodes(u_full)) > 0
+        assert sum(n.annotations.get("checkpoint_memory_us", 0) for n in _forward_nodes(u_none)) == 0
 
     def test_bwd_latency_full_greater_than_none(self, none_all, full_all):
         b_none = self._phase_latency_sum(none_all[2]["unified"], "bwd")
@@ -407,6 +444,62 @@ class TestRecomputeE2E:
         node_ids = {row[0] for row in rows[1:] if row and row[0] not in (None, "TOTAL")}
         for node_id in node_ids:
             assert not has_internal_recompute(graph.nodes[node_id])
+
+    def test_exported_forward_ops_show_checkpoint_memory(self, full_excel):
+        excel_path, graph, _report = full_excel
+        rows = _sheet_rows(excel_path, "Forward Operators")
+        for col in (
+            "Checkpoint Activation Bytes",
+            "Checkpoint Memory (us)",
+            "Final Latency (us)",
+        ):
+            assert col in rows[0]
+
+        recompute_rows = [
+            row for row in rows
+            if row["Node ID"] in graph.nodes
+            and graph.nodes[row["Node ID"]].annotations.get("checkpoint_activation_bytes", 0) > 0
+        ]
+        assert recompute_rows
+        assert any(float(row["Checkpoint Activation Bytes"] or 0) > 0 for row in recompute_rows)
+        assert any(float(row["Checkpoint Memory (us)"] or 0) > 0 for row in recompute_rows)
+        for row in recompute_rows[:20]:
+            node = graph.nodes[row["Node ID"]]
+            assert float(row["Final Latency (us)"]) == pytest.approx(
+                node.annotations.get("latency_us", 0.0),
+                abs=1e-3,
+            )
+
+    def test_exported_backward_ops_show_recompute_replay(self, full_excel):
+        excel_path, graph, _report = full_excel
+        rows = _sheet_rows(excel_path, "Backward Operators")
+        assert "Recompute Replay (us)" in rows[0]
+        assert "Final Latency (us)" in rows[0]
+
+        replay_rows = [
+            row for row in rows
+            if float(row.get("Recompute Replay (us)") or 0) > 0
+        ]
+        assert replay_rows
+        for row in replay_rows[:20]:
+            node = graph.nodes[row["Node ID"]]
+            replay = node.annotations.get("recompute_latency_us", 0.0)
+            final = node.annotations.get("latency_us", 0.0)
+            assert float(row["Recompute Replay (us)"]) == pytest.approx(replay, abs=1e-3)
+            assert float(row["Final Latency (us)"]) == pytest.approx(final, abs=1e-3)
+            assert final == pytest.approx(
+                node.annotations.get("base_latency_us", 0.0) + replay,
+                abs=1e-6,
+            )
+
+    def test_full_training_report_recompute_time_comes_from_graph(self, full_final_excel):
+        excel_path, graph = full_final_excel
+        summary = _excel_summary_map(excel_path)
+        assert "Recompute compute (ms)" in summary
+        assert float(summary["Recompute compute (ms)"]) == pytest.approx(
+            graph.metadata.get("recompute_compute_ms", 0.0),
+            abs=1e-3,
+        )
 
     def test_read_write_bytes_unchanged(self, none_all, full_all):
         u_none = none_all[2]["unified"]

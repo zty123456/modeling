@@ -212,12 +212,19 @@ class RooflinePass(GraphPass):
             recompute_flops = 0
             recompute_read_b = 0
             recompute_write_b = 0
+            checkpoint_activation_b = 0
 
             # Add external checkpoint replay overhead from fwd predecessors.
             # FA/SDPA attention cores already pay internal recompute inside
             # their backward kernel, so they are excluded from this replay.
             phase = node.annotations.get("phase", "fwd")
-            if phase in ("bwd", "backward", "train_backward") and ctx.training:
+            is_bwd = phase in ("bwd", "backward", "train_backward")
+            if ctx.training and not is_bwd and is_external_recompute_node(node):
+                checkpoint_activation_b = (
+                    sum(t.mem_bytes for t in node.inputs)
+                    or sum(t.mem_bytes for t in node.outputs)
+                )
+            if is_bwd and ctx.training:
                 for e in g.in_edges(node.id):
                     src_id = e.src
                     if src_id in g.nodes and is_external_recompute_node(g.nodes[src_id]):
@@ -228,7 +235,7 @@ class RooflinePass(GraphPass):
 
             flops = base_flops + recompute_flops
             read_b = base_read_b + recompute_read_b
-            write_b = base_write_b + recompute_write_b
+            write_b = base_write_b + recompute_write_b + checkpoint_activation_b
             total_b = read_b + write_b
 
             # Use activation input dtype for compute throughput (INT8/FP8 vs BF16)
@@ -252,6 +259,13 @@ class RooflinePass(GraphPass):
                 recompute_latency_us = max(recompute_compute_us, recompute_memory_us)
             else:
                 recompute_latency_us = 0.0
+            checkpoint_memory_us = (checkpoint_activation_b / bw * 1e6) if bw > 0 else 0.0
+            if is_bwd:
+                final_latency_us = base_latency_us + recompute_latency_us
+            elif compute_us > 0 or memory_us > 0:
+                final_latency_us = max(compute_us, memory_us, 1e-3)
+            else:
+                final_latency_us = 0.0
 
             ai = flops / total_b if total_b > 0 else math.inf
 
@@ -265,6 +279,8 @@ class RooflinePass(GraphPass):
             node.annotations["base_compute_us"]      = base_compute_us
             node.annotations["base_memory_us"]       = base_memory_us
             node.annotations["base_latency_us"]      = base_latency_us
+            node.annotations["checkpoint_activation_bytes"] = checkpoint_activation_b
+            node.annotations["checkpoint_memory_us"] = checkpoint_memory_us
             node.annotations["recompute_flops"]      = recompute_flops
             node.annotations["recompute_read_bytes"] = recompute_read_b
             node.annotations["recompute_write_bytes"] = recompute_write_b
@@ -275,7 +291,7 @@ class RooflinePass(GraphPass):
             node.annotations["bound"]                = bound
             # Respect pre-existing latency_us (e.g. from profiling or test injection)
             if "latency_us" not in node.annotations:
-                node.annotations["latency_us"] = max(compute_us, memory_us, 1e-3)
+                node.annotations["latency_us"] = final_latency_us
 
         return g
 

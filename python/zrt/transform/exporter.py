@@ -339,12 +339,15 @@ class TransformedGraphExcelWriter:
             ("Write Formula (sym)", 24),
             ("Write Formula (num)", 32),
             ("Activation (B)", 16),
+            ("Checkpoint Activation Bytes", 18),
+            ("Checkpoint Memory (us)", 18),
             # ── comm volume ───────────────────────────────────────────────────
             ("Comm Volume (B)", 14),
             # ── timing & bound ────────────────────────────────────────────────
             ("Compute (µs)", 12),
             ("Memory (µs)", 12),
             ("Total Latency (µs)", 14),
+            ("Final Latency (us)", 14),
             ("Bound", 10),
             ("Arith Intensity", 14),
             ("Annotations", 60),
@@ -425,11 +428,14 @@ class TransformedGraphExcelWriter:
                 formulas["write_sym"],
                 formulas["write_num"],
                 0 if node.annotations.get("recompute") else sum(t.mem_bytes for t in node.outputs),
+                node.annotations.get("checkpoint_activation_bytes", 0) or "",
+                round(node.annotations.get("checkpoint_memory_us", 0), 3) if node.annotations.get("checkpoint_memory_us") else "",
                 # comm
                 comm_vol,
                 # timing & bound
                 round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
                 round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 node.annotations.get("bound", ""),
                 round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
@@ -439,6 +445,8 @@ class TransformedGraphExcelWriter:
             # Choose fill color based on category
             if node.is_comm:
                 fill = self._comm_fill
+            elif node.annotations.get("checkpoint_activation_bytes", 0) > 0:
+                fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
             elif node.category == "memory":
                 fill = self._memory_fill
             else:
@@ -1238,7 +1246,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             self._write_backward_ops_sheet(wb, bwd_graph, ctx)
             self._write_recompute_sheet(wb, bwd_graph)
         if training_summary is not None:
-            self._write_training_summary_sheet(wb, training_summary, bwd_graph)
+            self._write_training_summary_sheet(wb, training_summary, bwd_graph or fwd_graph)
 
         wb.save(output_path)
         logger.info(f"Exported training graphs to {output_path}")
@@ -1277,6 +1285,8 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             ("Compute (µs)", 12),
             ("Memory (µs)", 12),
             ("Total Latency (µs)", 14),
+            ("Recompute Replay (us)", 18),
+            ("Final Latency (us)", 14),
             ("Bound", 10),
             ("Arith Intensity", 14),
         ]
@@ -1289,8 +1299,10 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") == "bwd"]
 
         for row_idx, node in enumerate(nodes_to_write, 2):
+            replay_us = node.annotations.get("recompute_latency_us", 0.0) or 0.0
             is_recompute = (
-                node.annotations.get("recompute", False)
+                replay_us > 0
+                or node.annotations.get("recompute", False)
                 or node.attrs.get("recompute", False)
             )
             fill = _recompute_fill if is_recompute else (
@@ -1324,6 +1336,8 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 comm_vol,
                 round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
                 round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
+                round(replay_us, 3) if replay_us else "",
                 round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 node.annotations.get("bound", ""),
                 round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
