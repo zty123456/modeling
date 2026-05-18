@@ -181,7 +181,7 @@ def export_estimate_excel(
         ["Pipeline", "", ""],
         ["Schedule", report.schedule_name, ""],
         ["Bubble Fraction", f"{report.bubble_fraction:.1%}", ""],
-        ["Bubble Time", f"{report.bubble_ms:.2f}", "ms"],
+        ["Bubble Time", f"{report.bubble_time_ms:.2f}", "ms"],
         ["Warmup Steps", str(report.warmup_steps) if report.warmup_steps > 0 else "N/A", ""],
         ["Steady Steps", str(report.steady_steps) if report.steady_steps > 0 else "N/A", ""],
         ["Cooldown Steps", str(report.cooldown_steps) if report.cooldown_steps > 0 else "N/A", ""],

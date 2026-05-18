@@ -91,7 +91,7 @@ def estimate(
         warnings=warnings,
         config_summary=config_summary,
         bubble_fraction=s.bubble_fraction,
-        bubble_ms=s.bubble * 1000,
+        bubble_time_ms=(s.warmup + s.cooldown) * 1000,
         schedule_name=s.schedule_name,
         warmup_steps=s.warmup_steps,
         cooldown_steps=s.cooldown_steps,

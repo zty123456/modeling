@@ -563,6 +563,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["mfu_native"] = round(report.mfu_native, 4)
         d["hfu"] = round(report.hfu, 4)
         d["bubble_fraction"] = round(report.bubble_fraction, 4)
+        d["bubble_time_ms"] = round(report.bubble_time_ms, 2)
         d["tokens_per_sec"] = round(report.tokens_per_sec, 1)
         if report.memory:
             # Per-rank weight/grad/opt-state can drop to single-digit MB after
@@ -586,7 +587,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
                    "dp_total_ms", "dp_exposed_ms",
                    "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms",
                    "step_time_ms", "pipeline_time_ms",
-                   "mfu", "mfu_native", "hfu", "bubble_fraction", "tokens_per_sec",
+                   "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",
                    "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
                    "comm_buffers_gb", "memory_gb"]
     config_cols = [k for k in rows[0].keys() if k not in metric_cols] if rows else []

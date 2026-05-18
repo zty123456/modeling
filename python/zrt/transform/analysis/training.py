@@ -398,6 +398,7 @@ class PipelineStepMetrics:
     cooldown_steps: int = 0
     steady_steps: int = 0
     bubble_fraction: float = 0.0
+    bubble_time_ms: float = 0.0  # Absolute pipeline bubble time in ms
     mfu: float = 0.0  # Model FLOPs Utilization
     hfu: float = 0.0  # Hardware FLOPs Utilization (includes recompute overhead)
     exposed_comm_ms: float = 0.0
@@ -412,6 +413,7 @@ class PipelineStepMetrics:
             "cooldown_steps": self.cooldown_steps,
             "steady_steps": self.steady_steps,
             "bubble_fraction": self.bubble_fraction,
+            "bubble_time_ms": self.bubble_time_ms,
             "mfu": self.mfu,
             "hfu": self.hfu,
             "exposed_comm_ms": self.exposed_comm_ms,
@@ -698,6 +700,7 @@ class TrainingPipelinePass(GraphPass):
             cooldown_steps=cooldown_steps,
             steady_steps=steady_steps,
             bubble_fraction=step_result.bubble_fraction,
+            bubble_time_ms=(step_result.warmup + step_result.cooldown) * 1000,
             mfu=min(mfu, 1.0),
             hfu=min(hfu, 1.0),
             exposed_comm_ms=exposed_comm_ms,

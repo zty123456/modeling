@@ -196,6 +196,7 @@ def estimate_training_from_graphs(
     cooldown_steps = pipeline_metrics.cooldown_steps if pipeline_metrics else 0
     steady_steps = pipeline_metrics.steady_steps if pipeline_metrics else 0
     bubble_fraction = pipeline_metrics.bubble_fraction if pipeline_metrics else 0.0
+    bubble_time_ms = pipeline_metrics.bubble_time_ms if pipeline_metrics else 0.0
     exposed_comm_ms = pipeline_metrics.exposed_comm_ms if pipeline_metrics else 0.0
     hidden_comm_ms = pipeline_metrics.hidden_comm_ms if pipeline_metrics else 0.0
     total_comm_ms = pipeline_metrics.total_comm_ms if pipeline_metrics else 0.0
@@ -237,6 +238,7 @@ def estimate_training_from_graphs(
         cooldown_steps=cooldown_steps,
         steady_steps=steady_steps,
         bubble_fraction=bubble_fraction,
+        bubble_time_ms=bubble_time_ms,
         total_params=total_params,
         fused_ops_summary=fused_ops_summary,
         exposed_comm_ms=exposed_comm_ms,

@@ -367,7 +367,10 @@ class DualPipeComposer(PipelineComposer):
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
         t_stage_max = t_fwd_max + t_bwd_max
 
-        bubble = (pp - 1) / 2.0 * t_stage_max
+        # Reference: DualPipe README formula (PP/2-1)*t_stage
+        # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
+        # pp=3: half-stage bubble (not floored to zero)
+        bubble = max(pp / 2 - 1, 0) * t_stage_max
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
@@ -386,8 +389,8 @@ class DualPipeComposer(PipelineComposer):
             cooldown=cooldown,
             dp_exposed=dp_exposed,
             schedule_name="dualpipe",
-            warmup_steps=max(1, -(-(pp - 1) // 2)),
-            cooldown_steps=max(1, -(-(pp - 1) // 2)),
+            warmup_steps=max(0, pp // 2 - 1),
+            cooldown_steps=max(0, pp // 2 - 1),
             warmup_fwd=warmup,
             warmup_bwd=0.0,
             steady_fwd=M * t_fwd_max,
@@ -425,7 +428,10 @@ class DualPipeVComposer(PipelineComposer):
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
         t_stage_max = t_fwd_max + t_bwd_max
 
-        bubble = (pp - 1) / (2.0 * V) * t_stage_max
+        # Reference: DualPipeV README formula (PP/2-1)/V*t_stage
+        # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
+        # pp=3: half-stage bubble (not floored to zero)
+        bubble = max(pp / 2 - 1, 0) / V * t_stage_max
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
@@ -444,8 +450,8 @@ class DualPipeVComposer(PipelineComposer):
             cooldown=cooldown,
             dp_exposed=dp_exposed,
             schedule_name="dualpipev",
-            warmup_steps=max(1, -(-(pp - 1) // (2 * V))),
-            cooldown_steps=max(1, -(-(pp - 1) // (2 * V))),
+            warmup_steps=max(0, (pp // 2 - 1 + V - 1) // V),
+            cooldown_steps=max(0, (pp // 2 - 1 + V - 1) // V),
             warmup_fwd=warmup,
             warmup_bwd=0.0,
             steady_fwd=M * t_fwd_max,
@@ -493,8 +499,12 @@ class ZeroBubbleComposer(PipelineComposer):
         # transition. We use 1e-6 s here as the minimum unit; callers that want
         # a hardware-derived floor can pass it in via stage_times comm_bwd already
         # baked into t_stage. This avoids the "0 bubble" artifact in search.
+        #
+        # Reference formula (F+B-2W) from DualPipe README: weight-gradient work
+        # (W) fills bubbles on BOTH forward and backward passes, so we subtract
+        # 2*t_w instead of t_w.
         ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6  # 2 µs P2P latency per pp transition
-        bubble = max((pp - 1) * max(t_stage - t_w, 0.0),
+        bubble = max((pp - 1) * max(t_stage - 2 * t_w, 0.0),
                      (pp - 1) * ZB_BUBBLE_FLOOR_PER_TRANSITION)
         warmup = bubble / 2.0
         steady = M * t_stage

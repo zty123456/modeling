@@ -81,7 +81,7 @@ class TrainingReport:
 
     # Pipeline metrics
     bubble_fraction: float = 0.0
-    bubble_ms: float = 0.0          # Absolute pipeline-idle time = warmup_ms + cooldown_ms
+    bubble_time_ms: float = 0.0   # Absolute pipeline bubble time in ms (= warmup_ms + cooldown_ms)
     schedule_name: str = "1f1b"
     warmup_steps: int = 0  # [Stack B]
     cooldown_steps: int = 0  # [Stack B]
@@ -192,7 +192,7 @@ class TrainingReport:
             "hfu": self.hfu,
             "total_flops": self.total_flops,
             "bubble_fraction": self.bubble_fraction,
-            "bubble_ms": self.bubble_ms,
+            "bubble_time_ms": self.bubble_time_ms,
             "schedule_name": self.schedule_name,
             "warmup_ms": self.warmup_ms,
             "steady_ms": self.steady_ms,
@@ -361,14 +361,13 @@ class TrainingReport:
             lines.append(f"Memory:   {total:.2f} GB/GPU{tail}")
 
         # ── Pipeline ──
-        bub = f"bubble {self.bubble_fraction:.1%} ({self.bubble_ms:.1f} ms)"
         if self.warmup_steps > 0 or self.steady_steps > 0 or self.cooldown_steps > 0:
             lines.append(
                 f"Pipeline: {self.warmup_steps}+{self.steady_steps}+{self.cooldown_steps} "
-                f"microbatches, {bub}"
+                f"microbatches, bubble {self.bubble_fraction:.1%} ({self.bubble_time_ms:.1f} ms)"
             )
-        elif self.bubble_fraction > 0 or self.bubble_ms > 0:
-            lines.append(f"Pipeline: {bub}")
+        elif self.bubble_fraction > 0:
+            lines.append(f"Pipeline: bubble {self.bubble_fraction:.1%} ({self.bubble_time_ms:.1f} ms)")
 
         # ── Recompute ──
         if self.recompute_time_raw_ms > 0 or self.recompute_time_ms > 0:

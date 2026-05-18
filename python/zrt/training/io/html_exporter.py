@@ -899,7 +899,7 @@ def export_estimate_html(
     html = html.replace("{title}", f"{model.hidden}d {len(model.layers)}L")
     html = html.replace("{json_data}", json_data)
     html = html.replace("{step_time_ms}", str(report.step_time_ms))
-    html = html.replace("{bubble_ms}", str(report.bubble_ms))
+    html = html.replace("{bubble_ms}", str(report.bubble_time_ms))
     html = html.replace("{recompute_ms}", str(report.recompute_time_ms))
     html = html.replace("{recompute_raw_ms}", str(report.recompute_time_raw_ms))
 

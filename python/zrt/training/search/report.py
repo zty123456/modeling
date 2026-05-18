@@ -20,6 +20,7 @@ def report_to_dict(report: Report) -> dict:
         "config_summary": report.config_summary,
         "schedule_name": report.schedule_name,
         "bubble_fraction": round(report.bubble_fraction, 4),
+        "bubble_time_ms": round(report.bubble_time_ms, 3),
         "warmup_ms": round(report.warmup_ms, 3),
         "steady_ms": round(report.steady_ms, 3),
         "cooldown_ms": round(report.cooldown_ms, 3),
@@ -95,7 +96,7 @@ def report_summary(report: Report) -> str:
 
     lines.append(f"  Step time:  {report.step_time_ms:.1f} ms")
     lines.append(f"  Schedule:   {report.schedule_name}")
-    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}")
+    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}  ({report.bubble_time_ms:.1f} ms)")
     lines.append(f"  MFU:        {report.mfu:.1%}")
     lines.append(f"  HFU:        {report.hfu:.1%}")
 
