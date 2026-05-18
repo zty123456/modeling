@@ -153,14 +153,20 @@ class CommInserterPass(GraphPass):
             dtype=DType.BF16,
         )
 
-        processed_scopes: set[str] = set()
+        processed_scopes: set[tuple[str, str]] = set()
         for node in ep_nodes:
             scope_root = _moe_scope_root(node.scope)
-            if scope_root in processed_scopes:
+            phase = node.annotations.get("phase", "")
+            scope_key = (scope_root, phase)
+            if scope_key in processed_scopes:
                 continue
-            processed_scopes.add(scope_root)
+            processed_scopes.add(scope_key)
 
-            block = [n for n in ep_nodes if _moe_scope_root(n.scope) == scope_root]
+            block = [
+                n for n in ep_nodes
+                if _moe_scope_root(n.scope) == scope_root
+                and n.annotations.get("phase", "") == phase
+            ]
             first, last = block[0], block[-1]
             # If first node is a GroupedMM gate_up, the block exit is the linked down node
             down_id = first.annotations.get("ep_block_down_id")

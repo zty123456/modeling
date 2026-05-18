@@ -120,16 +120,18 @@ class ExpertGroupedMMPass(GraphPass):
 
     def _fuse_experts(self, g: "OpGraph", num_experts: int, ep: int,
                       ctx: "TransformContext") -> None:
-        # Group expert nodes by MoE layer (forward-phase only)
-        expert_nodes = [n for n in g.topo_sort() if _is_routed_expert(n)
-                        and n.annotations.get("phase", "fwd") not in
-                        ("bwd", "backward", "train_backward")]
+        # Group expert nodes by MoE layer and phase. Forward and backward use
+        # different report-level GroupedMM shapes and ordering.
+        expert_nodes = [n for n in g.topo_sort() if _is_routed_expert(n)]
         if not expert_nodes:
             return
 
-        layers: dict[str, list[OpNode]] = {}
+        layers: dict[tuple[str, str], list[OpNode]] = {}
         for n in expert_nodes:
-            layers.setdefault(_layer_key(n), []).append(n)
+            phase = n.annotations.get("phase", "fwd")
+            if phase in ("backward", "train_backward"):
+                phase = "bwd"
+            layers.setdefault((_layer_key(n), phase), []).append(n)
 
         experts_per_rank = num_experts // ep
         seq = g.metadata.get("seq_len", 128)
@@ -141,7 +143,15 @@ class ExpertGroupedMMPass(GraphPass):
         M = max(1, (total_routed_tokens + num_experts - 1) // num_experts)
         G = experts_per_rank
 
-        for layer_key, nodes in layers.items():
+        for (layer_key, phase), nodes in layers.items():
+            if phase == "bwd":
+                self._fuse_backward_layer(
+                    g, layer_key, nodes, G, M, tokens_per_rank, hidden)
+                continue
+
+            if phase not in ("fwd", "forward", "train_forward"):
+                continue
+
             gates, ups, downs, activations = [], [], [], []
             for n in nodes:
                 if not _is_expert_matmul(n):
@@ -254,3 +264,86 @@ class ExpertGroupedMMPass(GraphPass):
                 g.edges.append(Edge(down_id, e.src_idx, e.dst, e.dst_idx, e.tensor))
 
             g._rebuild_adjacency()
+
+    def _fuse_backward_layer(self, g: "OpGraph", layer_key: str, nodes: list[OpNode],
+                             G: int, M: int, tokens_per_rank: int,
+                             hidden: int) -> None:
+        gates, ups, downs = [], [], []
+        for n in nodes:
+            if not _is_expert_matmul(n):
+                continue
+            w = _expert_weight_name(n.scope)
+            if w in ("w1", "gate_proj"):
+                gates.append(n)
+            elif w in ("w3", "up_proj"):
+                ups.append(n)
+            elif w in ("w2", "down_proj"):
+                downs.append(n)
+
+        if not gates or not ups or not downs:
+            return
+
+        H = downs[0].inputs[0].shape[-1] if downs[0].inputs else hidden
+        ffn = downs[0].outputs[0].shape[-1] if downs[0].outputs else (
+            gates[0].inputs[0].shape[-1] if gates[0].inputs else 3072)
+        old_ids = {n.id for n in nodes}
+
+        in_edges = [e for e in g.edges if e.dst in old_ids and e.src not in old_ids]
+        if not in_edges:
+            return
+
+        down_id = f"{layer_key.replace('.','_')}_grouped_down_bwd"
+        down = _make_grouped_mm(
+            down_id, f"{layer_key}.moe",
+            [
+                TensorMeta.from_shape_dtype("grouped_down_bwd_in", (G, M, H), DType.BF16),
+                _weight_tensor("grouped_down_bwd_weight", (G, H, ffn), DType.BF16),
+            ],
+            [TensorMeta.from_shape_dtype("grouped_down_bwd_out", (G, M, ffn), DType.BF16)],
+            downs[0],
+        )
+        down.component = "moe.grouped_down_bwd"
+        down.annotations["phase"] = "bwd"
+        down.annotations["grouped_mm_role"] = "down_bwd"
+        down.annotations["ep_tokens_per_rank"] = tokens_per_rank
+        down.annotations["ep_tokens_per_expert"] = M
+        down.annotations.pop("recompute", None)
+
+        gate_up_id = f"{layer_key.replace('.','_')}_grouped_gate_up_bwd"
+        gate_up = _make_grouped_mm(
+            gate_up_id, f"{layer_key}.moe",
+            [
+                TensorMeta.from_shape_dtype("grouped_gate_up_bwd_in", (G, M, ffn), DType.BF16),
+                _weight_tensor("grouped_gate_up_bwd_weight", (G, ffn, ffn * 2), DType.BF16),
+            ],
+            [TensorMeta.from_shape_dtype("grouped_gate_up_bwd_out", (G, M, ffn * 2), DType.BF16)],
+            gates[0],
+        )
+        gate_up.component = "moe.grouped_gate_up_bwd"
+        gate_up.annotations["phase"] = "bwd"
+        gate_up.annotations["grouped_mm_role"] = "gate_up_bwd"
+        gate_up.annotations["ep_tokens_per_rank"] = tokens_per_rank
+        gate_up.annotations["ep_tokens_per_expert"] = M
+        gate_up.annotations.pop("ep_needs_a2a", None)
+        gate_up.annotations.pop("ep_experts_local", None)
+        gate_up.annotations.pop("recompute", None)
+
+        g.edges = [e for e in g.edges if e.src not in old_ids and e.dst not in old_ids]
+        for nid in old_ids:
+            g.nodes.pop(nid, None)
+
+        g.nodes[down_id] = down
+        g.nodes[gate_up_id] = gate_up
+
+        down.annotations["ep_block_down_id"] = gate_up_id
+
+        seen_src = set()
+        for e in in_edges:
+            key = (e.src, e.dst_idx)
+            if key not in seen_src:
+                seen_src.add(key)
+                g.edges.append(Edge(e.src, e.src_idx, down_id, e.dst_idx, e.tensor))
+
+        g.edges.append(Edge(down_id, 0, gate_up_id, 0, down.outputs[0]))
+
+        g._rebuild_adjacency()

@@ -251,7 +251,7 @@ class TestEPE2E:
         G = _NUM_EXPERTS // _EP
         M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
         for n in t["unified"].nodes.values():
-            if n.op_type != "GroupedMatMul":
+            if n.op_type != "GroupedMatMul" or n.annotations.get("phase") != "fwd":
                 continue
             role = n.annotations["grouped_mm_role"]
             if role == "gate_up":
@@ -264,6 +264,28 @@ class TestEPE2E:
                 assert n.outputs[0].shape == (G, M, _HIDDEN)
             else:
                 pytest.fail(f"Unknown GroupedMM role: {role}")
+
+    def test_backward_grouped_mm_shapes_match_dsv4_experts(self, ep8_all):
+        _, _, t = ep8_all
+        G = _NUM_EXPERTS // _EP
+        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        bwd = [
+            n for n in t["unified"].nodes.values()
+            if n.op_type == "GroupedMatMul"
+            and n.annotations.get("phase") == "bwd"
+        ]
+        roles = {n.annotations.get("grouped_mm_role") for n in bwd}
+        assert {"down_bwd", "gate_up_bwd"} <= roles
+        for n in bwd:
+            role = n.annotations["grouped_mm_role"]
+            if role == "down_bwd":
+                assert n.inputs[0].shape == (G, M, _HIDDEN)
+                assert n.inputs[1].shape == (G, _HIDDEN, _MOE_INTERMEDIATE)
+                assert n.outputs[0].shape == (G, M, _MOE_INTERMEDIATE)
+            elif role == "gate_up_bwd":
+                assert n.inputs[0].shape == (G, M, _MOE_INTERMEDIATE)
+                assert n.inputs[1].shape == (G, _MOE_INTERMEDIATE, _MOE_INTERMEDIATE * 2)
+                assert n.outputs[0].shape == (G, M, _MOE_INTERMEDIATE * 2)
 
     def test_shared_expert_not_grouped(self, ep8_all):
         _, _, t = ep8_all
@@ -399,6 +421,31 @@ class TestEPE2E:
             assert str((G, M, _MOE_INTERMEDIATE)) in str(down["Input Shapes"])
             assert str((G, _MOE_INTERMEDIATE, _HIDDEN)) in str(down["Input Shapes"])
             assert str((G, M, _HIDDEN)) in str(down["Output Shapes"])
+
+    def test_exported_excel_backward_grouped_mm_shapes_and_order(self, ep8_artifacts):
+        rows = _sheet_rows(ep8_artifacts["excel"], "Backward Operators")
+        ids = [str(r["Node ID"]) for r in rows]
+        grouped = {str(r["Node ID"]): r for r in rows if r["Op Type"] == "GroupedMatMul"}
+        G = _NUM_EXPERTS // _EP
+        M = _BATCH * _SEQ_LEN * _MOE_ACTIVE // _NUM_EXPERTS
+        for layer in range(4):
+            prefix = f"transformer_layers_{layer}_ffn"
+            expected = [
+                f"comm_a2a_dispatch_{prefix}_grouped_down_bwd",
+                f"{prefix}_grouped_down_bwd",
+                f"{prefix}_grouped_gate_up_bwd",
+                f"comm_a2a_combine_{prefix}_grouped_gate_up_bwd",
+            ]
+            positions = [ids.index(x) for x in expected]
+            assert positions == sorted(positions), list(zip(expected, positions))
+            down = grouped[f"{prefix}_grouped_down_bwd"]
+            gate_up = grouped[f"{prefix}_grouped_gate_up_bwd"]
+            assert str((G, M, _HIDDEN)) in str(down["Input Shapes"])
+            assert str((G, _HIDDEN, _MOE_INTERMEDIATE)) in str(down["Input Shapes"])
+            assert str((G, M, _MOE_INTERMEDIATE)) in str(down["Output Shapes"])
+            assert str((G, M, _MOE_INTERMEDIATE)) in str(gate_up["Input Shapes"])
+            assert str((G, _MOE_INTERMEDIATE, _MOE_INTERMEDIATE * 2)) in str(gate_up["Input Shapes"])
+            assert str((G, M, _MOE_INTERMEDIATE * 2)) in str(gate_up["Output Shapes"])
 
     def test_exported_excel_ep_forward_order(self, ep8_artifacts):
         rows = _sheet_rows(ep8_artifacts["excel"], "Forward Operators")

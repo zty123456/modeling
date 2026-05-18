@@ -175,6 +175,47 @@ def test_comm_inserter_rewires_successors():
     assert g3.num_nodes() == g2.num_nodes() + 1   # one comm node added
 
 
+def test_comm_inserter_inserts_ep_a2a_per_phase():
+    fwd_gate = _linear_node("layer0_grouped_gate_up", "layer.0.ffn.moe", (2, 8), (2, 16))
+    fwd_down = _linear_node("layer0_grouped_down", "layer.0.ffn.moe", (2, 16), (2, 8))
+    bwd_down = _linear_node("layer0_grouped_down_bwd", "layer.0.ffn.moe", (2, 8), (2, 16))
+    bwd_gate = _linear_node("layer0_grouped_gate_up_bwd", "layer.0.ffn.moe", (2, 16), (2, 32))
+    fwd_gate.annotations.update({
+        "phase": "fwd",
+        "ep_needs_a2a": True,
+        "ep_block_down_id": "layer0_grouped_down",
+    })
+    fwd_down.annotations["phase"] = "fwd"
+    bwd_down.annotations.update({
+        "phase": "bwd",
+        "ep_needs_a2a": True,
+        "ep_block_down_id": "layer0_grouped_gate_up_bwd",
+    })
+    bwd_gate.annotations["phase"] = "bwd"
+    g = OpGraph(
+        name="ep_phase_comm",
+        phase="train",
+        nodes={n.id: n for n in (fwd_gate, fwd_down, bwd_down, bwd_gate)},
+        edges=[
+            Edge("layer0_grouped_gate_up", 0, "layer0_grouped_down", 0, fwd_gate.outputs[0]),
+            Edge("layer0_grouped_down_bwd", 0, "layer0_grouped_gate_up_bwd", 0, bwd_down.outputs[0]),
+        ],
+        metadata={"seq_len": 2, "hidden": 8},
+    )
+
+    out = CommInserterPass().run(g, _ctx(ep=8))
+
+    expected = {
+        "comm_a2a_dispatch_layer0_grouped_gate_up": "fwd",
+        "comm_a2a_combine_layer0_grouped_down": "fwd",
+        "comm_a2a_dispatch_layer0_grouped_down_bwd": "bwd",
+        "comm_a2a_combine_layer0_grouped_gate_up_bwd": "bwd",
+    }
+    for node_id, phase in expected.items():
+        assert node_id in out.nodes
+        assert out.nodes[node_id].annotations["phase"] == phase
+
+
 # ── StreamAssignPass ──────────────────────────────────────────────────────────
 
 def test_stream_assign_all_nodes_get_stream():

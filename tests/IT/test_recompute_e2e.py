@@ -20,8 +20,25 @@ _HIDDEN, _SEQ, _LAYERS, _BATCH = 7168, 128, 4, 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# fixtures
+# E2E fixtures (self-contained)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _capture_model():
+    from python.zrt.pipeline import run_trace_phases
+    try:
+        return run_trace_phases(
+            model_id="hf_models/deepseek_v4",
+            num_layers=4, batch_size=1, seq_len=128,
+            phases=("train_forward", "train_backward"),
+        )
+    except AssertionError as e:
+        if "Mixing fake modes" in str(e):
+            pytest.skip("FakeTensorMode already in use by another test module")
+        raise
+
+@pytest.fixture(scope="session")
+def captured_model():
+    return _capture_model()
 
 def _run_estimate(policy, captured_model):
     from python.zrt.transform.analysis import estimate_training_from_graphs
