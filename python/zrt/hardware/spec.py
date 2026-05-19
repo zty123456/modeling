@@ -130,7 +130,10 @@ class LinkSpec:
         if base <= 0.0:
             return 0.0
         if self.topology_class == "switched_tree" and self.oversubscription > 1.0:
-            radix = self.num_devices if self.num_devices > 0 else group_size
+            # num_devices <= 0 means "cluster-scale, no non-blocking bound"
+            # (inter-node fat-tree convention): the whole link IS the
+            # over-subscribed spine, so any group crosses it → radix 0.
+            radix = self.num_devices if self.num_devices > 0 else 0
             if group_size > radix:
                 return base / self.oversubscription
         return base

@@ -285,6 +285,18 @@ def test_oversubscription_derates_only_beyond_radix():
     assert link.effective_bw_bps(64) == pytest.approx(base / 4.0)  # beyond radix
 
 
+def test_oversubscription_applies_on_unbounded_inter_link():
+    """Inter-node fat_tree convention uses num_devices=0 (cluster-scale, no
+    non-blocking bound): the whole link is the over-subscribed spine, so the
+    derate must apply for ANY group size (regression for the radix=group_size
+    fallback that made oversubscription a no-op on exactly these links)."""
+    link = LinkSpec(type="RoCE", bandwidth_gbps=200, latency_us=5.0,
+                    topology="fat_tree", num_devices=0, oversubscription=4.0)
+    base = 200e9 / 8 * 0.7
+    assert link.effective_bw_bps(2) == pytest.approx(base / 4.0)
+    assert link.effective_bw_bps(512) == pytest.approx(base / 4.0)
+
+
 def test_clos_does_not_degrade_with_domain_size():
     """clos is non-blocking (default oversubscription=1.0): bandwidth is
     independent of parallel-domain size, yet latency still uses the
