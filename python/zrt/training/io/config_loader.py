@@ -233,6 +233,8 @@ def _parse_system(d: dict) -> SystemSpec:
         overlap_ratio=dict(hw.compute.overlap_ratio),
         sram_kb_per_sm=hw.compute.sram_kb_per_sm,
         ep_overlap_waves=hw.compute.ep_overlap_waves,
+        compute_efficiency=hw.compute.compute_efficiency,
+        mem_bw_efficiency=hw.memory.mem_bw_efficiency,
     )
     return SystemSpec(
         gpu=gpu,

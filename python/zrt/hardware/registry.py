@@ -112,6 +112,10 @@ def _parse_compute(c: dict[str, Any]) -> ComputeSpec:
         overlap_ratio={k: float(v) for k, v in overlap_raw.items()},
         sram_kb_per_sm=float(c.get("sram_kb_per_sm", 0.0)),
         ep_overlap_waves=int(c.get("ep_overlap_waves", 0)),
+        compute_efficiency=(
+            float(c["compute_efficiency"])
+            if c.get("compute_efficiency") is not None else None
+        ),
     )
 
 
@@ -130,6 +134,10 @@ def _parse_memory(m: dict[str, Any]) -> MemorySpec:
         hbm_bandwidth_gbps=float(m.get("hbm_bandwidth_gbps", 0.0)),
         l2_cache_mb=float(m.get("l2_cache_mb", 0.0)),
         tiers=tiers,
+        mem_bw_efficiency=(
+            float(m["mem_bw_efficiency"])
+            if m.get("mem_bw_efficiency") is not None else None
+        ),
     )
 
 
@@ -165,4 +173,6 @@ def _parse_link(lk: dict[str, Any]) -> LinkSpec:
         latency_us=float(lk.get("latency_us", 0.0)),
         topology=lk.get("topology", "point_to_point"),
         num_devices=int(lk.get("num_devices", 1)),
+        kb_efficiency=float(lk.get("kb_efficiency", 0.7)),
+        oversubscription=float(lk.get("oversubscription", 1.0)),
     )

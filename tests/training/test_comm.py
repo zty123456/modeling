@@ -30,9 +30,9 @@ def test_p2p_time():
     c = Collective("test_p2p", "P2P", "PP", 1024 * 1024, "op1")  # 1 MB
     t = collective_time(c, 2, link)
     assert t > 0
-    # alpha = 1us, beta = 1/(900e9/8) = 1/(112.5e9) ≈ 8.89e-12 s/byte
-    # S = 1MB = 1048576 bytes
-    expected = 1e-6 + 1048576 / (900e9 / 8)
+    # alpha = 1us; beta uses the unified effective bandwidth (peak ×
+    # kb_efficiency). S = 1MB = 1048576 bytes.
+    expected = 1e-6 + 1048576 / link.effective_bw_bps(2)
     assert t == pytest.approx(expected, rel=0.01)
 
 
@@ -48,8 +48,8 @@ def test_ag_time():
     c = Collective("test_ag", "AG", "TP", S, "op1")
     t = collective_time(c, N, link)
 
-    alpha = 1e-6
-    beta = 1.0 / (900e9 / 8)
+    alpha = 1e-6  # all_to_all → switched_full → single-step latency
+    beta = 1.0 / link.effective_bw_bps(N)
     expected = alpha + S * (N - 1) / N * beta
     assert t == pytest.approx(expected, rel=0.01)
 
@@ -77,7 +77,7 @@ def test_a2a_time():
     t = collective_time(c, N, link)
 
     alpha = 1e-6
-    beta = 1.0 / (900e9 / 8)
+    beta = 1.0 / link.effective_bw_bps(N)
     expected = alpha + S * (N - 1) / N * beta
     assert t == pytest.approx(expected, rel=0.01)
 
@@ -166,7 +166,7 @@ def test_a2a_large_n_uses_log2_latency():
     t = collective_time(c, N, link)
 
     # Bandwidth term: (N-1)/N * S * β ≈ S * β for large N
-    beta = 1.0 / (400e9 / 8)
+    beta = 1.0 / link.effective_bw_bps(N)
     bandwidth = (N - 1) / N * S * beta
     # Latency: log2(384) ≈ 9 rounds × 2µs = 18 µs
     expected_max = 12 * 2e-6 + bandwidth  # allow ceil + small margin
@@ -220,8 +220,107 @@ def test_a2a_small_n_keeps_legacy_formula():
     c = Collective("test_a2a", "A2A", "TP", S, "op1")
     t = collective_time(c, N, link)
     alpha = 1e-6
-    beta = 1.0 / (900e9 / 8)
-    expected_legacy = (N - 1) * (alpha + (S / N) * beta)
+    beta = 1.0 / link.effective_bw_bps(N)
+    expected_legacy = (N - 1) * alpha + S * (N - 1) / N * beta
     assert t == pytest.approx(expected_legacy, rel=1e-3), (
         f"Small N should keep legacy formula; got {t} vs {expected_legacy}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1/P2: topology-class dispatch, kb_efficiency, oversubscription
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_switched_tree_uses_log2_latency_vs_ring():
+    """fat_tree/clos (switched_tree) AG latency = ceil(log2 N)·α, far below
+    ring's (N-1)·α for large N."""
+    import math
+    S = 64 * 1024 * 1024
+    N = 64
+    tree = LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree")
+    ring = LinkSpec(type="x", bandwidth_gbps=400, latency_us=5.0, topology="ring")
+    c = Collective("c", "AG", "DP", S, "op1")
+    t_tree = collective_time(c, N, tree)
+    t_ring = collective_time(c, N, ring)
+
+    alpha = 5e-6
+    # Same bandwidth term (both kb_efficiency=0.7, no oversub) → latency only.
+    lat_tree = t_tree - S * (N - 1) / N / tree.effective_bw_bps(N)
+    lat_ring = t_ring - S * (N - 1) / N / ring.effective_bw_bps(N)
+    assert lat_tree == pytest.approx(math.ceil(math.log2(N)) * alpha, rel=1e-6)
+    assert lat_ring == pytest.approx((N - 1) * alpha, rel=1e-6)
+    assert t_tree < t_ring
+
+
+def test_unknown_topology_falls_back_to_ring():
+    """Unknown topology must behave exactly like ring ((N-1)-step latency)."""
+    S = 8 * 1024 * 1024
+    N = 16
+    unk = LinkSpec(type="x", bandwidth_gbps=200, latency_us=3.0, topology="weird_fabric")
+    ring = LinkSpec(type="x", bandwidth_gbps=200, latency_us=3.0, topology="ring")
+    c = Collective("c", "AR", "DP", S, "op1")
+    assert unk.topology_class == "ring"
+    assert collective_time(c, N, unk) == pytest.approx(
+        collective_time(c, N, ring), rel=1e-12
+    )
+
+
+def test_kb_efficiency_scales_bandwidth():
+    """effective_bw_bps = peak/8 × kb_efficiency; halving kb halves bw."""
+    full = LinkSpec(type="x", bandwidth_gbps=800, latency_us=1.0,
+                    topology="full_mesh", kb_efficiency=0.7)
+    half = LinkSpec(type="x", bandwidth_gbps=800, latency_us=1.0,
+                    topology="full_mesh", kb_efficiency=0.35)
+    assert full.effective_bw_bps(8) == pytest.approx(800e9 / 8 * 0.7)
+    assert full.effective_bw_bps(8) == pytest.approx(2 * half.effective_bw_bps(8))
+
+
+def test_oversubscription_derates_only_beyond_radix():
+    """switched_tree with oversubscription>1: bw derated only when the
+    parallel domain exceeds the non-blocking radix (num_devices)."""
+    link = LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0,
+                    topology="fat_tree", num_devices=8, oversubscription=4.0)
+    base = 400e9 / 8 * 0.7
+    assert link.effective_bw_bps(8) == pytest.approx(base)        # within radix
+    assert link.effective_bw_bps(64) == pytest.approx(base / 4.0)  # beyond radix
+
+
+def test_clos_does_not_degrade_with_domain_size():
+    """clos is non-blocking (default oversubscription=1.0): bandwidth is
+    independent of parallel-domain size, yet latency still uses the
+    switched_tree log2 law."""
+    clos = LinkSpec(type="x", bandwidth_gbps=400, latency_us=5.0,
+                    topology="clos", num_devices=8)
+    assert clos.topology_class == "switched_tree"
+    assert clos.effective_bw_bps(8) == pytest.approx(clos.effective_bw_bps(512))
+
+
+def test_effective_flops_override_precedence():
+    """GPU.compute_efficiency overrides the size-bucket heuristic; None keeps it."""
+    from zrt.training.io.perf_tables import effective_flops, achieved_flops_efficiency
+    from zrt.training.spec.dtype import Dtype
+
+    flops = 5e10
+    g_heur = GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350)
+    g_over = GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80,
+                 hbm_bw_gbps=3350, compute_efficiency=0.9)
+    peak = 989e12
+    assert effective_flops(g_heur, Dtype.BF16, flops) == pytest.approx(
+        peak * achieved_flops_efficiency("h100", Dtype.BF16, flops)
+    )
+    assert effective_flops(g_over, Dtype.BF16, flops) == pytest.approx(peak * 0.9)
+
+
+def test_effective_hbm_bw_override_precedence():
+    from zrt.training.io.perf_tables import (
+        effective_hbm_bw_bps, achieved_bandwidth_efficiency,
+    )
+    bytes_ = 5e7
+    g_heur = GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350)
+    g_over = GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80,
+                 hbm_bw_gbps=3350, mem_bw_efficiency=0.55)
+    bw = 3350e9
+    assert effective_hbm_bw_bps(g_heur, bytes_) == pytest.approx(
+        bw * achieved_bandwidth_efficiency("h100", bytes_)
+    )
+    assert effective_hbm_bw_bps(g_over, bytes_) == pytest.approx(bw * 0.55)

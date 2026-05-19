@@ -18,7 +18,7 @@ from zrt.training.models.optimizer import (
     muon_step_flops_from_arch,
     adam_step_flops,
 )
-from zrt.training.io.perf_tables import achieved_flops_efficiency
+from zrt.training.io.perf_tables import effective_flops
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import PPSched, Strategy, resolve_muon_ns_steps
@@ -876,12 +876,12 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
         muon_flops = muon_step_flops_from_arch(model, strategy, K, f_muon)
         adam_flops = adam_step_flops(int(P * (1 - f_muon)))
         flops = muon_flops + adam_flops
-        eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
-        return flops / (peak_flops * eff) if eff > 0 else 0.0
+        eff_flops = effective_flops(gpu, Dtype.BF16, flops)
+        return flops / eff_flops if eff_flops > 0 else 0.0
     else:
         flops = adam_step_flops(P)
-        eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
-        return flops / (peak_flops * eff) if eff > 0 else 0.0
+        eff_flops = effective_flops(gpu, Dtype.BF16, flops)
+        return flops / eff_flops if eff_flops > 0 else 0.0
 
 
 def _compute_optimizer_comm_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
@@ -929,6 +929,9 @@ def compute_mfu(
     actual_flops = total_training_flops(graph, model, strategy, system)
     # models sharded computation; cluster-wide FLOPs = per_gpu × world_size,
     # and cluster peak = per_gpu_peak × world_size — the world_size cancels).
+    # NOTE: raw theoretical peak by definition — MFU is achieved-vs-peak.
+    # Do NOT route through effective_flops (would double-count the
+    # utilization already reflected in step_time).
     peak = system.gpu.flops_bf16 * 1e12
 
     # Divide by PP because total_training_flops includes ALL layer FLOPs,
@@ -953,6 +956,8 @@ def compute_hfu(
 
     # Peak FLOP/s of single GPU (total_flops is per-GPU because the graph
     rc_overhead = recompute_overhead_flops(graph, model, strategy, system)
+    # NOTE: raw theoretical peak by definition (see compute_mfu) — excluded
+    # from the unified effective_flops entry.
     peak = system.gpu.flops_bf16 * 1e12
 
     # Divide by PP (same rationale as compute_mfu)

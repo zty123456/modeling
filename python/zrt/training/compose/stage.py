@@ -10,7 +10,9 @@ import math
 from dataclasses import dataclass
 
 from zrt.training.ir.training_graph import Collective, Graph, Op
-from zrt.training.io.perf_tables import achieved_bandwidth_efficiency, achieved_flops_efficiency
+from zrt.training.io.perf_tables import (
+    effective_flops, effective_hbm_bw_bps, peak_tflops_for,
+)
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
@@ -63,18 +65,15 @@ def op_to_time(
     gpu_name: str = "", dtype: Dtype = Dtype.BF16,
 ) -> float:
     """Roofline: op time = max(compute_time, memory_time)."""
-    from zrt.training.io.perf_tables import peak_tflops_for
     gpu = system.gpu
     compute_t = 0.0
     if flops > 0:
-        peak = peak_tflops_for(gpu, dtype)
-        eff = achieved_flops_efficiency(gpu_name or gpu.name, dtype, flops)
-        compute_t = flops / (peak * eff) if peak > 0 else 0.0
+        eff_flops = effective_flops(gpu, dtype, flops)
+        compute_t = flops / eff_flops if eff_flops > 0 else 0.0
     memory_t = 0.0
     if bytes_ > 0:
-        bw = gpu.hbm_bw_gbps * 1e9
-        eff = achieved_bandwidth_efficiency(gpu_name or gpu.name, bytes_)
-        memory_t = bytes_ / (bw * eff) if bw > 0 else 0.0
+        eff_bw = effective_hbm_bw_bps(gpu, bytes_)
+        memory_t = bytes_ / eff_bw if eff_bw > 0 else 0.0
     return max(compute_t, memory_t)
 
 
@@ -97,7 +96,6 @@ def op_to_time_hetero(
     If either heterogeneous peak is missing, preserve the legacy unified-peak
     roofline instead of treating one side of the work as free.
     """
-    from zrt.training.io.perf_tables import peak_tflops_for
     gpu = system.gpu
     total_flops = cube_flops + vector_flops
     if not has_heterogeneous_compute(system):
@@ -110,13 +108,18 @@ def op_to_time_hetero(
 
     compute_t = 0.0
     if total_flops > 0:
-        eff = achieved_flops_efficiency(gpu_name or gpu.name, dtype, total_flops)
+        # Override-or-heuristic utilization fraction via the unified entry
+        # (effective_flops = peak × eff ⇒ eff = effective_flops / peak).
+        eff = (
+            effective_flops(gpu, dtype, total_flops) / dtype_peak
+            if dtype_peak > 0 else 0.0
+        )
         cube_t = 0.0
         vector_t = 0.0
-        if cube_flops > 0:
+        if cube_flops > 0 and eff > 0:
             peak_cube = gpu.cube_tflops * 1e12 * scale
             cube_t = cube_flops / (peak_cube * eff) if peak_cube > 0 else 0.0
-        if vector_flops > 0:
+        if vector_flops > 0 and eff > 0:
             peak_vector = gpu.vector_tflops * 1e12 * scale
             vector_t = vector_flops / (peak_vector * eff) if peak_vector > 0 else 0.0
         if cube_t > 0 or vector_t > 0:
@@ -124,9 +127,8 @@ def op_to_time_hetero(
 
     memory_t = 0.0
     if bytes_ > 0:
-        bw = gpu.hbm_bw_gbps * 1e9
-        eff_bw = achieved_bandwidth_efficiency(gpu_name or gpu.name, bytes_)
-        memory_t = bytes_ / (bw * eff_bw) if bw > 0 else 0.0
+        eff_bw_bps = effective_hbm_bw_bps(gpu, bytes_)
+        memory_t = bytes_ / eff_bw_bps if eff_bw_bps > 0 else 0.0
     return max(compute_t, memory_t)
 
 

@@ -524,6 +524,8 @@ def _is_compute_bound(cost: OpCost, phase: str, system: SystemSpec) -> bool:
 
     Uses peak FLOPS and peak BW (no efficiency curves) so that bound is a
     structural property of the op shape, not dependent on the efficiency model.
+    Intentionally excluded from the unified effective_flops/effective_hbm_bw
+    entries for this reason.
     """
     flops = getattr(cost, f"{phase}_cube_flops") + getattr(cost, f"{phase}_vector_flops")
     bytes_ = getattr(cost, f"{phase}_bytes")

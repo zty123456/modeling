@@ -22,21 +22,24 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
       S = total post-collective bytes per rank (AG output, RS input)
       Bandwidth term for AG/RS = S × (N-1)/N × beta   (bus-bw form)
 
-    Topology-aware algorithm selection:
-      full_connectivity ("all_to_all"/"nvswitch"/"full_mesh"): single-step
+    Topology-class latency-step selection (``link.topology_class``):
+      switched_full ("all_to_all"/"nvswitch"/"full_mesh"): single-step
         AG/RS:  α + S·(N-1)/N · β
         AR:     2α + 2·S·(N-1)/N · β
-        A2A:    α + S·(N-1)/N · β
-      ring/fat_tree (default):
+      switched_tree ("fat_tree"/"clos"): recursive-doubling / tree
+        AG/RS:  ⌈log2 N⌉·α + S·(N-1)/N · β
+        AR:     2·⌈log2 N⌉·α + 2·S·(N-1)/N · β
+      ring/torus/unknown (default):
         AG/RS:  (N-1)·α + S·(N-1)/N · β
         AR:     2(N-1)·α + 2·S·(N-1)/N · β
-        A2A (N>16, Bruck): ⌈log2 N⌉·α + S·(N-1)/N · β
-        A2A (N≤16, pairwise): (N-1)·α + S·(N-1)/N · β
+      A2A: switched_full → α ; else Bruck (N>16, ⌈log2 N⌉) / pairwise (N-1).
 
-    P2P: rounds × (α + S·β).
+    β uses ``link.effective_bw_bps(N)`` — peak × kb_efficiency, plus the
+    non-clos switched-fabric over-subscription derate once N exceeds the
+    non-blocking radix. P2P: rounds × (α + S·β).
     """
     alpha = link.latency_us * 1e-6
-    bw_bytes = link.bandwidth_gbps * 1e9 / 8
+    bw_bytes = link.effective_bw_bps(group_size)
     beta = 1.0 / bw_bytes if bw_bytes > 0 else float("inf")
 
     N = group_size
@@ -46,19 +49,23 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
     if N <= 1 or S <= 0:
         return 0.0
 
-    full_connectivity = link.topology in ("all_to_all", "nvswitch", "full_mesh")
+    cls = link.topology_class
+    if cls == "switched_full":
+        steps = 1
+    elif cls == "switched_tree":
+        steps = max(1, math.ceil(math.log2(N)))
+    else:  # ring / torus / unknown
+        steps = N - 1
     bw_term = S * (N - 1) / N * beta  # NCCL bus-bw factor
 
     if c.kind in ("AG", "RS"):
-        latency = alpha if full_connectivity else (N - 1) * alpha
-        return latency + bw_term
+        return steps * alpha + bw_term
 
     if c.kind == "AR":
-        latency = 2 * alpha if full_connectivity else 2 * (N - 1) * alpha
-        return latency + 2 * bw_term
+        return 2 * steps * alpha + 2 * bw_term
 
     if c.kind == "A2A":
-        if full_connectivity:
+        if cls == "switched_full":
             return alpha + bw_term
         # NCCL/HCCL use Bruck (log2 rounds) above ~16 ranks; below that,
         # pairwise-exchange is competitive.
@@ -287,10 +294,10 @@ def pp_p2p_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> flo
     else:
         link = system.interconnect.inter_node
 
-    if link.bandwidth_gbps <= 0:
+    bw_bytes = link.effective_bw_bps(2)  # adjacent-stage point-to-point
+    if bw_bytes <= 0:
         return 0.0
 
-    bw_bytes = link.bandwidth_gbps * 1e9 / 8
     latency = link.latency_us * 1e-6
     return latency + act_bytes / bw_bytes
 

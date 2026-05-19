@@ -46,6 +46,11 @@ class ComputeSpec:
     # NVIDIA CUDA-capable hardware: typically 4.
     ep_overlap_waves: int = 0
 
+    # Explicit compute utilization override (achieved/peak FLOPs).
+    # None = fall back to the size-bucketed achieved_flops_efficiency() curve
+    # (MLPerf-calibrated). A YAML-supplied value takes precedence over it.
+    compute_efficiency: float | None = None
+
 
 @dataclass
 class MemoryTier:
@@ -63,6 +68,25 @@ class MemorySpec:
     l2_cache_mb: float = 0.0
     tiers: list[MemoryTier] = field(default_factory=list)
 
+    # Explicit HBM-bandwidth utilization override (achieved/peak).
+    # None = fall back to the size-bucketed achieved_bandwidth_efficiency()
+    # curve. A YAML-supplied value takes precedence over it.
+    mem_bw_efficiency: float | None = None
+
+
+# Topology → cost-law class. Drives both the alpha-beta latency-step count
+# (comm.py) and the bandwidth-derate eligibility (effective_bw_bps below).
+# Unknown topologies fall back to "ring" (conservative: (N-1)-step latency).
+#   switched_full : single-step full connectivity (NVSwitch / full mesh)
+#   switched_tree : switched fabric, recursive-doubling/tree algos (log2 N steps)
+#   ring / torus  : link-local bandwidth, N-independent; (N-1)-step latency
+_TOPO_CLASS = {
+    "nvswitch": "switched_full", "all_to_all": "switched_full",
+    "full_mesh": "switched_full",
+    "fat_tree": "switched_tree", "clos": "switched_tree",
+    "ring": "ring", "torus": "torus", "mesh": "torus",
+}
+
 
 @dataclass
 class LinkSpec:
@@ -79,6 +103,37 @@ class LinkSpec:
     latency_us: float
     topology: str = "point_to_point"
     num_devices: int = 1          # devices in the domain (e.g. 8 for a node)
+    # Bandwidth utilization (effective/peak), (0,1]. Applies to ALL topologies
+    # (clos included). Sole knob for the bandwidth-realism derate.
+    kb_efficiency: float = 0.7
+    # Spine over-subscription ratio for non-clos switched fabrics (e.g. 4 = 4:1).
+    # 1.0 = non-blocking (clos / default) → no domain-size derate.
+    oversubscription: float = 1.0
+
+    @property
+    def topology_class(self) -> str:
+        return _TOPO_CLASS.get(self.topology, "ring")
+
+    def effective_bw_bps(self, group_size: int = 1) -> float:
+        """Effective bandwidth in bytes/s.
+
+        = peak × ``kb_efficiency``, additionally derated by
+        ``oversubscription`` for non-clos switched fabrics once the parallel
+        domain exceeds the non-blocking radix (``num_devices``).
+
+        clos is non-blocking by definition → leave ``oversubscription`` at
+        1.0 so it never derates; only an explicitly over-subscribed fat-tree
+        sets it > 1.0. ring/torus bandwidth is link-local (N-independent);
+        the algorithmic (N-1)/N data-volume factor lives in comm.py, not here.
+        """
+        base = self.bandwidth_gbps * 1e9 / 8.0 * self.kb_efficiency
+        if base <= 0.0:
+            return 0.0
+        if self.topology_class == "switched_tree" and self.oversubscription > 1.0:
+            radix = self.num_devices if self.num_devices > 0 else group_size
+            if group_size > radix:
+                return base / self.oversubscription
+        return base
 
 
 @dataclass

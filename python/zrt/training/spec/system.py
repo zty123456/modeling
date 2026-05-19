@@ -30,6 +30,11 @@ class GPU:
     # overlap (e.g. Ascend HCCS). Mirrors HardwareSpec.compute.ep_overlap_waves.
     ep_overlap_waves: int = 0
 
+    # Explicit utilization overrides (None = use achieved_* heuristic curve).
+    # Mirror HardwareSpec.compute.compute_efficiency / memory.mem_bw_efficiency.
+    compute_efficiency: float | None = None
+    mem_bw_efficiency: float | None = None
+
 
 @dataclass
 class SystemSpec:
