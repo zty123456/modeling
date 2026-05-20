@@ -800,22 +800,22 @@ def pipeline_step_time(
     #      iteration's first microbatch(es) of forward — steady-state
     #      assumption, matches Megatron-Core distributed-optimizer behavior.
     #      Hide window: warmup_fwd for pp>1; one microbatch fwd for pp=1.
+    from zrt.training.models.optimizer import moonshot_optimizer_hiding
     rotation_active = (
             strategy.optimizer.value == "muon"
             and strategy.muon_config is not None
             and strategy.muon_config.rotation
     )
-    if rotation_active:
-        fwd_window = max(step.warmup_fwd, step.steady_fwd_per_mb)
-        rs_hidden = min(rs_time, fwd_window)
-        remaining_fwd = max(0.0, fwd_window - rs_hidden)
-        ag_hide_window = opt_time + remaining_fwd
-        ag_hidden = min(ag_time, ag_hide_window)
-    else:
-        ag_hidden = 0.0
-        rs_hidden = 0.0
-    opt_comm_hidden = ag_hidden + rs_hidden
-    opt_comm_exposed = (ag_time + rs_time) - opt_comm_hidden
+    fwd_window = max(step.warmup_fwd, step.steady_fwd_per_mb) if rotation_active else 0.0
+    opt_comm_exposed_s, opt_comm_hidden_s = moonshot_optimizer_hiding(
+        compute_us=opt_time * 1e6,
+        ag_us=ag_time * 1e6,
+        rs_us=rs_time * 1e6,
+        fwd_window_us=fwd_window * 1e6,
+        rotation=rotation_active,
+    )
+    opt_comm_exposed = opt_comm_exposed_s / 1e6
+    opt_comm_hidden = opt_comm_hidden_s / 1e6
 
     step.optimizer_time = opt_time
     step.optimizer_comm = opt_comm_exposed

@@ -341,6 +341,49 @@ def total_comm_time(
     return result
 
 
+def muon_comm_times_from_params(
+    P_muon_non_routed: int,
+    P_muon_routed: int,
+    dp: int,
+    expert_dp: int,
+    rotation: bool,
+    system,
+) -> dict[str, float]:
+    """Primitive-typed Muon AG/RS collective times (seconds).
+
+    Args:
+        P_muon_non_routed: Muon-eligible non-routed params on this rank (FP32 count)
+        P_muon_routed:     Muon-eligible routed expert params on this rank
+        dp:                Full DP group size (for non-routed params)
+        expert_dp:         Expert-DP group size = max(1, dp // ep)
+        rotation:          Whether Moonshot RS is active
+        system:            Any object with .interconnect.intra_node / .inter_node
+
+    Returns:
+        {"muon_ag": ag_seconds, "muon_rs": rs_seconds}
+    """
+    param_bytes = 4  # FP32 master copy
+
+    def _ag_rs(bytes_: int, group_size: int) -> tuple[float, float]:
+        if group_size <= 1 or bytes_ <= 0:
+            return 0.0, 0.0
+        ag = collective_time_hierarchical(
+            Collective(name="muon_ag", kind="AG", group="DP",
+                       bytes_=bytes_, inserted_after="backward_end"),
+            group_size, system,
+        )
+        rs = collective_time_hierarchical(
+            Collective(name="muon_rs", kind="RS", group="DP",
+                       bytes_=bytes_, inserted_after="optimizer_step"),
+            group_size, system,
+        ) if rotation else 0.0
+        return ag, rs
+
+    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, dp)
+    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp)
+    return {"muon_ag": ag_dense + ag_routed, "muon_rs": rs_dense + rs_routed}
+
+
 def optimizer_comm_time(
     model: ModelSpec, system: SystemSpec, strategy: Strategy,
     *,
@@ -378,7 +421,6 @@ def optimizer_comm_time(
         else 0.85
     )
     rotation = muon_config.rotation if muon_config else True
-    param_bytes = 4  # FP32 master copy
 
     P_total = _params_on_rank_for_dp(model, strategy)
 
@@ -391,6 +433,7 @@ def optimizer_comm_time(
 
     P_muon_non_routed = int(P_non_routed * f_muon)
     P_muon_routed = int(P_routed * f_muon)
+    param_bytes = 4  # FP32 master copy
 
     # Build/reuse the resolver. Callers from pipeline_step_time pass
     # `domain=` already built so groups are shared; legacy callers
@@ -399,7 +442,7 @@ def optimizer_comm_time(
         from zrt.training.topology.comm_domain import CommDomain
         domain = CommDomain(system=system, strategy=strategy)
 
-    def _ag_rs(bytes_, group_size: int, group_kind: str) -> tuple[float, float]:
+    def _ag_rs(bytes_: int, group_size: int, group_kind: str) -> tuple[float, float]:
         """Cost the AG (+optional RS) over `group_kind` via the resolver."""
         if group_size <= 1 or bytes_ <= 0:
             return 0.0, 0.0
@@ -420,14 +463,11 @@ def optimizer_comm_time(
     # distributed optimizer convention) — size dp/ep, ranks orthogonal
     # to EP within a DP block. CommDomain knows both groups so the
     # tier resolution and α-β decomposition are correct for each.
-    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, strategy.dp, "DP")
     expert_dp = max(1, strategy.dp // strategy.ep) if strategy.ep > 1 else strategy.dp
+    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, strategy.dp, "DP")
     ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp, "EXPERT_DP")
 
-    return {
-        "muon_ag": ag_dense + ag_routed,
-        "muon_rs": rs_dense + rs_routed,
-    }
+    return {"muon_ag": ag_dense + ag_routed, "muon_rs": rs_dense + rs_routed}
 
 
 def pp_p2p_time(
