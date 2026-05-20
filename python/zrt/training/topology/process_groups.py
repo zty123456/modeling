@@ -54,9 +54,8 @@ class GroupTierAssignment:
     tier the collective must reach when running flat.
 
     ``inner_tier`` — the smallest tier the group *also* spans, i.e. the
-    deepest tier it can decompose into when the collective is performed
-    hierarchically. For groups smaller than tier[0]'s per-instance size,
-    inner_tier == primary_tier == tier[0].
+    first tier where hierarchical decomposition can do useful local work
+    before reaching ``primary_tier``.
 
     ``tier_aligned`` — True when the group's rank set falls inside a
     single instance of ``primary_tier``. Always True in the construction
@@ -275,20 +274,16 @@ def _tier_for_groups(
             primary = i
             break
 
-    # inner_tier: deepest tier into which the group can decompose
-    # cleanly (used by collective_time_multi_tier later). Equal to
-    # primary when the group already fits the innermost tier, else 0
-    # if the innermost tier still holds *some* shard cleanly.
+    # inner_tier: innermost tier that provides a real local fanout for
+    # every group instance. If lower tiers only contain one rank per
+    # instance, decomposition must start at the primary tier or later.
     inner = primary
     if primary > 0:
-        # Does the innermost tier hold one rank per group? Equivalent to
-        # "the group's stride is a multiple of inner-tier size" — common
-        # case for DP whose ranks are all in different nodes/racks.
-        inner_n = interconnect.tiers[0].link.num_devices
-        if inner_n > 0:
-            sample = groups[0]
-            local_count = sum(1 for r in sample if r // inner_n == sample[0] // inner_n)
-            inner = 0 if local_count >= 1 else primary
+        for i, tier in enumerate(interconnect.tiers[:primary]):
+            n = tier.link.num_devices
+            if all(len({r // n for r in g}) < len(g) for g in groups):
+                inner = i
+                break
 
     return GroupTierAssignment(
         group="", group_size=size,

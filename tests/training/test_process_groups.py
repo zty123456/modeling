@@ -230,6 +230,26 @@ def test_tier_assignment_falls_back_to_outermost():
     assert g.tier["DP"].primary_tier == 1
 
 
+def test_inner_tier_ignores_tiers_with_only_one_rank_per_instance():
+    """A strided group cannot start decomposition at a tier with no local shard."""
+    ic = _make_tiers(("tray", 8, 1800), ("spine", 0, 400))
+    s = Strategy(tp=4, cp=4, ep=1, dp=8, pp=1)
+    g = build_process_groups(128, s, _make_system(ic, 128))
+    assert g.dp_groups[0] == [0, 16, 32, 48, 64, 80, 96, 112]
+    assert g.tier["DP"].primary_tier == 1
+    assert g.tier["DP"].inner_tier == 1
+
+
+def test_inner_tier_can_start_at_middle_tier_when_inner_has_no_local_shard():
+    """A group can decompose from rack tier even when tray tier has no fanout."""
+    ic = _make_tiers(("tray", 4, 1800), ("rack", 64, 900), ("spine", 0, 400))
+    s = Strategy(tp=4, cp=4, ep=1, dp=8, pp=1)
+    g = build_process_groups(128, s, _make_system(ic, 128))
+    assert g.dp_groups[0] == [0, 16, 32, 48, 64, 80, 96, 112]
+    assert g.tier["DP"].primary_tier == 2
+    assert g.tier["DP"].inner_tier == 1
+
+
 def test_degree_one_axis_yields_singletons():
     """tp=1 → every TP "group" has size 1."""
     s = Strategy(tp=1, cp=1, ep=1, dp=4, pp=2)

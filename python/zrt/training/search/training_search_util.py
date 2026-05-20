@@ -158,7 +158,7 @@ def _passes_pod_packing(
 ) -> bool:
     cfg = other_config or {}
     if system is None:
-        return True
+        raise ValueError("_passes_pod_packing requires system for tier-aware checks")
     if target_ws % system.gpus_per_node == 0:
         return True
     axes = _normalize_pod_packing_axes(cfg.get("pod_packing_axes"))
@@ -168,6 +168,7 @@ def _passes_pod_packing(
     try:
         from zrt.training.topology.process_groups import build_process_groups
 
+        # EP shares physical ranks, so tier assignment is independent of EP.
         strategy = Strategy(tp=tp, cp=cp, pp=pp, dp=dp, ep=1)
         groups = build_process_groups(target_ws, strategy, system)
     except ValueError:
@@ -324,7 +325,12 @@ class TrainingConfigManager:
             dp_grad_buckets=other_config.get("dp_grad_buckets", 25),
         )
 
-    def _expand_auto_values_optimized(self, grid: Dict[str, List[Any]], world_size: int) -> None:
+    def _expand_auto_values_optimized(
+        self,
+        grid: Dict[str, List[Any]],
+        world_size: int,
+        model: ModelSpec | None = None,
+    ) -> None:
         """
         核心优化：基于已知维度的最小值，动态裁剪并收紧 auto 变量的选择范围。
         避免盲目扩展成全量 world_size 的约数，将 auto 并行搜索空间缩减 90% 以上。
@@ -383,13 +389,19 @@ class TrainingConfigManager:
 
         # 5. EP 特殊处理：EP 独立扩展，不参与 rank 计算
         if auto_ep:
+            if model is None:
+                ep_candidates = optimized_divisors
+            elif model.num_experts > 0:
+                ep_candidates = self._get_divisors(model.num_experts)
+            else:
+                ep_candidates = [1]
+
             vals = grid["ep"]
             if isinstance(vals, list):
                 clean_vals = [v for v in vals if v != "auto"]
-                # EP 可以是任意值，通常基于 num_experts 的约束
-                grid["ep"] = sorted(list(set(clean_vals + optimized_divisors)))
+                grid["ep"] = sorted(list(set(clean_vals + ep_candidates)))
             else:
-                grid["ep"] = optimized_divisors
+                grid["ep"] = ep_candidates
 
     def _enumerate_valid_parallel_configs(
             self, grid: Dict[str, List[Any]], target_ws: int,
@@ -474,7 +486,15 @@ class TrainingConfigManager:
         _reject_gpus_per_node_config(grid)
         world_sizes = grid.get("world_size", [1])
         target_ws = world_sizes[0]
-        self._expand_auto_values_optimized(grid, target_ws)
+        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
+        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
+        model_for_auto = None
+        try:
+            model_for_auto = _load_model_spec(model_name)
+            model_for_auto.seq_len = seq_len
+        except Exception:
+            pass
+        self._expand_auto_values_optimized(grid, target_ws, model_for_auto)
 
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
         
@@ -485,13 +505,17 @@ class TrainingConfigManager:
         if has_total_token and "seq_len" in other_keys:
             other_keys.remove("seq_len")
 
-        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
-        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
 
+        model = None
         try:
             model = _load_model_spec(model_name)
             model.seq_len = seq_len
+        except Exception:
+            pass
+
+        system = None
+        try:
             hw = load_hw(hw_name)
             gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
@@ -503,7 +527,6 @@ class TrainingConfigManager:
                 host_mem_gb=grid.get("host_mem_gb", [256.0])[0] if grid.get("host_mem_gb") else 256.0,
             )
         except Exception:
-            model = None
             system = None
 
         other_combinations = 1
@@ -527,7 +550,16 @@ class TrainingConfigManager:
             raise ValueError("Only single world_size is supported when using 'auto' parallel strategy")
         target_ws = world_sizes[0]
 
-        self._expand_auto_values_optimized(grid, target_ws)
+        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
+        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
+        model_for_auto = None
+        try:
+            model_for_auto = _load_model_spec(model_name)
+            model_for_auto.seq_len = seq_len
+        except Exception:
+            pass
+
+        self._expand_auto_values_optimized(grid, target_ws, model_for_auto)
 
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
         
@@ -538,15 +570,18 @@ class TrainingConfigManager:
         if has_total_token and "seq_len" in other_keys:
             other_keys.remove("seq_len")
 
-        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
-        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
 
         model = None
         system = None
         try:
             model = _load_model_spec(model_name)
             model.seq_len = seq_len
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        try:
             hw = load_hw(hw_name)
             gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
@@ -557,10 +592,8 @@ class TrainingConfigManager:
                 world_size_override=target_ws,
                 host_mem_gb=grid.get("host_mem_gb", [256.0])[0] if grid.get("host_mem_gb") else 256.0,
             )
-        except FileNotFoundError:
-            pass
         except Exception:
-            pass
+            system = None
 
         other_grids = [grid[k] for k in other_keys]
         for other_vals in itertools.product(*other_grids):

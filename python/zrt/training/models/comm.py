@@ -245,7 +245,6 @@ def collective_time_multi_tier(
         return collective_time(c, N, outermost_link)
 
     if c.kind == "AR":
-        assert c.kind == "AR"
         rs_c = Collective(name=c.name + "_rs", kind="RS", group=c.group, bytes_=S)
         ag_c = Collective(name=c.name + "_ag", kind="AG", group=c.group, bytes_=S)
         return (

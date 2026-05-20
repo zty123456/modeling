@@ -8,10 +8,13 @@ from zrt.training.search.training_search_util import (
     _load_model_spec,
     _make_strategy_from_config,
     _make_system_from_config,
+    _passes_pod_packing,
     format_results,
     run_training_task_wrapper,
 )
 from zrt.training.spec.report import TrainingReport
+from zrt.training.spec.model import LayerKind, ModelSpec
+from zrt.training.models.memory import MemBreakdown
 from zrt.training.spec.strategy import (
     CPKind,
     OptKind,
@@ -322,6 +325,87 @@ class TestTrainingConfigManager:
         assert combos == {(32, 4, 1, 8)}
         assert all(c["tp"] * c["cp"] * c["pp"] * c["dp"] == 1024 for c in configs)
 
+    def test_pod_packing_requires_system(self):
+        with pytest.raises(ValueError, match="requires system"):
+            _passes_pod_packing(
+                tp=2, cp=1, pp=1, dp=5,
+                target_ws=10, system=None, other_config=None,
+            )
+
+    def test_pod_packing_rejects_2tier_partial_tp_crossing_innermost_tier(self):
+        system = _make_system_from_config({
+            "hw": "nvidia_h100_sxm",
+            "world_size": 10,
+        })
+
+        assert not _passes_pod_packing(
+            tp=10, cp=1, pp=1, dp=1,
+            target_ws=10, system=system, other_config=None,
+        )
+
+    def test_ep_auto_uses_num_experts_divisors_not_rank_divisors(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [384],
+                "seq_len": [4096],
+                "tp": [1],
+                "cp": [1],
+                "pp": [1],
+                "ep": ["auto"],
+                "dp": [384],
+                "micro_batch": [1],
+                "global_batch": [384],
+                "zero_stage": [0],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["adam"],
+            }
+        )
+
+        configs = manager.generate_static_configs()
+        ep_values = {cfg["ep"] for cfg in configs}
+
+        assert 256 in ep_values
+        assert manager.count_total_configs() == len(configs)
+
+    def test_ep_auto_falls_back_to_rank_divisors_without_model_context(self):
+        manager = TrainingConfigManager(param_grid={})
+        grid = {"tp": [1], "cp": [1], "pp": [1], "ep": ["auto"], "dp": [1]}
+
+        manager._expand_auto_values_optimized(grid, world_size=12, model=None)
+
+        assert grid["ep"] == [1, 2, 3, 4, 6, 12]
+
+    def test_rank_auto_expands_world_size_divisors_for_list_and_scalar_inputs(self):
+        manager = TrainingConfigManager(param_grid={})
+        grid = {"tp": [2, "auto"], "cp": "auto", "pp": [1], "ep": [1], "dp": [1]}
+
+        manager._expand_auto_values_optimized(grid, world_size=12, model=None)
+
+        assert grid["tp"] == [1, 2, 3, 4, 6, 12]
+        assert grid["cp"] == [1, 2, 3, 4, 6, 12]
+
+    def test_ep_auto_collapses_to_one_for_dense_model(self):
+        manager = TrainingConfigManager(param_grid={})
+        model = ModelSpec(
+            hidden=128,
+            ffn=256,
+            num_heads=8,
+            num_kv_heads=8,
+            head_dim=16,
+            vocab=32000,
+            seq_len=1024,
+            layers=[LayerKind.DENSE],
+            num_experts=0,
+        )
+        grid = {"tp": [1], "cp": [1], "pp": [1], "ep": "auto", "dp": [1]}
+
+        manager._expand_auto_values_optimized(grid, world_size=12, model=model)
+
+        assert grid["ep"] == [1]
+
     def test_count_total_configs_matches_generated_configs_without_gpus_per_node_grid(self):
         manager = TrainingConfigManager(
             param_grid={
@@ -345,6 +429,22 @@ class TestTrainingConfigManager:
 
         configs = manager.generate_static_configs()
         assert manager.count_total_configs() == len(configs)
+
+    def test_count_total_configs_builds_system_when_model_is_unknown(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["unknown"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [4],
+                "tp": [1, 2, 4],
+                "cp": [1],
+                "pp": [1],
+                "ep": [1],
+                "dp": [1, 2, 4],
+            }
+        )
+
+        assert manager.count_total_configs() == len(manager.generate_static_configs())
 
     def test_worker_uses_search_world_size_not_floor_pod_allocation(self):
         result = run_training_task_wrapper({
@@ -477,6 +577,39 @@ class TestFormatResults:
         assert df.iloc[0]["pp_exposed_ms"] == 2.0
         assert df.iloc[0]["dp_total_ms"] == 9.0
         assert df.iloc[0]["dp_exposed_ms"] == 6.0
+
+    def test_format_results_includes_memory_and_filters_over_hbm_budget(self):
+        reports = [
+            TrainingReport(
+                mfu=0.5,
+                memory=MemBreakdown(
+                    weights=1.25e9,
+                    grads=0.5e9,
+                    opt_state=0.25e9,
+                    activations=2.0e9,
+                    comm_buffers=0.125e9,
+                ),
+            ),
+            TrainingReport(
+                mfu=0.9,
+                memory=MemBreakdown(weights=70e9, activations=10e9),
+            ),
+        ]
+        configs = [
+            {"model": "fits", "hw": "nvidia_h100_sxm"},
+            {"model": "too_large", "hw": "nvidia_h100_sxm"},
+        ]
+
+        df = format_results(reports, configs)
+
+        assert list(df["model"]) == ["fits"]
+        row = df.iloc[0]
+        assert row["weights_gb"] == 1.25
+        assert row["grads_gb"] == 0.5
+        assert row["opt_state_gb"] == 0.25
+        assert row["activations_gb"] == 2.0
+        assert row["comm_buffers_gb"] == 0.12
+        assert row["memory_gb"] == 4.12
 
 
 if __name__ == "__main__":
