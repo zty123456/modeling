@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import openpyxl
+import pytest
 
 from zrt.hardware.spec import InterconnectSpec, LinkSpec
 from zrt.training.io.excel_exporter import export_estimate_excel
@@ -108,6 +110,30 @@ def test_html_mega_moe_formula_and_export_include_dimensions_quant_and_waves():
         assert "L0.mega_moe" in html
         assert "Mega MoE" in html
         assert "dispatch+FFN+combine" in html
+
+
+def test_html_mega_moe_formula_terms_match_cost_for_top_k_greater_than_one():
+    _, _, _, _, op_costs, mega_moe = _mega_moe_case()
+
+    detail = _op_detail(mega_moe, op_costs[mega_moe.name])
+    formula = detail["fwd_formula"]
+    match = re.search(
+        r"2\*tokens\*top_k\*k\*n\*mult = "
+        r"2\*(\d+)\*(\d+)\*(\d+)\*(\d+)\*([0-9.]+)",
+        formula,
+    )
+
+    assert match is not None
+    tokens, top_k, k, n = (int(value) for value in match.groups()[:4])
+    mult = float(match.group(5))
+    displayed_formula_value = 2 * tokens * top_k * k * n * mult
+    actual_cost_value = op_costs[mega_moe.name].fwd_cube_flops + op_costs[mega_moe.name].fwd_vector_flops
+
+    assert mega_moe.meta["top_k"] > 1
+    assert mega_moe.meta["fwd_multiplier"] == 3 * mega_moe.meta["top_k"]
+    assert "mult=3" in formula
+    assert "mult=6" not in formula
+    assert displayed_formula_value == pytest.approx(actual_cost_value)
 
 
 def test_excel_strategy_sheet_exports_mega_moe_fields():

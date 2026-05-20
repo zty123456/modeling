@@ -175,22 +175,25 @@ def _op_formula(op, cost):
         return "negligible", "negligible", "negligible", "negligible"
 
     if op.kind == "mega_moe":
+        from zrt.training.models.mega_moe import mega_moe_cost_terms
+
+        terms = mega_moe_cost_terms(op)
         mm = m.get("m", 0)
         micro_batch = m.get("micro_batch", 1)
-        tokens = mm * micro_batch
-        nn = m.get("n_local", m.get("n", 0))
-        kk = m.get("k_local", m.get("k", 0))
-        top_k = m.get("top_k", 0)
-        mult = m.get("fwd_multiplier", 1.0)
-        quant = m.get("quant_variant", "standard")
+        tokens = terms.tokens
+        nn = terms.n
+        kk = terms.k_eff
+        top_k = terms.top_k
+        mult = f"{terms.fwd_multiplier:g}"
+        quant = terms.quant_variant
         waves = m.get("requested_waves", 0)
-        local_experts = m.get("experts_per_rank", m.get("num_experts", top_k))
+        local_experts = terms.local_experts
         fwd_str = (
             "Mega MoE dispatch+FFN+combine: "
             f"m={mm}, micro_batch={micro_batch}, tokens={tokens}, "
             f"top_k={top_k}, k={kk}, n={nn}, experts/rank={local_experts}, "
-            f"quant={quant}, waves={waves}; "
-            f"2*tokens*top_k*k*n*mult = {_fmt_e(ff)}"
+            f"mult={mult}, quant={quant}, waves={waves}; "
+            f"2*tokens*top_k*k*n*mult = 2*{tokens}*{top_k}*{kk}*{nn}*{mult} = {_fmt_e(ff)}"
         )
         bwd_str = f"dx+dw = 2*fwd = {_fmt_e(df + wf)}"
         bytes_str = (
