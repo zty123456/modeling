@@ -74,7 +74,7 @@ def test_mega_moe_on_with_ep_uses_fused_op_without_routed_expert_a2a():
     assert all(c.inserted_after != mega_moe.name for c in graph.collectives)
 
 
-def test_mega_moe_tp_sharding_keeps_input_hidden_and_shards_output_hidden():
+def test_mega_moe_tp_sharding_keeps_input_hidden_and_shards_output_hidden_without_ep():
     model = _moe_model()
     strategy = Strategy(tp=4, mega_moe=True)
     graph = build_graph(model, strategy)
@@ -86,6 +86,52 @@ def test_mega_moe_tp_sharding_keeps_input_hidden_and_shards_output_hidden():
     assert mega_moe.outputs[0].shape_logical == (model.seq_len, model.hidden)
     assert mega_moe.outputs[0].shape_local == (model.seq_len, model.hidden // strategy.tp)
     assert mega_moe.meta["k_local"] == mega_moe.meta["k"] // strategy.tp
+
+
+def test_mega_moe_with_ep_ignores_main_tp_for_routed_path():
+    model = _moe_model()
+    strategy = Strategy(tp=4, ep=4, mega_moe=True)
+    graph = build_graph(model, strategy)
+
+    mega_moe = _op_for_layer(graph, 0, kind="mega_moe")
+
+    assert mega_moe.inputs[0].shape_local == (model.seq_len, model.hidden)
+    assert mega_moe.outputs[0].shape_local == (model.seq_len, model.hidden)
+    assert "k_local" not in mega_moe.meta
+
+
+def test_routed_expert_with_ep_ignores_main_tp_for_routed_path():
+    model = _moe_model()
+    strategy = Strategy(tp=4, ep=4, mega_moe=False)
+    graph = build_graph(model, strategy)
+
+    routed = _op_for_layer(graph, 0, name="L0.routed_expert_ffn")
+    ep_a2a = _ep_a2a_collectives(graph)
+
+    assert routed.inputs[0].shape_local == (model.seq_len, model.hidden)
+    assert routed.outputs[0].shape_local == (model.seq_len, model.hidden)
+    assert "k_local" not in routed.meta
+    expected_bytes = (
+        strategy.micro_batch
+        * model.seq_len
+        * model.hidden
+        * model.top_k
+        * model.effective_moe_act_dtype().bytes
+        // strategy.ep
+    )
+    assert [c.bytes_ for c in ep_a2a] == [expected_bytes, expected_bytes]
+
+
+def test_routed_expert_without_ep_still_uses_main_tp_sharding():
+    model = _moe_model()
+    strategy = Strategy(tp=4, ep=1, mega_moe=False)
+    graph = build_graph(model, strategy)
+
+    routed = _op_for_layer(graph, 0, name="L0.routed_expert_ffn")
+
+    assert routed.inputs[0].shape_local == (model.seq_len, model.hidden)
+    assert routed.outputs[0].shape_local == (model.seq_len, model.hidden // strategy.tp)
+    assert routed.meta["k_local"] == routed.meta["k"] // strategy.tp
 
 
 def test_mega_moe_cp_sharding_divides_token_dimension_and_meta_m():

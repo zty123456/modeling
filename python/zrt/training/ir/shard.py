@@ -415,8 +415,6 @@ def _insert_ep_collectives(
       - A2A after routed expert FFN (gathers expert outputs)
     """
     h = model.hidden
-    if shard.tp > 1:
-        h = h // shard.tp
     seq = model.seq_len
     if shard.cp > 1:
         seq = seq // shard.cp
@@ -482,6 +480,8 @@ def _apply_tp_sharding(
         op = graph.ops[i]
 
         if op.kind == "mega_moe":
+            if shard.has_ep:
+                continue
             k = op.meta.get("k", 0)
             n = op.meta.get("n", 0)
             if k > 0:
@@ -534,6 +534,8 @@ def _apply_tp_sharding(
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
             elif "routed_expert" in op.name:
+                if shard.has_ep:
+                    continue
                 # routed_expert_ffn fuses up+gate+down projections into one op.
                 # up/gate are column-parallel (n sharded), down is row-parallel
                 # (k sharded). Total FLOPs = 6*m*n*k*top_k / tp (single tp factor).
