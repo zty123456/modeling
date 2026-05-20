@@ -73,8 +73,7 @@ class CommDomain:
     def __post_init__(self) -> None:
         # Decide once whether the explicit-ranks N-tier path applies.
         # Only triggered for 3+ tier interconnects to keep 2-tier anchors
-        # bit-exact with prior behavior. See _maybe_build_groups in comm.py
-        # for the same gate.
+        # bit-exact with prior behavior.
         n_tiers = len(self.system.interconnect.tiers)
         self._use_multi_tier = n_tiers >= 3
 

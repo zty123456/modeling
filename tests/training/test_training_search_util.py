@@ -56,7 +56,6 @@ class TestMakeSystemFromConfig:
         config = {
             "hw": "nvidia_h100_sxm",
             "nodes": 8,
-            "gpus_per_node": 8,
             "host_mem_gb": 2048.0,
         }
         system = _make_system_from_config(config)
@@ -66,37 +65,34 @@ class TestMakeSystemFromConfig:
         assert system.world_size == 64
         assert system.host_mem_gb == 2048.0
 
-    def test_search_world_size_uses_active_ranks_with_partial_pod(self):
+    def test_system_gpus_per_node_inferred_from_ascend_superpod_tier(self):
         system = _make_system_from_config({
-            "hw": "nvidia_h100_sxm",
-            "world_size": 8192,
-            "gpus_per_node": 72,
+            "hw": "ascend_910c_superpod",
+            "world_size": 384,
         })
 
-        assert system.nodes == 114
-        assert system.gpus_per_node == 72
-        assert system.world_size == 8192
-        assert system.allocated_gpus == 8208
-        assert system.idle_gpus == 16
+        assert system.nodes == 1
+        assert system.gpus_per_node == 384
+        assert system.world_size == 384
+        assert system.allocated_gpus == 384
+        assert system.idle_gpus == 0
 
-    def test_search_world_size_ceil_nodes_for_144_gpu_pod(self):
+    def test_system_gpus_per_node_inferred_from_gb300_first_tier(self):
         system = _make_system_from_config({
-            "hw": "nvidia_h100_sxm",
-            "world_size": 8192,
-            "gpus_per_node": 144,
+            "hw": "nvidia_gb300_nvl576",
+            "world_size": 72,
         })
 
-        assert system.nodes == 57
-        assert system.gpus_per_node == 144
-        assert system.world_size == 8192
-        assert system.allocated_gpus == 8208
-        assert system.idle_gpus == 16
+        assert system.nodes == 18
+        assert system.gpus_per_node == 4
+        assert system.world_size == 72
+        assert system.allocated_gpus == 72
+        assert system.idle_gpus == 0
 
     def test_search_world_size_preserves_exact_pod_allocation(self):
         system = _make_system_from_config({
             "hw": "nvidia_h100_sxm",
             "world_size": 128,
-            "gpus_per_node": 8,
         })
 
         assert system.nodes == 16
@@ -104,6 +100,29 @@ class TestMakeSystemFromConfig:
         assert system.world_size == 128
         assert system.allocated_gpus == 128
         assert system.idle_gpus == 0
+
+    def test_search_world_size_warns_for_partial_allocation(self, caplog):
+        caplog.set_level("WARNING", logger="zrt.training.search.training_search_util")
+
+        system = _make_system_from_config({
+            "hw": "ascend_910c_superpod",
+            "world_size": 1024,
+        })
+
+        assert system.nodes == 3
+        assert system.gpus_per_node == 384
+        assert system.world_size == 1024
+        assert system.allocated_gpus == 1152
+        assert system.idle_gpus == 128
+        assert any("idle_gpus=128" in r.message for r in caplog.records)
+
+    def test_gpus_per_node_config_is_rejected(self):
+        with pytest.raises(ValueError, match="gpus_per_node.*removed"):
+            _make_system_from_config({
+                "hw": "nvidia_h100_sxm",
+                "world_size": 128,
+                "gpus_per_node": 8,
+            })
 
 
 class TestMakeStrategyFromConfig:
@@ -258,22 +277,39 @@ class TestTrainingConfigManager:
             product = cfg["tp"] * cfg["cp"] * cfg["pp"] * cfg["dp"]
             assert ws == product, f"world_size={ws} != tp*cp*pp*dp={product}"
 
-    def test_pod_packing_filters_tp_cp_that_do_not_fit_72_gpu_pod(self):
+    def test_gpus_per_node_param_grid_is_rejected(self):
         manager = TrainingConfigManager(
             param_grid={
                 "model": ["deepseek_v3_2"],
                 "hw": ["nvidia_h100_sxm"],
-                "world_size": [8192],
-                "gpus_per_node": [72],
-                "seq_len": [8192],
-                "tp": [8, 16],
+                "world_size": [128],
+                "gpus_per_node": [8],
+                "tp": [8],
                 "cp": [1],
-                "pp": [16],
+                "pp": [1],
                 "ep": [1],
-                "dp": [64, 32],
+                "dp": [16],
+            }
+        )
+
+        with pytest.raises(ValueError, match="gpus_per_node.*removed"):
+            manager.generate_static_configs()
+
+    def test_tier_aware_pod_packing_uses_ascend_supernode_not_hardcoded_8(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["ascend_910c_superpod"],
+                "world_size": [1024],
+                "seq_len": [8192],
+                "tp": [32],
+                "cp": [4],
+                "pp": [1],
+                "ep": [1],
+                "dp": [8],
                 "micro_batch": [1],
-                "global_batch": [8192],
-                "zero_stage": [1],
+                "global_batch": [1024],
+                "zero_stage": [0],
                 "pp_schedule": ["1f1b"],
                 "recompute": ["none"],
                 "optimizer": ["adam"],
@@ -283,25 +319,23 @@ class TestTrainingConfigManager:
         configs = manager.generate_static_configs()
         combos = {(c["tp"], c["cp"], c["pp"], c["dp"]) for c in configs}
 
-        assert (8, 1, 16, 64) in combos
-        assert (16, 1, 16, 32) not in combos
-        assert all(c["tp"] * c["cp"] * c["pp"] * c["dp"] == 8192 for c in configs)
+        assert combos == {(32, 4, 1, 8)}
+        assert all(c["tp"] * c["cp"] * c["pp"] * c["dp"] == 1024 for c in configs)
 
-    def test_pod_packing_allows_tp_cp_16_for_144_gpu_pod(self):
+    def test_count_total_configs_matches_generated_configs_without_gpus_per_node_grid(self):
         manager = TrainingConfigManager(
             param_grid={
                 "model": ["deepseek_v3_2"],
                 "hw": ["nvidia_h100_sxm"],
-                "world_size": [8192],
-                "gpus_per_node": [144],
-                "seq_len": [8192],
-                "tp": [16],
+                "world_size": [128],
+                "seq_len": [4096],
+                "tp": [4, 8],
                 "cp": [1],
-                "pp": [16],
+                "pp": [1, 2],
                 "ep": [1],
-                "dp": [32],
+                "dp": [8, 16, 32],
                 "micro_batch": [1],
-                "global_batch": [8192],
+                "global_batch": [128],
                 "zero_stage": [1],
                 "pp_schedule": ["1f1b"],
                 "recompute": ["none"],
@@ -310,17 +344,13 @@ class TestTrainingConfigManager:
         )
 
         configs = manager.generate_static_configs()
-
-        assert [(c["tp"], c["cp"], c["pp"], c["dp"]) for c in configs] == [
-            (16, 1, 16, 32)
-        ]
+        assert manager.count_total_configs() == len(configs)
 
     def test_worker_uses_search_world_size_not_floor_pod_allocation(self):
         result = run_training_task_wrapper({
             "model": "deepseek_v3_2",
             "hw": "nvidia_h100_sxm",
             "world_size": 8192,
-            "gpus_per_node": 72,
             "seq_len": 8192,
             "tp": 8,
             "cp": 1,

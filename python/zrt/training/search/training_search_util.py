@@ -40,7 +40,7 @@ from zrt.training.spec.system import GPU, SystemSpec
 logger = logging.getLogger(__name__)
 
 _WORKER_MODEL_CACHE: Dict[Tuple[str, Optional[str]], ModelSpec] = {}
-_WORKER_HW_CACHE: Dict[str, SystemSpec] = {}
+_WORKER_HW_CACHE: Dict[Tuple[str, int], SystemSpec] = {}
 
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 _DEFAULT_POD_PACKING_AXES = ("tp", "cp")
@@ -50,6 +50,68 @@ def _ceil_nodes_for_world_size(world_size: int, gpus_per_node: int) -> int:
     if gpus_per_node <= 0:
         raise ValueError("gpus_per_node must be positive")
     return max(1, math.ceil(world_size / gpus_per_node))
+
+
+def _inferred_gpus_per_node(hw: Any) -> int:
+    """Search allocation unit inferred from the innermost hardware tier."""
+    try:
+        n = int(hw.interconnect.tiers[0].link.num_devices)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        n = 0
+    return n if n > 0 else 8
+
+
+def _reject_gpus_per_node_config(config_or_grid: Dict[str, Any]) -> None:
+    if "gpus_per_node" in config_or_grid:
+        raise ValueError(
+            "gpus_per_node has been removed from search configs; express "
+            "hardware topology via the hardware YAML interconnect.tiers"
+        )
+
+
+def _warn_if_partial_allocation(system: SystemSpec) -> None:
+    if system.idle_gpus > 0:
+        logger.warning(
+            "Search allocation has idle GPUs: world_size=%s allocated_gpus=%s "
+            "idle_gpus=%s nodes=%s gpus_per_node=%s",
+            system.world_size,
+            system.allocated_gpus,
+            system.idle_gpus,
+            system.nodes,
+            system.gpus_per_node,
+        )
+
+
+def _system_from_hw(
+    hw: Any,
+    *,
+    nodes: int,
+    gpus_per_node: int,
+    world_size_override: int | None,
+    host_mem_gb: float,
+) -> SystemSpec:
+    system = SystemSpec(
+        gpu=GPU(
+            name=hw.name,
+            flops_bf16=hw.compute.bf16_tflops,
+            flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+            flops_fp4=hw.compute.fp4_tops,
+            hbm_gb=hw.memory.capacity_gb,
+            hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
+            cube_tflops=hw.compute.cube_bf16_tflops,
+            vector_tflops=hw.compute.vector_bf16_tflops,
+            overlap_ratio=dict(hw.compute.overlap_ratio),
+            compute_efficiency=hw.compute.compute_efficiency,
+            mem_bw_efficiency=hw.memory.mem_bw_efficiency,
+        ),
+        interconnect=hw.interconnect,
+        nodes=nodes,
+        gpus_per_node=gpus_per_node,
+        world_size_override=world_size_override,
+        host_mem_gb=host_mem_gb,
+    )
+    _warn_if_partial_allocation(system)
+    return system
 
 
 def _normalize_pod_packing_axes(value: Any) -> tuple[str, ...]:
@@ -91,17 +153,38 @@ def _passes_pod_packing(
     pp: int,
     dp: int,
     target_ws: int,
+    system: SystemSpec | None,
     other_config: Dict[str, Any] | None,
 ) -> bool:
     cfg = other_config or {}
-    gpus_per_node = int(cfg.get("gpus_per_node", 8))
-    if target_ws % gpus_per_node == 0:
+    if system is None:
+        return True
+    if target_ws % system.gpus_per_node == 0:
         return True
     axes = _normalize_pod_packing_axes(cfg.get("pod_packing_axes"))
-    group_size = _pod_packing_group_size(
-        axes, tp=tp, cp=cp, pp=pp, dp=dp
-    )
-    return group_size > 0 and gpus_per_node % group_size == 0
+    if _pod_packing_group_size(axes, tp=tp, cp=cp, pp=pp, dp=dp) <= 1:
+        return True
+
+    try:
+        from zrt.training.topology.process_groups import build_process_groups
+
+        strategy = Strategy(tp=tp, cp=cp, pp=pp, dp=dp, ep=1)
+        groups = build_process_groups(target_ws, strategy, system)
+    except ValueError:
+        return False
+
+    outermost = len(system.interconnect.tiers) - 1
+    degrees = {"tp": tp, "cp": cp, "pp": pp, "dp": dp}
+    for axis in axes:
+        if degrees[axis] <= 1:
+            continue
+        assignment = groups.tier.get(axis.upper())
+        if assignment is None:
+            return False
+        tier = system.interconnect.tiers[assignment.primary_tier]
+        if assignment.primary_tier >= outermost and tier.link.num_devices == 0:
+            return False
+    return True
 
 
 def _load_model_spec(model_name: str, quant_preset: Optional[str] = None) -> ModelSpec:
@@ -120,10 +203,11 @@ def _load_model_spec(model_name: str, quant_preset: Optional[str] = None) -> Mod
 
 
 def _make_system_from_config(config: Dict) -> SystemSpec:
+    _reject_gpus_per_node_config(config)
     hw_name = config.get("hw", "nvidia_h100_sxm")
     hw = load_hw(hw_name)
 
-    gpus_per_node = config.get("gpus_per_node", 8)
+    gpus_per_node = _inferred_gpus_per_node(hw)
     world_size_override = None
     if "world_size" in config:
         world_size_override = int(config["world_size"])
@@ -131,21 +215,8 @@ def _make_system_from_config(config: Dict) -> SystemSpec:
     else:
         nodes = config.get("nodes", 1)
 
-    return SystemSpec(
-        gpu=GPU(
-            name=hw.name,
-            flops_bf16=hw.compute.bf16_tflops,
-            flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-            flops_fp4=hw.compute.fp4_tops,
-            hbm_gb=hw.memory.capacity_gb,
-            hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-            cube_tflops=hw.compute.cube_bf16_tflops,
-            vector_tflops=hw.compute.vector_bf16_tflops,
-            overlap_ratio=dict(hw.compute.overlap_ratio),
-            compute_efficiency=hw.compute.compute_efficiency,
-            mem_bw_efficiency=hw.memory.mem_bw_efficiency,
-        ),
-        interconnect=hw.interconnect,
+    return _system_from_hw(
+        hw,
         nodes=nodes,
         gpus_per_node=gpus_per_node,
         world_size_override=world_size_override,
@@ -367,7 +438,8 @@ class TrainingConfigManager:
 
                         if not _passes_pod_packing(
                             tp=tp, cp=cp, pp=pp, dp=dp,
-                            target_ws=target_ws, other_config=other_config,
+                            target_ws=target_ws, system=system,
+                            other_config=other_config,
                         ):
                             continue
 
@@ -399,6 +471,7 @@ class TrainingConfigManager:
 
     def count_total_configs(self) -> int:
         grid = {k: (v if isinstance(v, list) else [v]) for k, v in self.param_grid.items()}
+        _reject_gpus_per_node_config(grid)
         world_sizes = grid.get("world_size", [1])
         target_ws = world_sizes[0]
         self._expand_auto_values_optimized(grid, target_ws)
@@ -420,23 +493,10 @@ class TrainingConfigManager:
             model = _load_model_spec(model_name)
             model.seq_len = seq_len
             hw = load_hw(hw_name)
-            gpus_per_node = grid.get("gpus_per_node", [8])[0] if grid.get("gpus_per_node") else 8
+            gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
-            system = SystemSpec(
-                gpu=GPU(
-                    name=hw.name,
-                    flops_bf16=hw.compute.bf16_tflops,
-                    flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-                    flops_fp4=hw.compute.fp4_tops,
-                    hbm_gb=hw.memory.capacity_gb,
-                    hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-                    cube_tflops=hw.compute.cube_bf16_tflops,
-                    vector_tflops=hw.compute.vector_bf16_tflops,
-                    overlap_ratio=dict(hw.compute.overlap_ratio),
-                    compute_efficiency=hw.compute.compute_efficiency,
-                    mem_bw_efficiency=hw.memory.mem_bw_efficiency,
-                ),
-                interconnect=hw.interconnect,
+            system = _system_from_hw(
+                hw,
                 nodes=nodes,
                 gpus_per_node=gpus_per_node,
                 world_size_override=target_ws,
@@ -461,6 +521,7 @@ class TrainingConfigManager:
 
     def generate_static_configs_stream(self) -> Generator[Dict[str, Any], None, None]:
         grid = {k: (v if isinstance(v, list) else [v]) for k, v in self.param_grid.items()}
+        _reject_gpus_per_node_config(grid)
         world_sizes = grid.get("world_size", [1])
         if len(world_sizes) > 1:
             raise ValueError("Only single world_size is supported when using 'auto' parallel strategy")
@@ -487,23 +548,10 @@ class TrainingConfigManager:
             model = _load_model_spec(model_name)
             model.seq_len = seq_len
             hw = load_hw(hw_name)
-            gpus_per_node = grid.get("gpus_per_node", [8])[0] if grid.get("gpus_per_node") else 8
+            gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
-            system = SystemSpec(
-                gpu=GPU(
-                    name=hw.name,
-                    flops_bf16=hw.compute.bf16_tflops,
-                    flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-                    flops_fp4=hw.compute.fp4_tops,
-                    hbm_gb=hw.memory.capacity_gb,
-                    hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-                    cube_tflops=hw.compute.cube_bf16_tflops,
-                    vector_tflops=hw.compute.vector_bf16_tflops,
-                    overlap_ratio=dict(hw.compute.overlap_ratio),
-                    compute_efficiency=hw.compute.compute_efficiency,
-                    mem_bw_efficiency=hw.memory.mem_bw_efficiency,
-                ),
-                interconnect=hw.interconnect,
+            system = _system_from_hw(
+                hw,
                 nodes=nodes,
                 gpus_per_node=gpus_per_node,
                 world_size_override=target_ws,
@@ -569,13 +617,11 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         if seq_len is not None:
             model.seq_len = int(seq_len)
 
-        # System cache must key on world_size / gpus_per_node, not just hw_name,
-        # because nodes is derived from those — otherwise multi-world_size grids
-        # silently reuse the first config's SystemSpec.
+        # System cache must key on world_size as well as hardware; nodes is
+        # derived from world_size and the hardware's innermost tier size.
         sys_key = (
             hw_name,
             int(config.get("world_size", 0)),
-            int(config.get("gpus_per_node", 8)),
         )
         system = _WORKER_HW_CACHE.get(sys_key)
         if system is None:
@@ -727,23 +773,11 @@ def export_best_configs_excel(
         model.seq_len = seq_len
 
         hw = load_hw(hw_name)
-        gpus_per_node = best_config.get("gpus_per_node", 8)
+        _reject_gpus_per_node_config(best_config)
+        gpus_per_node = _inferred_gpus_per_node(hw)
         nodes = _ceil_nodes_for_world_size(world_size, gpus_per_node)
-        system = SystemSpec(
-            gpu=GPU(
-                name=hw.name,
-                flops_bf16=hw.compute.bf16_tflops,
-                flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-                flops_fp4=hw.compute.fp4_tops,
-                hbm_gb=hw.memory.capacity_gb,
-                hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-                cube_tflops=hw.compute.cube_bf16_tflops,
-                vector_tflops=hw.compute.vector_bf16_tflops,
-                overlap_ratio=dict(hw.compute.overlap_ratio),
-                compute_efficiency=hw.compute.compute_efficiency,
-                mem_bw_efficiency=hw.memory.mem_bw_efficiency,
-            ),
-            interconnect=hw.interconnect,
+        system = _system_from_hw(
+            hw,
             nodes=nodes,
             gpus_per_node=gpus_per_node,
             world_size_override=world_size,

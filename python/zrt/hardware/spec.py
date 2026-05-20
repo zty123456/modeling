@@ -217,6 +217,17 @@ class InterconnectSpec:
             if inter_node is not None:
                 tlist.append(TopologyTier(name="inter_node", link=inter_node))
             self.tiers = tlist
+        self._validate_tiers()
+
+    def _validate_tiers(self) -> None:
+        """Validate tier ordering invariants shared by direct/YAML construction."""
+        last_idx = len(self.tiers) - 1
+        for i, tier in enumerate(self.tiers):
+            if tier.link.num_devices == 0 and i != last_idx:
+                raise ValueError(
+                    "InterconnectSpec: only outermost tier may be unbounded "
+                    f"(num_devices=0); got tier {i} {tier.name!r}"
+                )
 
     # ── Back-compat accessors ─────────────────────────────────────────
     @property

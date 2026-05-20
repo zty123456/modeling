@@ -245,6 +245,7 @@ def collective_time_multi_tier(
         return collective_time(c, N, outermost_link)
 
     if c.kind == "AR":
+        assert c.kind == "AR"
         rs_c = Collective(name=c.name + "_rs", kind="RS", group=c.group, bytes_=S)
         ag_c = Collective(name=c.name + "_ag", kind="AG", group=c.group, bytes_=S)
         return (
@@ -338,28 +339,6 @@ def total_comm_time(
         result["pp_p2p"] = pp_p2p_time(model, system, strategy, domain=domain)
 
     return result
-
-
-# NOTE: `_maybe_build_groups` was the inline dispatcher gating N-tier vs
-# legacy 2-tier pricing. That logic now lives on
-# :class:`zrt.training.topology.CommDomain` so every comm consumer shares
-# the same dispatch path. Kept around as a back-compat alias in case
-# external code imported the private symbol.
-
-def _maybe_build_groups(
-    system: SystemSpec, strategy: Strategy,
-) -> "ParallelGroups | None":
-    """Legacy alias — returns ``ParallelGroups`` only for 3+ tier systems.
-
-    Prefer :func:`zrt.training.topology.build_comm_domain` going forward.
-    """
-    if len(system.interconnect.tiers) < 3:
-        return None
-    try:
-        from zrt.training.topology.process_groups import build_process_groups
-        return build_process_groups(system.world_size, strategy, system)
-    except ValueError:
-        return None
 
 
 def optimizer_comm_time(
