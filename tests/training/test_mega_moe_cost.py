@@ -184,6 +184,36 @@ def test_mega_moe_cost_uses_local_k_and_local_experts_when_sharded():
     assert terms.weight_bytes == 2 * 16 * 1024 * 3 * 2
 
 
+def test_mega_moe_cost_uses_local_hidden_when_tp_sharded():
+    terms = mega_moe_cost_terms(
+        _mega_moe_op(
+            n=1024,
+            n_local=256,
+            k=2048,
+            k_local=512,
+            top_k=2,
+            num_experts=8,
+            experts_per_rank=2,
+            micro_batch=1,
+            m=128,
+            moe_act_bytes=1,
+            act_bytes=2,
+            out_bytes=2,
+            weight_stored_bytes=2,
+            fwd_multiplier=3,
+        )
+    )
+
+    assert terms.n == 256
+    assert terms.k_eff == 512
+    assert terms.fwd_flops == 2 * 128 * 2 * 512 * 256 * 3
+    assert terms.weight_bytes == 2 * 512 * 256 * 3 * 2
+    assert terms.activation_input_bytes == 128 * 256 * 2
+    assert terms.activation_output_bytes == 128 * 256 * 2
+    assert terms.moe_activation_input_bytes == 128 * 256 * 1
+    assert _mega_moe_dispatch_bytes(terms, ep=4) == 128 * 256 * 1 * 2 / 4
+
+
 def test_mega_moe_w4a8_bytes_use_stored_fp4_weight_bytes():
     op = _mega_moe_op(
         quant_variant="w4a8",

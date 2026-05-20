@@ -192,7 +192,7 @@ def test_ep_a2a_phase_both():
 
 
 def test_ep_a2a_bytes_with_tp():
-    """EP A2A bytes should not be sharded by main TP when EP is enabled."""
+    """EP A2A bytes should use the TP-sharded hidden size."""
     model = ModelSpec(
         hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
         head_dim=128, vocab=32000, seq_len=2048,
@@ -205,7 +205,7 @@ def test_ep_a2a_bytes_with_tp():
     expected_bytes = (
         strategy.micro_batch
         * model.seq_len
-        * model.hidden
+        * (model.hidden // strategy.tp)
         * model.top_k
         * model.effective_moe_act_dtype().bytes
         // strategy.ep
@@ -214,7 +214,7 @@ def test_ep_a2a_bytes_with_tp():
     for c in graph.collectives:
         if c.group == "EP" and c.kind == "A2A":
             assert c.bytes_ == expected_bytes, (
-                f"EP A2A bytes should be {expected_bytes} (main TP ignored), got {c.bytes_}"
+                f"EP A2A bytes should be {expected_bytes} (hidden/tp), got {c.bytes_}"
             )
 
 

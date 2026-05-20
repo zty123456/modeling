@@ -84,7 +84,7 @@ def mega_moe_cost_terms(op: Op) -> MegaMoECostTerms:
     m = int(meta["m"])
     micro_batch = int(meta.get("micro_batch", 1))
     tokens = micro_batch * m
-    n = int(meta["n"])
+    n = int(meta.get("n_local", meta["n"]))
     k_eff = int(meta.get("k_local", meta["k"]))
     top_k = int(meta["top_k"])
     local_experts = int(meta.get("experts_per_rank", meta.get("num_experts", top_k)))

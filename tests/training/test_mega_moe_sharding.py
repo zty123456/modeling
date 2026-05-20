@@ -85,10 +85,11 @@ def test_mega_moe_tp_sharding_keeps_input_hidden_and_shards_output_hidden_withou
     assert mega_moe.inputs[0].shape_local == (model.seq_len, model.hidden)
     assert mega_moe.outputs[0].shape_logical == (model.seq_len, model.hidden)
     assert mega_moe.outputs[0].shape_local == (model.seq_len, model.hidden // strategy.tp)
+    assert mega_moe.meta["n_local"] == mega_moe.meta["n"] // strategy.tp
     assert mega_moe.meta["k_local"] == mega_moe.meta["k"] // strategy.tp
 
 
-def test_mega_moe_with_ep_ignores_main_tp_for_routed_path():
+def test_mega_moe_with_ep_uses_main_tp_for_routed_path():
     model = _moe_model()
     strategy = Strategy(tp=4, ep=4, mega_moe=True)
     graph = build_graph(model, strategy)
@@ -96,11 +97,12 @@ def test_mega_moe_with_ep_ignores_main_tp_for_routed_path():
     mega_moe = _op_for_layer(graph, 0, kind="mega_moe")
 
     assert mega_moe.inputs[0].shape_local == (model.seq_len, model.hidden)
-    assert mega_moe.outputs[0].shape_local == (model.seq_len, model.hidden)
-    assert "k_local" not in mega_moe.meta
+    assert mega_moe.outputs[0].shape_local == (model.seq_len, model.hidden // strategy.tp)
+    assert mega_moe.meta["n_local"] == mega_moe.meta["n"] // strategy.tp
+    assert mega_moe.meta["k_local"] == mega_moe.meta["k"] // strategy.tp
 
 
-def test_routed_expert_with_ep_ignores_main_tp_for_routed_path():
+def test_routed_expert_with_ep_uses_main_tp_for_routed_path_and_a2a_bytes():
     model = _moe_model()
     strategy = Strategy(tp=4, ep=4, mega_moe=False)
     graph = build_graph(model, strategy)
@@ -109,12 +111,12 @@ def test_routed_expert_with_ep_ignores_main_tp_for_routed_path():
     ep_a2a = _ep_a2a_collectives(graph)
 
     assert routed.inputs[0].shape_local == (model.seq_len, model.hidden)
-    assert routed.outputs[0].shape_local == (model.seq_len, model.hidden)
-    assert "k_local" not in routed.meta
+    assert routed.outputs[0].shape_local == (model.seq_len, model.hidden // strategy.tp)
+    assert routed.meta["k_local"] == routed.meta["k"] // strategy.tp
     expected_bytes = (
         strategy.micro_batch
         * model.seq_len
-        * model.hidden
+        * (model.hidden // strategy.tp)
         * model.top_k
         * model.effective_moe_act_dtype().bytes
         // strategy.ep

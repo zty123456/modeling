@@ -415,6 +415,8 @@ def _insert_ep_collectives(
       - A2A after routed expert FFN (gathers expert outputs)
     """
     h = model.hidden
+    if shard.tp > 1:
+        h = h // shard.tp
     seq = model.seq_len
     if shard.cp > 1:
         seq = seq // shard.cp
@@ -424,7 +426,7 @@ def _insert_ep_collectives(
     # halves the A2A volume vs BF16 baseline).
     act_bytes = model.effective_moe_act_dtype().bytes
 
-    # EP A2A payload: micro_batch * seq * hidden * topk * dtype / EP
+    # EP A2A payload: micro_batch * seq * hidden_tp * topk * dtype / EP
     # Each token is routed to topk experts, but A2A distributes tokens across EP ranks
     # So each rank sends/receives 1/EP of the total routed data
     micro_batch = strategy.micro_batch
@@ -480,14 +482,13 @@ def _apply_tp_sharding(
         op = graph.ops[i]
 
         if op.kind == "mega_moe":
-            if shard.has_ep:
-                continue
             k = op.meta.get("k", 0)
             n = op.meta.get("n", 0)
             if k > 0:
                 op.meta["k_local"] = k // shard.tp
             if n > 0:
                 n_local = n // shard.tp
+                op.meta["n_local"] = n_local
                 for t in op.outputs:
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
@@ -534,8 +535,6 @@ def _apply_tp_sharding(
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
             elif "routed_expert" in op.name:
-                if shard.has_ep:
-                    continue
                 # routed_expert_ffn fuses up+gate+down projections into one op.
                 # up/gate are column-parallel (n sharded), down is row-parallel
                 # (k sharded). Total FLOPs = 6*m*n*k*top_k / tp (single tp factor).
