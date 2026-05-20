@@ -433,6 +433,7 @@ def optimizer_comm_time(
 
     P_muon_non_routed = int(P_non_routed * f_muon)
     P_muon_routed = int(P_routed * f_muon)
+    param_bytes = 4  # FP32 master copy
 
     # Build/reuse the resolver. Callers from pipeline_step_time pass
     # `domain=` already built so groups are shared; legacy callers
