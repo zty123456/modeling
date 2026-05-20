@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from zrt.training.compose.stage import StageTime, stage_time
 from zrt.training.ir.training_graph import Graph
 from zrt.training.models.comm import total_comm_time, optimizer_comm_time
+from zrt.training.topology import CommDomain
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
 from zrt.training.models.optimizer import (
@@ -629,6 +630,11 @@ def pipeline_step_time(
     pp = strategy.pp
     M = strategy.num_microbatches()
 
+    # One resolver per estimate() call. ParallelGroups is enumerated
+    # lazily on first .time(c) / .ranks() / .link() lookup, then cached
+    # so per-stage and per-collective queries all share it.
+    domain = CommDomain(system=system, strategy=strategy)
+
     # Compute per-stage times
     stage_ids = _assign_stages(model, strategy)
     stage_times: list[StageTime] = []
@@ -646,11 +652,11 @@ def pipeline_step_time(
             )
         ]
 
-        st = stage_time(stage_ops, stage_colls, model, system, strategy)
+        st = stage_time(stage_ops, stage_colls, model, system, strategy, domain=domain)
         stage_times.append(st)
 
     # Compute DP allreduce time and PP P2P overhead
-    comm_times = total_comm_time(graph, model, system, strategy)
+    comm_times = total_comm_time(graph, model, system, strategy, domain=domain)
     dp_ar_time = comm_times.get("dp_grad_reduce", 0.0)
 
     # Add PP P2P per-microbatch cost to each stage's fwd and bwd
@@ -767,7 +773,7 @@ def pipeline_step_time(
 
     # Optimizer time and communication
     opt_time = _compute_optimizer_time(model, system, strategy)
-    opt_comm_parts = optimizer_comm_time(model, system, strategy)
+    opt_comm_parts = optimizer_comm_time(model, system, strategy, domain=domain)
     ag_time = opt_comm_parts.get("muon_ag", 0.0)
     rs_time = opt_comm_parts.get("muon_rs", 0.0)
 
@@ -908,9 +914,17 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
         return flops / eff_flops if eff_flops > 0 else 0.0
 
 
-def _compute_optimizer_comm_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
-    """Compute optimizer communication time (Muon ZeRO-1 AllGather + ReduceScatter)."""
-    comm_times = optimizer_comm_time(model, system, strategy)
+def _compute_optimizer_comm_time(
+    model: ModelSpec, system: SystemSpec, strategy: Strategy,
+    domain: CommDomain | None = None,
+) -> float:
+    """Compute optimizer communication time (Muon ZeRO-1 AllGather + ReduceScatter).
+
+    Optional ``domain`` lets the caller reuse a pre-built resolver from
+    :func:`pipeline_step_time`. Without it, a local fall-back domain is
+    instantiated — equivalent to the previous behavior for back-compat.
+    """
+    comm_times = optimizer_comm_time(model, system, strategy, domain=domain)
     return comm_times.get("muon_ag", 0.0) + comm_times.get("muon_rs", 0.0)
 
 

@@ -14,6 +14,7 @@ from zrt.training.io.perf_tables import (
     effective_flops, effective_hbm_bw_bps, peak_tflops_for,
 )
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
+from zrt.training.topology import CommDomain
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -171,8 +172,22 @@ def stage_time(
     model: ModelSpec,
     system: SystemSpec,
     strategy: Strategy,
+    domain: CommDomain | None = None,
 ) -> StageTime:
-    """Compute forward + backward time for one PP stage and one microbatch."""
+    """Compute forward + backward time for one PP stage and one microbatch.
+
+    Parameters
+    ----------
+    domain
+        Optional shared :class:`CommDomain`. When provided, ALL
+        per-collective costs are priced through it — picking up the
+        N-tier explicit-ranks path automatically for 3+ tier systems
+        (no per-call rebuilds of ParallelGroups). When ``None``, a
+        local domain is constructed inline; callers in the search hot
+        path should pass a pre-built one to avoid the rebuild.
+    """
+    if domain is None:
+        domain = CommDomain(system=system, strategy=strategy)
     gpu_name = system.gpu.name
     gpu = system.gpu
 
@@ -212,9 +227,10 @@ def stage_time(
     t_other_comm_fwd = 0.0  # DP and any other groups
     t_other_comm_bwd = 0.0
     for c in stage_collectives:
-        group_size = _group_size(c.group, strategy)
-        tier = tier_for_group(c.group, group_size, system)
-        ct = collective_time(c, group_size, tier)
+        # All per-collective pricing goes through the unified resolver —
+        # picks the right tier (N-tier for 3+ levels, legacy for 2-tier)
+        # without each call site re-deriving the dispatch.
+        ct = domain.time(c)
 
         if c.group == "CP":
             if c.phase == "fwd":
@@ -507,15 +523,20 @@ def _wave_overlap_saved(comm_time: float, gemm_time: float, K: int = 4) -> float
 
 def _ep_comm_time(
     collectives: list[Collective], strategy: Strategy, system: SystemSpec,
+    domain: CommDomain | None = None,
 ) -> float:
-    """Total EP A2A communication time (seconds)."""
-    from zrt.training.models.comm import collective_time, tier_for_group
+    """Total EP A2A communication time (seconds).
+
+    Uses the shared :class:`CommDomain` when provided so the N-tier
+    explicit-ranks path applies (A2A picks the outermost spanned tier
+    for 3+ tier systems). Local fall-back domain otherwise.
+    """
+    if domain is None:
+        domain = CommDomain(system=system, strategy=strategy)
     total = 0.0
     for c in collectives:
         if c.group == "EP":
-            group_size = _group_size(c.group, strategy)
-            tier = tier_for_group(c.group, group_size, system)
-            total += collective_time(c, group_size, tier)
+            total += domain.time(c)
     return total
 
 
