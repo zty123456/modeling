@@ -174,6 +174,32 @@ def _op_formula(op, cost):
     if op.kind == "hash_route":
         return "negligible", "negligible", "negligible", "negligible"
 
+    if op.kind == "mega_moe":
+        mm = m.get("m", 0)
+        micro_batch = m.get("micro_batch", 1)
+        tokens = mm * micro_batch
+        nn = m.get("n_local", m.get("n", 0))
+        kk = m.get("k_local", m.get("k", 0))
+        top_k = m.get("top_k", 0)
+        mult = m.get("fwd_multiplier", 1.0)
+        quant = m.get("quant_variant", "standard")
+        waves = m.get("requested_waves", 0)
+        local_experts = m.get("experts_per_rank", m.get("num_experts", top_k))
+        fwd_str = (
+            "Mega MoE dispatch+FFN+combine: "
+            f"m={mm}, micro_batch={micro_batch}, tokens={tokens}, "
+            f"top_k={top_k}, k={kk}, n={nn}, experts/rank={local_experts}, "
+            f"quant={quant}, waves={waves}; "
+            f"2*tokens*top_k*k*n*mult = {_fmt_e(ff)}"
+        )
+        bwd_str = f"dx+dw = 2*fwd = {_fmt_e(df + wf)}"
+        bytes_str = (
+            "act_in+act_out+stored_weights "
+            f"(quant={quant}) = {_fmt_e(cost.fwd_bytes)}"
+        )
+        bwd_bytes_str = f"same fused traffic per dx/dw = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
     # Fallback
     return f"fwd = {_fmt_e(ff)}", f"bwd = {_fmt_e(df + wf)}", \
            f"bytes = {_fmt_e(cost.fwd_bytes)}", f"dx_bytes = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
@@ -235,7 +261,7 @@ def _classify_ops_in_layer(ops: list[Op], layer_kind: str) -> list[dict]:
         boundaries = [
             ("Attention + Indexer", "ln1", "residual1"),
             ("Router + Shared Expert", "ln2", "shared_down_proj"),
-            ("Routed Expert", "routed_expert_ffn", "residual2"),
+            ("Routed Expert", ("routed_expert_ffn", "mega_moe"), "residual2"),
         ]
     elif layer_kind == "mtp":
         boundaries = [
@@ -250,17 +276,25 @@ def _classify_ops_in_layer(ops: list[Op], layer_kind: str) -> list[dict]:
         ]
 
     blocks = []
+
+    def _matches_marker(op: Op, marker) -> bool:
+        if marker is None:
+            return False
+        if isinstance(marker, tuple):
+            return any(part in op.name for part in marker)
+        return marker in op.name
+
     for name, start_marker, end_marker in boundaries:
         block_ops = []
         capturing = start_marker is None
         for op in ops:
-            if start_marker and start_marker in op.name:
+            if _matches_marker(op, start_marker):
                 capturing = True
             if capturing:
                 block_ops.append(op)
-                if end_marker and end_marker in op.name:
+                if _matches_marker(op, end_marker):
                     # Remove end marker op from this block if it's the start of next
-                    if start_marker is None or (start_marker and start_marker in op.name):
+                    if start_marker is None or _matches_marker(op, start_marker):
                         block_ops.pop()
                     break
         if block_ops:

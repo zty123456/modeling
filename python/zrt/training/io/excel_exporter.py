@@ -381,6 +381,8 @@ def export_estimate_excel(
         ["Optimizer", strategy.optimizer.value, ""],
         ["TP Overlap", strategy.tp_overlap.value, ""],
         ["EP Overlap", str(strategy.ep_overlap), ""],
+        ["Mega MoE", str(strategy.mega_moe), ""],
+        ["Mega MoE Waves", strategy.mega_moe_waves, ""],
         ["Dual-Batch Overlap", str(strategy.dualbatch), ""],
         ["", "", ""],
         ["Recompute", "", ""],
