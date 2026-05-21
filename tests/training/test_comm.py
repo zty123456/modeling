@@ -266,12 +266,12 @@ def test_unknown_topology_falls_back_to_ring():
 
 
 def test_kb_efficiency_scales_bandwidth():
-    """effective_bw_bps = peak/8 × kb_efficiency; halving kb halves bw."""
+    """effective_bw_bps = peak GB/s × kb_efficiency; halving kb halves bw."""
     full = LinkSpec(type="x", bandwidth_gbps=800, latency_us=1.0,
                     topology="full_mesh", kb_efficiency=0.7)
     half = LinkSpec(type="x", bandwidth_gbps=800, latency_us=1.0,
                     topology="full_mesh", kb_efficiency=0.35)
-    assert full.effective_bw_bps(8) == pytest.approx(800e9 / 8 * 0.7)
+    assert full.effective_bw_bps(8) == pytest.approx(800e9 * 0.7)
     assert full.effective_bw_bps(8) == pytest.approx(2 * half.effective_bw_bps(8))
 
 
@@ -281,7 +281,7 @@ def test_oversubscription_continuous_scale_derate():
     s = 1 + (os-1)*(1 - R/N) rising toward os as the domain grows."""
     link = LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0,
                     topology="fat_tree", num_devices=8, oversubscription=4.0)
-    base = 400e9 / 8 * 0.7
+    base = 400e9 * 0.7
     assert link.effective_bw_bps(8) == pytest.approx(base)          # at radix → s=1
     # N=64: s = 1 + 3*(1 - 8/64) = 3.625 (continuous, not the flat /4 step)
     assert link.effective_bw_bps(64) == pytest.approx(base / 3.625)
@@ -297,7 +297,7 @@ def test_oversubscription_applies_on_unbounded_inter_link():
     fallback that made oversubscription a no-op on exactly these links)."""
     link = LinkSpec(type="RoCE", bandwidth_gbps=200, latency_us=5.0,
                     topology="fat_tree", num_devices=0, oversubscription=4.0)
-    base = 200e9 / 8 * 0.7
+    base = 200e9 * 0.7
     assert link.effective_bw_bps(2) == pytest.approx(base / 4.0)
     assert link.effective_bw_bps(512) == pytest.approx(base / 4.0)
 
@@ -311,7 +311,7 @@ def test_clos_is_own_class_never_derates_keeps_log2_latency():
                     topology="clos", num_devices=8, oversubscription=4.0)
     assert clos.topology_class == "clos"
     # Bandwidth independent of domain size despite oversubscription=4.0.
-    base = 400e9 / 8 * 0.7
+    base = 400e9 * 0.7
     assert clos.effective_bw_bps(8) == pytest.approx(base)
     assert clos.effective_bw_bps(4096) == pytest.approx(base)
 

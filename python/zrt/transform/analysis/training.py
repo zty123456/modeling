@@ -894,7 +894,7 @@ class TrainingPipelinePass(GraphPass):
             compute_time_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
         else:
             opt_state_bytes = float(opt_node.attrs.get("state_bytes", 0))
-            hbm_bw = hw.memory.hbm_bandwidth_gbps * 1e9 / 8
+            hbm_bw = hw.memory.hbm_bandwidth_gbps * 1e9
             compute_time_us = (opt_state_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
 
         ag_time_us = 0.0
@@ -906,7 +906,7 @@ class TrainingPipelinePass(GraphPass):
                 dp = ctx.parallel.dp if ctx.parallel else 1
                 gpus_per_node = hw.interconnect.intra_node.num_devices
                 link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
-                dp_bw = link.bandwidth_gbps * 1e9 / 8
+                dp_bw = link.bandwidth_gbps * 1e9
                 ring_factor = (dp - 1) / dp
                 ag_time_us = (ring_factor * ag_bytes / dp_bw) * 1e6 if dp_bw > 0 else 0.0
                 if ns_rotation:
@@ -973,9 +973,7 @@ class TrainingPipelinePass(GraphPass):
 
         gpus_per_node = hw.interconnect.intra_node.num_devices
         link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
-        dp_bw_bytes_per_us = (
-            link.bandwidth_gbps * 1e9 / 8 / 1e6
-        )
+        dp_bw_bytes_per_us = link.bandwidth_gbps * 1e9 / 1e6
         if dp_bw_bytes_per_us <= 0:
             return 0.0
 

@@ -145,7 +145,7 @@ class LinkSpec:
         the ideal reference the scale-derated fabrics are measured against).
         The algorithmic (N-1)/N data-volume factor lives in comm.py.
         """
-        base = self.bandwidth_gbps * 1e9 / 8.0 * self.kb_efficiency
+        base = self.bandwidth_gbps * 1e9 * self.kb_efficiency
         if base <= 0.0:
             return 0.0
         if (

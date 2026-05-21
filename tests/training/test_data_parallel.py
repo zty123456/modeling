@@ -168,6 +168,43 @@ class TestDPZero2:
 
         assert rs_time == pytest.approx(ar_time / 2)
 
+    def test_dp_ar_time_treats_interconnect_bandwidth_as_gb_per_second(self):
+        dp = 4
+        bucket_bytes = 900_000
+        comm_node = OpNode(
+            id="comm_grad_reduce",
+            op_type="comm.all_reduce",
+            inputs=[], outputs=[],
+            attrs={
+                "group_size": dp,
+                "collective": "all_reduce",
+                "bucket_bytes": bucket_bytes,
+                "role": "dp_grad_reduce",
+            },
+            scope="data_parallel.grad_reduce",
+            category="communication",
+        )
+        comm_node.annotations["dp_comm"] = True
+
+        graph = OpGraph(
+            name="test_dp_bw_units",
+            phase="train_backward",
+            nodes={"comm_grad_reduce": comm_node},
+            metadata={"seq_len": 4096, "hidden": 4096},
+        )
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=dp),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        ar_time = TrainingPipelinePass._compute_dp_ar_time(
+            graph, _make_hardware_spec(), ctx,
+        )
+
+        expected = 2.0 * (dp - 1) / dp * bucket_bytes / (900e9 / 1e6)
+        assert ar_time == pytest.approx(expected)
+
 
 class TestDPOverlap:
     """Tests for DP overlap-in-bubble behavior."""

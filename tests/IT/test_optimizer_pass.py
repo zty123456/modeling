@@ -19,6 +19,7 @@ from python.zrt.ir.node import OpNode
 from python.zrt.ir.types import TensorMeta, DType
 from python.zrt.transform.training.optimizer import OptimizerPass
 from python.zrt.transform.context import TransformContext, TrainingConfig, ParallelConfig
+from python.zrt.transform.analysis.training import TrainingPipelinePass
 from python.zrt.hardware.spec import HardwareSpec, MemorySpec, InterconnectSpec, LinkSpec
 
 
@@ -512,19 +513,77 @@ class TestComputeOptimizerStepTime:
         """Adam compute time = state_bytes / hbm_bandwidth."""
         state_bytes = 1e6
         hbm_bw_gbps = 3352  # H100
-        hbm_bw = hbm_bw_gbps * 1e9 / 8
+        hbm_bw = hbm_bw_gbps * 1e9
         compute_us = (state_bytes / hbm_bw) * 1e6
         assert compute_us > 0
+
+    def test_adam_compute_time_treats_hbm_bandwidth_as_gb_per_second(self):
+        """Graph-native optimizer timing must not treat GB/s as Gbit/s."""
+        opt_node = OpNode(
+            id="optimizer_step",
+            op_type="optimizer.adam",
+            inputs=[], outputs=[],
+            attrs={"optimizer": "adam", "state_bytes": 3_352_000},
+            category="compute",
+        )
+        graph = OpGraph(
+            name="test_optimizer_bw_units",
+            phase="train_backward",
+            nodes={"optimizer_step": opt_node},
+            edges=[],
+        )
+        compute_us, ag_us, rs_us, total_comm_us = (
+            TrainingPipelinePass._compute_optimizer_step_time(
+                graph, make_mock_hardware(), make_mock_context(optimizer="adam"),
+            )
+        )
+
+        assert compute_us == pytest.approx(1.0)
+        assert ag_us == pytest.approx(0.0)
+        assert rs_us == pytest.approx(0.0)
+        assert total_comm_us == pytest.approx(0.0)
 
     def test_ag_time_ring_factor_formula(self):
         """AG time includes ring factor (dp-1)/dp."""
         ag_bytes = 1e6
         dp = 8
-        dp_bw = 900e9 / 8  # intra-node
+        dp_bw = 900e9  # intra-node GB/s
         ring_factor = (dp - 1) / dp
         ag_us = (ring_factor * ag_bytes / dp_bw) * 1e6
         assert ag_us > 0
         assert ring_factor == pytest.approx(0.875)
+
+    def test_muon_ag_time_treats_interconnect_bandwidth_as_gb_per_second(self):
+        """Graph-native Muon AG/RS timing must not divide GB/s by 8."""
+        opt_node = OpNode(
+            id="optimizer_step",
+            op_type="optimizer.muon",
+            inputs=[], outputs=[],
+            attrs={
+                "optimizer": "muon",
+                "step_flops": 0,
+                "muon_ag_bytes": 900_000,
+                "ns_rotation": True,
+            },
+            category="compute",
+        )
+        graph = OpGraph(
+            name="test_muon_bw_units",
+            phase="train_backward",
+            nodes={"optimizer_step": opt_node},
+            edges=[],
+        )
+        compute_us, ag_us, rs_us, total_comm_us = (
+            TrainingPipelinePass._compute_optimizer_step_time(
+                graph, make_mock_hardware(), make_mock_context(optimizer="muon", dp=8),
+            )
+        )
+
+        expected_ag_us = (7 / 8) * 900_000 / 900e9 * 1e6
+        assert compute_us == pytest.approx(0.0)
+        assert ag_us == pytest.approx(expected_ag_us)
+        assert rs_us == pytest.approx(expected_ag_us)
+        assert total_comm_us == pytest.approx(2 * expected_ag_us)
 
     def test_rs_time_equals_ag_when_rotation(self):
         """RS time = AG time when Moonshot rotation enabled."""

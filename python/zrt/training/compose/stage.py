@@ -35,10 +35,15 @@ class StageTime:
     tp_exposed: float = 0.0  # TP comm exposed after CoC/MC2 (fwd + bwd combined)
     ep_exposed: float = 0.0  # EP comm exposed after wave-overlap (fwd + bwd combined)
     cp_exposed: float = 0.0  # CP comm exposed — no overlap mechanism (fwd + bwd combined)
-    recompute: float = 0.0  # activation-recompute fwd-redo time. Kept inside `bwd`
-                            # for the pipeline timeline (it is on the bwd critical
-                            # path); tracked separately so it can be reported as
-                            # its own step-time term instead of hidden in bwd.
+    recompute: float = 0.0  # Per-microbatch activation-recompute fwd-redo time.
+                            # NOT folded into ``bwd`` / ``bwd_dx`` / ``comm_bwd`` —
+                            # those fields stay pure (compute + native exposed comm
+                            # only). Pipeline composers receive a locally-augmented
+                            # copy with recompute added back when they need it on
+                            # the critical path (see schedules.py:pipeline_step_time).
+                            # In ``StepResult.per_stage`` this is the FULL per-mb
+                            # recompute work (pre-hide); ``StepResult.recompute_time``
+                            # vs ``recompute_time_raw`` reports critical-path vs total.
 
 
 def ep_imbalance_factor(num_experts: int, ep: int, topk: int = 1) -> float:

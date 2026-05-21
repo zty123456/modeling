@@ -44,7 +44,7 @@ class StepResult:
       compute_time     = fwd_compute + bwd_compute + recompute_time
       bubble           = warmup + cooldown   (absolute pipeline idle, seconds)
       exposed_comm     = tp_exposed + cp_exposed + ep_exposed + pp_exposed + dp_exposed
-      hidden_comm      = dp_hidden + tp_hidden + ep_hidden
+      hidden_comm      = dp_hidden + tp_hidden + ep_hidden + pp_hidden
       total_comm_volume = exposed_comm + hidden_comm
     """
 
@@ -108,6 +108,7 @@ class StepResult:
     dp_hidden: float = 0.0  # DP AR absorbed in pipeline bubble
     tp_hidden: float = 0.0  # TP hidden by CoC/MC2
     ep_hidden: float = 0.0  # EP hidden by wave-overlap
+    pp_hidden: float = 0.0  # PP P2P hidden by DualPipe/DualPipeV bwd_dw stream
 
     # Total comm volume = exposed + hidden
     total_comm_volume: float = 0.0  # All comm in step
@@ -707,32 +708,45 @@ def pipeline_step_time(
 
     pp_p2p_fwd_exposed: list[float] = []
     pp_p2p_bwd_exposed: list[float] = []
+    pp_p2p_hidden: list[float] = []
     recompute_exposed: list[float] = []
     for st in stage_times:
         if pp == 1 or not is_dual:
             pp_p2p_fwd_exposed.append(pp_p2p)
             pp_p2p_bwd_exposed.append(pp_p2p)
+            pp_p2p_hidden.append(0.0)
             recompute_exposed.append(st.recompute)
             continue
         # Dual-stream hide. 2x pp_p2p (one fwd-boundary + one bwd-boundary
-        # per mb) and st.recompute compete for the bwd_dw budget on this
-        # stage. Allocate the residual proportionally so the report
-        # attributes the exposed share to each source.
-        total_to_hide = 2.0 * pp_p2p + st.recompute
+        # per mb) and st.recompute share the bwd_dw budget on this stage.
+        # Attribute the bwd_dw hide window to PP first: PP is communication
+        # scheduled on the opposite stream, while any remaining residual from
+        # a large recompute belongs to recompute itself, not PP.
+        pp_p2p_total = 2.0 * pp_p2p
+        total_to_hide = pp_p2p_total + st.recompute
         if total_to_hide <= 0:
             pp_p2p_fwd_exposed.append(0.0)
             pp_p2p_bwd_exposed.append(0.0)
+            pp_p2p_hidden.append(0.0)
             recompute_exposed.append(0.0)
             continue
-        residual = max(0.0, total_to_hide - st.bwd_dw)
-        pp_p2p_share = residual * (2.0 * pp_p2p) / total_to_hide
+        pp_p2p_share = max(0.0, pp_p2p_total - st.bwd_dw)
+        pp_p2p_hide = pp_p2p_total - pp_p2p_share
+        recompute_hide_budget = max(0.0, st.bwd_dw - pp_p2p_total)
+        recompute_share = max(0.0, st.recompute - recompute_hide_budget)
         # Split the pp_p2p residual evenly between fwd and bwd boundaries.
         pp_p2p_fwd_exposed.append(pp_p2p_share / 2.0)
         pp_p2p_bwd_exposed.append(pp_p2p_share / 2.0)
-        recompute_exposed.append(residual * st.recompute / total_to_hide)
+        pp_p2p_hidden.append(pp_p2p_hide)
+        recompute_exposed.append(recompute_share)
 
+    # Build the augmented stage_times the composer needs to see (recompute +
+    # pp_p2p on the bwd critical path) WITHOUT mutating the original list.
+    # ``step.per_stage`` will expose the PURE original copy so downstream
+    # consumers (Excel / HTML / JSON / search report) see per-stage bwd that
+    # is just compute + native exposed comm — no pp_p2p, no recompute.
     if pp_p2p > 0 or recompute_raw_per_mb > 0:
-        stage_times = [
+        stage_times_aug = [
             StageTime(
                 fwd=st.fwd + pp_p2p_fwd_exposed[i],
                 # bwd = bwd_dx + bwd_dw, so adding to bwd_dx propagates to bwd.
@@ -750,12 +764,19 @@ def pipeline_step_time(
             )
             for i, st in enumerate(stage_times)
         ]
+    else:
+        stage_times_aug = stage_times
 
-    # Compose according to schedule
+    # Compose using the augmented view (composer needs recompute on the
+    # critical path for its bubble formula).
     composer_cls = COMPOSER_BY_SCHED.get(strategy.pp_schedule, OneF1BComposer)
     composer = composer_cls()
-    step = composer.compose(stage_times, M, pp, dp_ar_time, strategy)
+    step = composer.compose(stage_times_aug, M, pp, dp_ar_time, strategy)
 
+    # per_stage exposes ORIGINAL (pure) stage_times. ``st.bwd`` here is pure
+    # backward compute + native exposed comm. ``st.recompute`` is the FULL
+    # per-mb recompute work (pre-hide) — even when dual-stream hiding makes
+    # the critical-path residual smaller than this.
     step.per_stage = stage_times
 
     # === Communication and compute breakdown ===
@@ -764,15 +785,19 @@ def pipeline_step_time(
     # Invariants enforced here:
     #   pipeline_time    = compute_time + exposed_comm + bubble   (exact)
     #   exposed_comm     = tp + cp + ep + pp + dp _exposed       (exact)
-    #   hidden_comm      = dp_hidden + tp_hidden + ep_hidden      (exact)
+    #   hidden_comm      = dp_hidden + tp_hidden + ep_hidden + pp_hidden (exact)
     #   total_comm_volume = exposed_comm + hidden_comm            (exact)
     #
     # comm_fwd/comm_bwd in StageTime are already-reduced exposed portions
     # (TP CoC/MC2 and EP wave-overlap applied inside stage_time()).
     # The bottleneck stage ratio gives a schedule-agnostic critical-path split.
 
+    # Bottleneck selection drives the timeline-based attribution (scale,
+    # comm scaling, recompute_time). Must use the AUGMENTED view so it
+    # matches what the composer saw — picking from pure stage_times would
+    # under-count stages whose timeline weight comes from recompute.
     bot_idx, s_bot = max(
-        enumerate(stage_times), key=lambda kv: kv[1].fwd + kv[1].bwd
+        enumerate(stage_times_aug), key=lambda kv: kv[1].fwd + kv[1].bwd
     )
     bot_total = s_bot.fwd + s_bot.bwd
 
@@ -801,9 +826,10 @@ def pipeline_step_time(
         )
         step.tp_hidden = scale * s_bot.tp_hidden
         step.ep_hidden = scale * s_bot.ep_hidden
+        step.pp_hidden = scale * pp_p2p_hidden[bot_idx]
     else:
         step.tp_exposed = step.ep_exposed = step.cp_exposed = step.pp_exposed = 0.0
-        step.tp_hidden = step.ep_hidden = 0.0
+        step.tp_hidden = step.ep_hidden = step.pp_hidden = 0.0
 
     exposed_comm_excl_dp = (step.tp_exposed + step.ep_exposed
                             + step.cp_exposed + step.pp_exposed)
@@ -856,7 +882,9 @@ def pipeline_step_time(
     # dual-batch above). Verify the invariant: dp_hidden = dp_ar_time - dp_exposed.
     step.dp_hidden = max(0.0, dp_ar_time - step.dp_exposed)
 
-    step.hidden_comm = step.dp_hidden + step.tp_hidden + step.ep_hidden
+    step.hidden_comm = (
+        step.dp_hidden + step.tp_hidden + step.ep_hidden + step.pp_hidden
+    )
     step.total_comm_volume = step.exposed_comm + step.hidden_comm
 
     # Optimizer time and communication

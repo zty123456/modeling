@@ -126,7 +126,7 @@ class CommLatencyPass(GraphPass):
             else:
                 link = hw_spec.interconnect.intra_node
 
-            # Unified effective-bandwidth entry: peak / 8 × kb_efficiency,
+            # Unified effective-bandwidth entry: peak GB/s × kb_efficiency,
             # plus non-clos switched-fabric over-subscription derate.
             bandwidth_bps = link.effective_bw_bps(group_size)
 

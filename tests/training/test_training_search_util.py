@@ -656,7 +656,8 @@ class TestFormatResults:
             ep_hidden_ms=1.0,
             ep_total_ms=5.0,
             pp_exposed_ms=2.0,
-            pp_total_ms=2.0,
+            pp_hidden_ms=0.5,
+            pp_total_ms=2.5,
             dp_exposed_ms=6.0,
             dp_hidden_ms=3.0,
             dp_total_ms=9.0,
@@ -673,6 +674,7 @@ class TestFormatResults:
         assert "ep_exposed_ms" in df.columns
         assert "pp_total_ms" in df.columns
         assert "pp_exposed_ms" in df.columns
+        assert "pp_hidden_ms" in df.columns
         assert "dp_total_ms" in df.columns
         assert "dp_exposed_ms" in df.columns
         assert df.iloc[0]["tp_total_ms"] == 7.0
@@ -681,8 +683,9 @@ class TestFormatResults:
         assert df.iloc[0]["cp_exposed_ms"] == 3.0
         assert df.iloc[0]["ep_total_ms"] == 5.0
         assert df.iloc[0]["ep_exposed_ms"] == 4.0
-        assert df.iloc[0]["pp_total_ms"] == 2.0
+        assert df.iloc[0]["pp_total_ms"] == 2.5
         assert df.iloc[0]["pp_exposed_ms"] == 2.0
+        assert df.iloc[0]["pp_hidden_ms"] == 0.5
         assert df.iloc[0]["dp_total_ms"] == 9.0
         assert df.iloc[0]["dp_exposed_ms"] == 6.0
 

@@ -740,6 +740,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["ep_exposed_ms"] = round(report.ep_exposed_ms, 2)
         d["pp_total_ms"] = round(report.pp_total_ms, 2)
         d["pp_exposed_ms"] = round(report.pp_exposed_ms, 2)
+        d["pp_hidden_ms"] = round(report.pp_hidden_ms, 2)
         d["dp_total_ms"] = round(report.dp_total_ms, 2)
         d["dp_exposed_ms"] = round(report.dp_exposed_ms, 2)
         d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 4)
@@ -774,7 +775,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     metric_cols = ["compute_time_ms", "fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
                    "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                    "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
-                   "dp_total_ms", "dp_exposed_ms",
+                   "pp_hidden_ms", "dp_total_ms", "dp_exposed_ms",
                    "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms", "recompute_time_ms",
                    "recompute_time_raw_ms", "step_time_ms", "pipeline_time_ms",
                    "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",

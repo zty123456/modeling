@@ -661,6 +661,7 @@ def _build_summary(
             "dp_exposed_ms": getattr(report, "dp_exposed_ms", 0.0),
             "tp_hidden_ms": getattr(report, "tp_hidden_ms", 0.0),
             "ep_hidden_ms": getattr(report, "ep_hidden_ms", 0.0),
+            "pp_hidden_ms": getattr(report, "pp_hidden_ms", 0.0),
             "dp_hidden_ms": getattr(report, "dp_hidden_ms", 0.0),
             "total_comm_volume_ms": getattr(report, "total_comm_volume_ms", 0.0),
         },
