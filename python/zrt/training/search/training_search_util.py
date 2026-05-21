@@ -43,11 +43,6 @@ logger = logging.getLogger(__name__)
 _WORKER_MODEL_CACHE: Dict[Tuple[str, Optional[str]], ModelSpec] = {}
 _WORKER_HW_CACHE: Dict[Tuple[str, int], SystemSpec] = {}
 
-# Main-process caches (shared across format_results / export_best_configs_excel).
-_HW_CACHE: Dict[str, Any] = {}
-_CommDomainKey = Tuple[str, int, int, int, int, int, int]  # hw, ws, tp, cp, ep, dp, pp
-_COMM_DOMAIN_CACHE: Dict[_CommDomainKey, Dict[str, str]] = {}
-
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 _DEFAULT_POD_PACKING_AXES = ("tp", "cp")
 _COMM_DOMAIN_AXES = ("ep", "pp", "dp", "tp", "cp")
@@ -215,7 +210,7 @@ def _load_model_spec(model_name: str, quant_preset: Optional[str] = None) -> Mod
 def _make_system_from_config(config: Dict, *, warn_partial: bool = True) -> SystemSpec:
     _reject_gpus_per_node_config(config)
     hw_name = config.get("hw", "nvidia_h100_sxm")
-    hw = _cached_hw(hw_name)
+    hw = load_hw(hw_name)
 
     gpus_per_node = _inferred_gpus_per_node(hw)
     world_size_override = None
@@ -299,33 +294,6 @@ def _comm_domain_columns_from_config(config: Dict[str, Any]) -> dict[str, str]:
         f"{axis}_comm_domain": format_comm_domain_entry(report[axis.upper()])
         for axis in _COMM_DOMAIN_AXES
     }
-
-
-def _cached_hw(hw_name: str):
-    """Cached hardware-spec loader for the main process."""
-    if hw_name not in _HW_CACHE:
-        _HW_CACHE[hw_name] = load_hw(hw_name)
-    return _HW_CACHE[hw_name]
-
-
-def _comm_domain_cache_key(config: Dict[str, Any]) -> _CommDomainKey:
-    return (
-        config.get("hw", "nvidia_h100_sxm"),
-        int(config.get("world_size", 1)),
-        int(config.get("tp", 1)),
-        int(config.get("cp", 1)),
-        int(config.get("ep", 1)),
-        int(config.get("dp", 1)),
-        int(config.get("pp", 1)),
-    )
-
-
-def _cached_comm_domain_columns(config: Dict[str, Any]) -> Dict[str, str]:
-    """Memoized wrapper that avoids rebuilding SystemSpec+Strategy every row."""
-    key = _comm_domain_cache_key(config)
-    if key not in _COMM_DOMAIN_CACHE:
-        _COMM_DOMAIN_CACHE[key] = _comm_domain_columns_from_config(config)
-    return _COMM_DOMAIN_CACHE[key]
 
 
 @dataclass
@@ -578,7 +546,7 @@ class TrainingConfigManager:
 
         system = None
         try:
-            hw = _cached_hw(hw_name)
+            hw = load_hw(hw_name)
             gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
             system = _system_from_hw(
@@ -644,7 +612,7 @@ class TrainingConfigManager:
         except Exception:
             pass
         try:
-            hw = _cached_hw(hw_name)
+            hw = load_hw(hw_name)
             gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
             system = _system_from_hw(
@@ -745,23 +713,21 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
 
 
 def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.DataFrame:
-    hw_capacity: Dict[str, float] = {}
     rows = []
     for cfg, report in zip(configs, reports):
         d = cfg.copy()
         if report.memory:
-            hw_name = cfg.get("hw", "nvidia_h100_sxm")
-            cap_gb = hw_capacity.get(hw_name)
-            if cap_gb is None:
-                cap_gb = _cached_hw(hw_name).memory.capacity_gb
-                hw_capacity[hw_name] = cap_gb
             memory_gb = round(report.memory.total / 1e9, 2)
-            if memory_gb > cap_gb * 0.8:
+            hw_name = cfg.get("hw", "nvidia_h100_sxm")
+            hw = load_hw(hw_name)
+            gpu_capacity_gb = hw.memory.capacity_gb
+            # *0.8利用率
+            if memory_gb > gpu_capacity_gb * 0.8:
                 continue
         else:
             memory_gb = None
 
-        d.update(_cached_comm_domain_columns(cfg))
+        d.update(_comm_domain_columns_from_config(cfg))
         d["compute_time_ms"] = round(report.compute_time_ms, 2)
         d["fwd_compute_ms"] = round(report.fwd_compute_ms, 2)
         d["bwd_compute_ms"] = round(report.bwd_compute_ms, 2)
@@ -872,7 +838,7 @@ def export_best_configs_excel(
         model = _load_model_spec(model_name)
         model.seq_len = seq_len
 
-        hw = _cached_hw(hw_name)
+        hw = load_hw(hw_name)
         _reject_gpus_per_node_config(best_config)
         gpus_per_node = _inferred_gpus_per_node(hw)
         nodes = _ceil_nodes_for_world_size(world_size, gpus_per_node)
@@ -987,14 +953,10 @@ def run_training_search_parallel(
     # 80% of GPU HBM capacity. Apply before BOTH the CSV table and the Excel
     # "best" export so the latter cannot pick infeasible configs.
     feasible_results: List[Dict] = []
-    hw_cap_cache: Dict[str, float] = {}
     for r in all_results:
         rep = r["report"]
         hw_name = r.get("hw_name") or r["config"].get("hw", "nvidia_h100_sxm")
-        cap_gb = hw_cap_cache.get(hw_name)
-        if cap_gb is None:
-            cap_gb = _cached_hw(hw_name).memory.capacity_gb
-            hw_cap_cache[hw_name] = cap_gb
+        cap_gb = load_hw(hw_name).memory.capacity_gb
         if rep.memory is None:
             feasible_results.append(r)
             continue
