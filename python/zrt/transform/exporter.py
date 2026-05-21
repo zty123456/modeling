@@ -19,6 +19,10 @@ from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.param_count import op_short
 from python.zrt.transform.context import TransformContext, ParallelConfig
+from python.zrt.transform.training.recompute import (
+    has_internal_recompute,
+    is_external_recompute_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +329,7 @@ class TransformedGraphExcelWriter:
             ("Output Dtypes", 20),
             # ── compute ──────────────────────────────────────────────────────
             ("FLOPs", 14),
+            ("Effective FLOPs (with recompute)", 26),
             ("FLOPs Formula (sym)", 24),
             ("FLOPs Formula (num)", 32),
             # ── memory access ─────────────────────────────────────────────────
@@ -334,12 +339,15 @@ class TransformedGraphExcelWriter:
             ("Write Bytes (B)", 14),
             ("Write Formula (sym)", 24),
             ("Write Formula (num)", 32),
+            ("Activation (B)", 16),
+            ("Activation Memory (µs)", 20),
             # ── comm volume ───────────────────────────────────────────────────
             ("Comm Volume (B)", 14),
             # ── timing & bound ────────────────────────────────────────────────
             ("Compute (µs)", 12),
             ("Memory (µs)", 12),
             ("Total Latency (µs)", 14),
+            ("Final Latency (µs)", 14),
             ("Bound", 10),
             ("Arith Intensity", 14),
             ("Annotations", 60),
@@ -367,15 +375,23 @@ class TransformedGraphExcelWriter:
             input_dtypes = ", ".join(str(t.dtype) for t in node.inputs)
             output_dtypes = ", ".join(str(t.dtype) for t in node.outputs)
 
-            # Comm volume for comm nodes
-            comm_vol = sum(t.mem_bytes for t in node.outputs) if node.is_comm else ""
+            # Comm volume for comm nodes. EP A2A carries semantic msg_bytes
+            # which may differ from the placeholder tensor shape size.
+            comm_vol = ""
+            if node.is_comm:
+                comm_vol = node.attrs.get("msg_bytes")
+                if comm_vol is None:
+                    comm_vol = node.attrs.get("bytes")
+                if comm_vol is None:
+                    comm_vol = sum(t.mem_bytes for t in node.outputs)
 
             # Build annotations string (exclude columns that have dedicated cells)
             annotations_list = []
             for key, val in node.annotations.items():
                 if key not in ("stream_id", "stream_type", "flops", "compute_us",
                                "memory_us", "latency_us", "arithmetic_intensity", "bound",
-                               "read_bytes", "write_bytes"):
+                               "read_bytes", "write_bytes", "saved_activation_bytes",
+                               "activation_memory_us"):
                     if isinstance(val, dict):
                         annotations_list.append(f"{key}={str(val)[:30]}")
                     else:
@@ -403,6 +419,7 @@ class TransformedGraphExcelWriter:
                 output_dtypes,
                 # compute
                 node.annotations.get("flops", ""),
+                node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
                 formulas["flops_sym"],
                 formulas["flops_num"],
                 # memory access
@@ -412,11 +429,14 @@ class TransformedGraphExcelWriter:
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
+                node.annotations.get("saved_activation_bytes", 0),
+                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
                 # comm
                 comm_vol,
                 # timing & bound
                 round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
                 round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
                 round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 node.annotations.get("bound", ""),
                 round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
@@ -426,6 +446,8 @@ class TransformedGraphExcelWriter:
             # Choose fill color based on category
             if node.is_comm:
                 fill = self._comm_fill
+            elif node.annotations.get("recompute"):
+                fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
             elif node.category == "memory":
                 fill = self._memory_fill
             else:
@@ -468,8 +490,12 @@ class TransformedGraphExcelWriter:
             group_size = node.attrs.get("group_size", "")
             role = node.attrs.get("role", "")
 
-            # Estimate data volume: sum of output tensor sizes
-            data_volume = sum(t.mem_bytes for t in node.outputs)
+            # Estimate data volume. Prefer explicit semantic volume when present.
+            data_volume = node.attrs.get("msg_bytes")
+            if data_volume is None:
+                data_volume = node.attrs.get("bytes")
+            if data_volume is None:
+                data_volume = sum(t.mem_bytes for t in node.outputs)
 
             input_shapes = ", ".join(str(t.shape) for t in node.inputs)
             output_shapes = ", ".join(str(t.shape) for t in node.outputs)
@@ -1235,7 +1261,9 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             self._write_optimizer_sheet(wb, bwd_graph, ctx)
             self._write_recompute_sheet(wb, bwd_graph)
         if training_summary is not None:
-            self._write_training_summary_sheet(wb, training_summary)
+            self._write_training_summary_sheet(
+                wb, training_summary, bwd_graph or fwd_graph, ctx
+            )
 
         wb.save(output_path)
         logger.info(f"Exported training graphs to {output_path}")
@@ -1260,6 +1288,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             ("Output Shapes", 50),
             # ── compute ──────────────────────────────────────────────────────
             ("FLOPs", 14),
+            ("Effective FLOPs (with recompute)", 26),
             ("FLOPs Formula (sym)", 24),
             ("FLOPs Formula (num)", 32),
             # ── memory access ─────────────────────────────────────────────────
@@ -1274,6 +1303,8 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             ("Compute (µs)", 12),
             ("Memory (µs)", 12),
             ("Total Latency (µs)", 14),
+            ("Recompute Replay (µs)", 18),
+            ("Final Latency (µs)", 14),
             ("Bound", 10),
             ("Arith Intensity", 14),
         ]
@@ -1286,15 +1317,23 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") == "bwd"]
 
         for row_idx, node in enumerate(nodes_to_write, 2):
+            replay_us = node.annotations.get("recompute_latency_us", 0.0) or 0.0
             is_recompute = (
-                node.annotations.get("recompute", False)
+                replay_us > 0
+                or node.annotations.get("recompute", False)
                 or node.attrs.get("recompute", False)
             )
             fill = _recompute_fill if is_recompute else (
                 self._comm_fill if node.is_comm else self._compute_fill
             )
             formulas = get_op_formulas(node)
-            comm_vol = sum(t.mem_bytes for t in node.outputs) if node.is_comm else ""
+            comm_vol = ""
+            if node.is_comm:
+                comm_vol = node.attrs.get("msg_bytes")
+                if comm_vol is None:
+                    comm_vol = node.attrs.get("bytes")
+                if comm_vol is None:
+                    comm_vol = sum(t.mem_bytes for t in node.outputs)
             values = [
                 node.id,
                 node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
@@ -1308,6 +1347,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 ", ".join(str(t.shape) for t in node.outputs),
                 # compute
                 node.annotations.get("flops", ""),
+                node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
                 formulas["flops_sym"],
                 formulas["flops_num"],
                 # memory access
@@ -1321,6 +1361,8 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 comm_vol,
                 round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
                 round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
+                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
+                round(replay_us, 3) if replay_us else "",
                 round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 node.annotations.get("bound", ""),
                 round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
@@ -1336,7 +1378,15 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         recompute_nodes = [
             n for n in bwd_graph.nodes.values()
-            if n.annotations.get("recompute", False) or n.attrs.get("recompute", False)
+            if is_external_recompute_node(n)
+            or (
+                # Legacy/imported graphs may carry recompute only in attrs.
+                # Keep those visible while still excluding kernels with
+                # internal replay such as FlashAttention/SDPA.
+                n.attrs.get("recompute", False)
+                and not n.annotations.get("recompute")
+                and not has_internal_recompute(n)
+            )
         ]
 
         if not recompute_nodes:
@@ -1360,7 +1410,12 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         total_flops = 0
 
         for row_idx, node in enumerate(recompute_nodes, 2):
-            lat = node.annotations.get("latency_us", 0) or 0
+            lat = (
+                node.annotations.get("recompute_latency_us", 0)
+                or node.annotations.get("base_latency_us", 0)
+                or node.annotations.get("latency_us", 0)
+                or 0
+            )
             flops = node.annotations.get("flops", 0) or 0
             total_lat   += lat
             total_flops += flops
@@ -1556,8 +1611,18 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         ws.freeze_panes = "A2"
 
-    def _write_training_summary_sheet(self, wb: openpyxl.Workbook, ts) -> None:
+    def _write_training_summary_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        ts,
+        graph: OpGraph | None = None,
+        ctx: TransformContext | None = None,
+    ) -> None:
         """Write TrainingSummary metrics as a key-value sheet."""
+        if hasattr(ts, "step_time_ms"):
+            self._write_training_report_sheet(wb, ts, graph, ctx)
+            return
+
         ws = wb.create_sheet("Training Summary")
 
         ws.append(["Training Step Summary"])
@@ -1630,6 +1695,87 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             rows += [("", ""), ("=== Top Bottleneck Ops ===", "")]
             for op_desc, lat_us in ts.top_bottleneck_ops:
                 rows.append((op_desc, f"{lat_us:.1f} µs"))
+
+        for key, val in rows:
+            ws.append([key, val])
+            if str(key).startswith("==="):
+                row_num = ws.max_row
+                ws.cell(row=row_num, column=1).font = Font(bold=True)
+
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 28
+
+    def _write_training_report_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        report,
+        graph: OpGraph | None = None,
+        ctx: TransformContext | None = None,
+    ) -> None:
+        """Write graph-native TrainingReport metrics as a key-value sheet."""
+        ws = wb.create_sheet("Training Summary")
+        ws.append(["Training Step Summary"])
+        ws["A1"].font = Font(bold=True, size=13)
+        recompute_compute_ms = (
+            getattr(report, "recompute_compute_ms", 0.0)
+            or (graph.metadata.get("recompute_compute_ms", 0.0) if graph is not None else 0.0)
+        )
+        metadata = graph.metadata if graph is not None else {}
+        model_name = getattr(ctx, "model_id", "") if ctx is not None else ""
+        hardware_name = (
+            getattr(getattr(ctx, "hw_spec", None), "name", "")
+            if ctx is not None else ""
+        )
+        batch_size = metadata.get("batch_size", "")
+        seq_len = metadata.get("seq_len", getattr(getattr(ctx, "training", None), "seq_len", ""))
+
+        rows = [
+            ("Model", model_name),
+            ("Hardware", hardware_name),
+            ("Parallelism", report.config_summary),
+            ("Batch size", batch_size),
+            ("Sequence length", seq_len),
+            ("", ""),
+            ("=== Step Timing ===", ""),
+            ("Step latency (ms)", round(report.step_time_ms, 3)),
+            ("Pipeline time (ms)", round(report.pipeline_time_ms, 3)),
+            ("Compute time (ms)", round(report.compute_time_ms, 3)),
+            ("Forward compute (ms)", round(report.fwd_compute_ms, 3)),
+            ("Backward compute (ms)", round(report.bwd_compute_ms, 3)),
+            ("Recompute compute (ms)", round(recompute_compute_ms, 3)),
+            (
+                "Compute time note",
+                "Compute time already includes forward, backward base, and activation recompute replay compute.",
+            ),
+            ("Exposed comm (ms)", round(report.exposed_comm_ms, 3)),
+            ("", ""),
+            ("=== HW Efficiency ===", ""),
+            ("MFU", f"{report.mfu:.2%}"),
+            ("HFU", f"{report.hfu:.2%}"),
+            ("Total FLOPs (T)", round(report.training_flops / 1e12, 3)),
+            ("Forward FLOPs (T)", round(report.forward_flops / 1e12, 3)),
+            ("Backward FLOPs (T)", round(report.backward_flops / 1e12, 3)),
+            ("", ""),
+            ("=== Communication ===", ""),
+            ("TP exposed (ms)", round(report.tp_exposed_ms, 3)),
+            ("CP exposed (ms)", round(report.cp_exposed_ms, 3)),
+            ("EP exposed (ms)", round(report.ep_exposed_ms, 3)),
+            ("EP hidden (ms)", round(report.ep_hidden_ms, 3)),
+            ("Total comm volume (ms)", round(report.total_comm_volume_ms, 3)),
+        ]
+
+        memory = report.memory_breakdown or {}
+        if memory:
+            rows += [
+                ("", ""),
+                ("=== Memory (per GPU) ===", ""),
+                ("Weights (GB)", round(memory.get("weights", 0) / 1e9, 3)),
+                ("Gradients (GB)", round(memory.get("grads", 0) / 1e9, 3)),
+                ("Opt states (GB)", round(memory.get("opt_state", 0) / 1e9, 3)),
+                ("Activations (GB)", round(memory.get("activations", 0) / 1e9, 3)),
+                ("Comm buffers (GB)", round(memory.get("comm_buffers", 0) / 1e9, 3)),
+                ("Total (GB)", round(memory.get("total", 0) / 1e9, 3)),
+            ]
 
         for key, val in rows:
             ws.append([key, val])
