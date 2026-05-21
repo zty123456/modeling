@@ -426,12 +426,20 @@ def _insert_ep_collectives(
     # halves the A2A volume vs BF16 baseline).
     act_bytes = model.effective_moe_act_dtype().bytes
 
-    # EP A2A payload: micro_batch * seq * hidden * topk * dtype / EP
-    # Each token is routed to topk experts, but A2A distributes tokens across EP ranks
-    # So each rank sends/receives 1/EP of the total routed data
+    # EP A2A payload — per-rank participating buffer (bus-bw convention).
+    #
+    # Each rank holds ``(micro_batch, seq/cp, hidden/tp)`` activation and
+    # top-k routes each token, so its dispatch input buffer is
+    # ``micro_batch * seq * h * topk * act_bytes`` (seq, h already CP/TP
+    # sharded). ``collective_time()`` applies ``× (N-1)/N`` to extract the
+    # cross-rank portion, so we MUST NOT pre-divide by EP here — doing so
+    # under-counts EP A2A by exactly ``ep`` (history: a /ep divisor sat
+    # here for years; calibration absorbed the error until ep > 16 grids
+    # made it visible — see verify_ep_a2a_bug.py for the 94× delta on
+    # ep=128, top_k=6).
     micro_batch = strategy.micro_batch
     topk = model.top_k
-    a2a_bytes = micro_batch * seq * h * topk * act_bytes // shard.ep
+    a2a_bytes = micro_batch * seq * h * topk * act_bytes
 
     for layer_id, (start, end) in graph.layer_index.items():
         # Check if this is an MoE layer

@@ -701,7 +701,16 @@ def pipeline_step_time(
     #   (b) post-compose pp_exposed extraction uses the bottleneck stage's
     #       exposed sum, not a hardcoded ``2*pp_p2p``.
     pp_p2p = comm_times.get("pp_p2p", 0.0)
-    is_dual = strategy.pp_schedule in (PPSched.DUALPIPE, PPSched.DUALPIPE_V)
+    # Dual-stream PP P2P hide only fires when (a) schedule is dual-stream
+    # AND (b) user explicitly opted in via ``strategy.pp_overlap``. The
+    # gate is needed because DualPipe(V)'s antiparallel structure only
+    # *enables* the bwd_dw window — the actual P2P-on-comm-stream
+    # scheduling is a runtime/kernel property (NCCL P2P stream, HCCL
+    # comm-stream affinity), so it should not be assumed for free.
+    is_dual = (
+        strategy.pp_schedule in (PPSched.DUALPIPE, PPSched.DUALPIPE_V)
+        and strategy.pp_overlap
+    )
     # Capture raw recompute max BEFORE augmentation — recompute_time_raw
     # uses this (the work that would be done if nothing hid it).
     recompute_raw_per_mb = max((st.recompute for st in stage_times), default=0.0)

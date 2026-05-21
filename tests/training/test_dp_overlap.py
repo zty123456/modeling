@@ -265,7 +265,12 @@ class TestDualbatchBubbleFloor:
 
 
 class TestPPHiddenAccounting:
-    """PP P2P hidden by DualPipe's bwd_dw stream must remain visible in totals."""
+    """PP P2P hidden by DualPipe's bwd_dw stream must remain visible in totals.
+
+    Note: ``pp_overlap=True`` is required to enable the dual-stream hide —
+    the gate was added to make this a runtime/kernel capability rather
+    than a free schedule property.
+    """
 
     def test_dualpipe_pp_p2p_hidden_is_reported(self, monkeypatch):
         from zrt.training.compose import schedules
@@ -274,7 +279,7 @@ class TestPPHiddenAccounting:
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE] * 2)
         s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
-                     pp_schedule=PPSched.DUALPIPE)
+                     pp_schedule=PPSched.DUALPIPE, pp_overlap=True)
         graph = build_graph(model, s)
 
         def fake_stage_time(*args, **kwargs):
@@ -299,7 +304,7 @@ class TestPPHiddenAccounting:
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE] * 2)
         s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
-                     pp_schedule=PPSched.DUALPIPE)
+                     pp_schedule=PPSched.DUALPIPE, pp_overlap=True)
         graph = build_graph(model, s)
 
         def fake_stage_time(*args, **kwargs):
@@ -318,6 +323,35 @@ class TestPPHiddenAccounting:
 
         assert result.pp_exposed == pytest.approx(0.0)
         assert result.pp_hidden == pytest.approx(0.8)
+
+    def test_dualpipe_without_pp_overlap_keeps_pp_exposed(self, monkeypatch):
+        """Default ``pp_overlap=False`` — even on DualPipe, PP P2P stays on
+        the critical path (no free hide-in-bwd_dw). Regression for the
+        2026-05-21 fix that gated dual-stream PP hide on an explicit flag.
+        """
+        from zrt.training.compose import schedules
+
+        model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                          head_dim=128, vocab=32000, seq_len=1024,
+                          layers=[LayerKind.DENSE] * 2)
+        s = Strategy(tp=1, pp=2, dp=1, micro_batch=1, global_batch=4,
+                     pp_schedule=PPSched.DUALPIPE)  # pp_overlap defaults False
+        graph = build_graph(model, s)
+
+        def fake_stage_time(*args, **kwargs):
+            return StageTime(fwd=1.0, bwd=1.0, bwd_dx=0.0, bwd_dw=1.0)
+
+        monkeypatch.setattr(schedules, "stage_time", fake_stage_time)
+        monkeypatch.setattr(
+            schedules, "total_comm_time",
+            lambda *args, **kwargs: {"pp_p2p": 0.1},
+        )
+
+        result = pipeline_step_time(graph, model, _make_system(), s)
+        # With pp_overlap=False the hide does not fire — pp_hidden must be 0
+        # and pp_exposed must carry the full per-mb 2×pp_p2p × scale.
+        assert result.pp_hidden == pytest.approx(0.0)
+        assert result.pp_exposed > 0.0
 
 
 class TestZeroBubbleFloor:

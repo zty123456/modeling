@@ -207,6 +207,7 @@ def _parse_model(d: dict) -> ModelSpec:
         routed_expert_weight_dtype=_parse_dtype(d["routed_expert_weight_dtype"]) if "routed_expert_weight_dtype" in d else None,
         attn_act_dtype=_parse_dtype(d["attn_act_dtype"]) if "attn_act_dtype" in d else None,
         moe_act_dtype=_parse_dtype(d["moe_act_dtype"]) if "moe_act_dtype" in d else None,
+        residual_dtype=_parse_dtype(d["residual_dtype"]) if "residual_dtype" in d else None,
         routed_expert_grad_dtype=_parse_dtype(d.get("routed_expert_grad_dtype", "fp32")),
         # normalization
         norm_kind=d.get("norm_kind", "rmsnorm"),
@@ -308,6 +309,7 @@ def _parse_strategy(d: dict) -> Strategy:
         offload=offload,
         tp_overlap=TPOverlap(d.get("tp_overlap", "none")),
         ep_overlap=d.get("ep_overlap", False),
+        pp_overlap=d.get("pp_overlap", False),
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
         dp_steady_overlap_ratio=float(d.get("dp_steady_overlap_ratio", 0.5)),
