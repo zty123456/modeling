@@ -279,6 +279,9 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         result = TrainingPipelinePass().run(g, ctx)
 
     assert result.metadata["recompute_compute_ms"] == pytest.approx(0.08)
+    metrics = result.metadata["pipeline_metrics"]
+    assert metrics.fwd_compute_ms == 0.0
+    assert metrics.compute_time_ms == pytest.approx(metrics.recompute_compute_ms)
 
 
 def test_train_flops_pass_zeros_dx_dw_for_backward_phase_nodes():
@@ -713,6 +716,7 @@ def test_recompute_helper_classifies_internal_attention_kernels():
     assert has_internal_recompute(
         OpNode(id="scaled_dot", op_type="aten.scaled_dot_product_attention.default")
     )
+    assert not has_internal_recompute(OpNode(id="mask", op_type="custom_attn_mask_apply"))
     assert not has_internal_recompute(OpNode(id="mm", op_type="aten.mm.default"))
     assert not has_internal_recompute(OpNode(id="silu", op_type="aten.silu.default"))
 

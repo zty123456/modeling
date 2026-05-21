@@ -13,7 +13,10 @@ from python.zrt.transform import (
     build_default_pipeline,
 )
 from python.zrt.transform.analysis.passes import FlopsPass, RooflinePass, StreamAssignPass
-from python.zrt.transform.parallel.expert_grouped_mm import ExpertGroupedMMPass
+from python.zrt.transform.parallel.expert_grouped_mm import (
+    ExpertGroupedMMPass,
+    _expert_weight_name,
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -221,6 +224,28 @@ def test_comm_inserter_inserts_ep_a2a_per_phase():
         assert out.nodes[node_id].attrs["dtype_bytes"] == 2
 
 
+def test_comm_inserter_ep_msg_bytes_uses_ceil_routed_tokens():
+    node = _linear_node("layer0_grouped_gate_up", "layer.0.ffn.moe", (2, 8), (2, 16))
+    node.annotations.update({
+        "phase": "fwd",
+        "ep_needs_a2a": True,
+        "ep_block_down_id": "layer0_grouped_gate_up",
+    })
+    graph = OpGraph(
+        name="ep_msg_bytes_ceil",
+        phase="train",
+        nodes={node.id: node},
+        metadata={"seq_len": 5, "hidden": 8},
+    )
+    ctx = _ctx(ep=4)
+    ctx.profile = SimpleNamespace(moe_active=3)
+
+    out = CommInserterPass().run(graph, ctx)
+
+    dispatch = out.nodes["comm_a2a_dispatch_layer0_grouped_gate_up"]
+    assert dispatch.attrs["msg_bytes"] == 4 * 8 * 2
+
+
 def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width():
     src = _linear_node("src", "input", (2, 8), (2, 8))
     down = _linear_node(
@@ -284,7 +309,7 @@ def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width
         assert edge.tensor.shape == gate_up.outputs[0].shape
 
 
-def test_expert_grouped_mm_backward_ignores_external_bridge_edges():
+def test_expert_grouped_mm_backward_preserves_reachable_external_inputs():
     src = _linear_node("src", "input", (2, 8), (2, 8))
     down = _linear_node(
         "down_bwd",
@@ -330,7 +355,15 @@ def test_expert_grouped_mm_backward_ignores_external_bridge_edges():
     out.topo_sort()
     assert "sink" in out.successors(gate_up_id)
     assert gate_up_id not in out.predecessors("bridge")
-    assert "bridge" not in out.predecessors("transformer_layers_0_ffn_grouped_down_bwd")
+    assert "bridge" in out.predecessors("transformer_layers_0_ffn_grouped_down_bwd")
+
+
+def test_expert_weight_name_matches_path_segments_only():
+    assert _expert_weight_name("transformer.layers.0.ffn.experts.0.w1") == "w1"
+    assert _expert_weight_name("transformer.layers.0.ffn.experts.0.gate_proj.weight") == "gate_proj"
+    assert _expert_weight_name("transformer.layers.0.ffn.experts.0.up_proj.weight") == "up_proj"
+    assert _expert_weight_name("transformer.layers.0.ffn.experts.0.down_proj.weight") == "down_proj"
+    assert _expert_weight_name("transformer.layers.0.ffn.experts.0.w12_proj") == ""
 
 
 def test_flops_pass_does_not_ep_scale_expert_grouped_mm_again():

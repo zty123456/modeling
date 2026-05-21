@@ -46,14 +46,15 @@ def _layer_key(node: OpNode) -> str:
 
 def _expert_weight_name(scope: str) -> str:
     """Return the weight suffix (w1, w2, w3, gate_proj, up_proj, down_proj)."""
-    s = scope.lower()
-    # DSv4-style: .w1, .w2, .w3
+    parts = [p for p in scope.lower().replace("/", ".").split(".") if p]
+    # DSv4-style module names: w1, w2, w3. Match path segments only so names
+    # like w12_proj are not accidentally classified as w1.
     for w in ("w1", "w2", "w3"):
-        if s.endswith(w) or f".{w}" in s:
+        if w in parts:
             return w
-    # Standard-style: gate_proj, up_proj, down_proj
+    # Standard-style module names.
     for pat in ("gate_proj", "up_proj", "down_proj"):
-        if pat in s:
+        if pat in parts:
             return pat
     return ""
 
@@ -139,14 +140,16 @@ class ExpertGroupedMMPass(GraphPass):
         batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 6
         total_routed_tokens = batch * seq * topk
-        tokens_per_rank = max(1, (total_routed_tokens + ep - 1) // ep)
+        # Tokens carried by one EP rank across all local experts. GroupedMM
+        # shapes use M below: per-expert tokens, not per-rank routed tokens.
+        tokens_per_ep_rank = max(1, (total_routed_tokens + ep - 1) // ep)
         M = max(1, (total_routed_tokens + num_experts - 1) // num_experts)
         G = experts_per_rank
 
         for (layer_key, phase), nodes in layers.items():
             if phase == "bwd":
                 self._fuse_backward_layer(
-                    g, layer_key, nodes, G, M, tokens_per_rank, hidden)
+                    g, layer_key, nodes, G, M, tokens_per_ep_rank, hidden)
                 continue
 
             if phase not in ("fwd", "forward", "train_forward"):
@@ -203,8 +206,9 @@ class ExpertGroupedMMPass(GraphPass):
             )
             gate_up.component = "moe.grouped_gate_up"
             gate_up.annotations["grouped_mm_role"] = "gate_up"
-            gate_up.annotations["ep_tokens_per_rank"] = tokens_per_rank
+            gate_up.annotations["ep_tokens_per_rank"] = tokens_per_ep_rank
             gate_up.annotations["ep_tokens_per_expert"] = M
+            gate_up.annotations["ep_a2a_inserted"] = False
 
             act_id = f"{layer_key.replace('.','_')}_grouped_silu"
             act_node = OpNode(
@@ -235,7 +239,7 @@ class ExpertGroupedMMPass(GraphPass):
             )
             down.component = "moe.grouped_down"
             down.annotations["grouped_mm_role"] = "down"
-            down.annotations["ep_tokens_per_rank"] = tokens_per_rank
+            down.annotations["ep_tokens_per_rank"] = tokens_per_ep_rank
             down.annotations["ep_tokens_per_expert"] = M
 
             # Drop old nodes and all edges touching them
@@ -323,23 +327,9 @@ class ExpertGroupedMMPass(GraphPass):
                 stack.extend(succ.get(cur, []))
             return False
 
-        def _reachable_from_any_old(node_id: str) -> bool:
-            stack = list(old_ids)
-            seen: set[str] = set()
-            while stack:
-                cur = stack.pop()
-                if cur == node_id:
-                    return True
-                if cur in seen:
-                    continue
-                seen.add(cur)
-                stack.extend(succ.get(cur, []))
-            return False
-
         in_edges = [
             e for e in g.edges
             if e.dst in old_ids and e.src not in old_ids
-            and not _reachable_from_any_old(e.src)
         ]
         out_edges = [
             e for e in g.edges
@@ -364,6 +354,7 @@ class ExpertGroupedMMPass(GraphPass):
         down.annotations["grouped_mm_role"] = "down_bwd"
         down.annotations["ep_tokens_per_rank"] = tokens_per_rank
         down.annotations["ep_tokens_per_expert"] = M
+        down.annotations["ep_a2a_inserted"] = False
         down.annotations.pop("recompute", None)
 
         gate_up_id = f"{layer_key.replace('.','_')}_grouped_gate_up_bwd"

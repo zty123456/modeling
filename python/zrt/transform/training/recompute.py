@@ -18,9 +18,10 @@ def has_internal_recompute(node: OpNode) -> bool:
     should not charge an additional external replay for the same op.
     """
     op_type = node.op_type.lower()
-    return any(
-        key in op_type
-        for key in ("flash_attn", "flashattention", "scaled_dot_product", "sdpa", "attention", "attn")
+    normalized = op_type.removeprefix("aten.").lstrip("_")
+    return (
+        normalized.startswith(("flash_attn", "flashattention", "sdpa"))
+        or "scaled_dot_product" in normalized
     )
 
 

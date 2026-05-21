@@ -141,8 +141,10 @@ class CommInserterPass(GraphPass):
         topk = ctx.profile.moe_active if ctx.profile else 8
 
         # Per A2A direction on this EP rank. Dispatch and combine each carry
-        # one BF16 hidden activation stream for the routed top-k tokens.
-        ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes // ep
+        # one BF16 hidden activation stream for the routed top-k tokens. Use
+        # the same ceil token partitioning as ExpertGroupedMMPass.
+        routed_tokens_per_ep_rank = max(1, (micro_batch * seq_len * topk + ep - 1) // ep)
+        ep_msg_bytes = routed_tokens_per_ep_rank * hidden * dtype_bytes
 
         dispatch_tensor = TensorMeta.from_shape_dtype(
             "ep_dispatch_hidden",
@@ -170,10 +172,15 @@ class CommInserterPass(GraphPass):
                 and n.annotations.get("phase", "") == phase
             ]
             first, last = block[0], block[-1]
-            # If first node is a GroupedMM gate_up, the block exit is the linked down node
+            # If first node is a GroupedMM gate_up, the block exit is the linked
+            # down node. ExpertGroupedMMPass runs before this pass, so down_id
+            # should still point to a raw fused compute node, not a comm node.
             down_id = first.annotations.get("ep_block_down_id")
             if down_id and down_id in g.nodes:
                 last = g.nodes[down_id]
+                assert not last.annotations.get("ep_a2a_inserted"), (
+                    f"EP block exit already has A2A inserted: {down_id}"
+                )
 
             dispatch_id = f"comm_a2a_dispatch_{first.id}"
             combine_id  = f"comm_a2a_combine_{last.id}"

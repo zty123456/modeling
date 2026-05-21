@@ -716,12 +716,15 @@ class TrainingPipelinePass(GraphPass):
             return node.annotations.get("phase", "") in _BWD_PHASES
 
         # Forward latency includes activation-save overhead added by RooflinePass.
-        # Recompute uses base latency below because replayed external checkpoints
-        # should not pay activation-save memory time a second time.
+        # External checkpoint nodes are reported in recompute_compute_ms below,
+        # so exclude their base latency here to keep compute_time_ms from
+        # charging the same replay-eligible work twice.
         fwd_compute_ms = sum(
             n.annotations.get("latency_us", 0.0)
             for n in g.nodes.values()
-            if not _is_bwd_node(n) and n.category != "communication"
+            if not _is_bwd_node(n)
+            and n.category != "communication"
+            and not is_external_recompute_node(n)
         ) / 1000.0
         bwd_compute_ms = sum(
             n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
@@ -739,9 +742,7 @@ class TrainingPipelinePass(GraphPass):
             fwd_compute_ms *= layer_scale
             bwd_compute_ms *= layer_scale
             recompute_compute_ms *= layer_scale
-        # fwd_compute_ms uses full forward latency, including activation-save
-        # overhead. recompute_compute_ms is the checkpoint replay time split
-        # out for reporting, so total compute is the explicit sum below.
+        # fwd_compute_ms and recompute_compute_ms are disjoint by construction.
         compute_time_ms = fwd_compute_ms + bwd_compute_ms + recompute_compute_ms
 
         metrics = PipelineStepMetrics(
