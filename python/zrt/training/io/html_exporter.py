@@ -640,6 +640,9 @@ def _build_summary(
             "bubble_time_ms": getattr(report, "bubble_time_ms", 0.0),
             "flops_per_token": getattr(report, "flops_per_token", 0.0),
             "total_flops": getattr(report, "total_flops", 0.0),
+            "recompute_time_ms": getattr(report, "recompute_time_ms", 0.0),
+            "recompute_time_raw_ms": getattr(report, "recompute_time_raw_ms", 0.0),
+            "bubble_time_ms": getattr(report, "bubble_time_ms", 0.0),
         },
         "memory": memory,
         "bound": {
