@@ -478,6 +478,49 @@ def test_default_pipeline_mega_moe_forward_fuses_without_external_a2a():
     assert meta["quant_variant"] == "standard"
 
 
+def test_graph_capture_mega_moe_uses_shared_cost_model_and_formula():
+    from python.zrt.simulator.backends.roofline import get_op_formulas
+    from zrt.training.models.mega_moe import mega_moe_cost_terms_from_meta
+
+    graph = routed_moe_graph()
+    ctx = _ctx(ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True, mega_moe_waves=3)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
+    terms = mega_moe_cost_terms_from_meta(mega.annotations["mega_moe_meta"])
+    assert mega.annotations["flops"] == int(terms.fwd_flops)
+    assert mega.annotations["flops_dx"] == int(terms.fwd_flops)
+    assert mega.annotations["flops_dw"] == int(terms.fwd_flops)
+    assert (
+        mega.annotations["read_bytes"] + mega.annotations["write_bytes"]
+        == int(terms.fwd_bytes)
+    )
+
+    formulas = get_op_formulas(mega)
+    assert "MegaMoE" in formulas["flops_sym"]
+    assert "top_k" in formulas["flops_sym"]
+    assert "weight" in formulas["read_sym"]
+
+
+def test_graph_capture_mega_moe_latency_includes_internal_ep_comm():
+    graph = routed_moe_graph()
+    ctx = _ctx(ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True, mega_moe_waves=2)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
+    assert mega.annotations["mega_moe_dispatch_us"] > 0
+    assert mega.annotations["mega_moe_combine_us"] > 0
+    assert mega.annotations["mega_moe_exposed_comm_us"] > 0
+    assert mega.annotations["mega_moe_hidden_comm_us"] >= 0
+    assert mega.annotations["latency_us"] >= mega.annotations["base_latency_us"]
+
+
 def test_expert_weight_name_matches_path_segments_only():
     assert _expert_weight_name("transformer.layers.0.ffn.experts.0.w1") == "w1"
     assert _expert_weight_name("transformer.layers.0.ffn.experts.0.gate_proj.weight") == "gate_proj"

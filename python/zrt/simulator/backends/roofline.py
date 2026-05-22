@@ -978,6 +978,19 @@ def _grouped_mm(node: "OpNode") -> FMR:
     return _mm(node)
 
 
+def _mega_moe(node: "OpNode") -> FMR:
+    meta = node.annotations.get("mega_moe_meta") or node.attrs.get("mega_moe_meta")
+    if not meta:
+        return _default(node)
+
+    from zrt.training.models.mega_moe import mega_moe_cost_terms_from_meta
+
+    terms = mega_moe_cost_terms_from_meta(meta)
+    read = terms.activation_input_bytes + terms.weight_bytes
+    write = terms.activation_output_bytes
+    return terms.fwd_flops, read, write
+
+
 def _concat_fp16(node: "OpNode") -> FMR:
     """Concat + cast to fp16: no compute, copy inputs to output (read inputs, write output)."""
     # read: sum of input bytes, write: output bytes
@@ -1173,6 +1186,7 @@ _EXACT_FORMULAS: dict[str, "callable"] = {
     "IndexerProlog":                    _indexer_prolog,
     "GroupedMm":                        _grouped_mm,
     "GroupedMatMul":                    _grouped_mm,
+    "mega_moe":                         _mega_moe,
     "ConcatFP16":                       _concat_fp16,
 }
 
@@ -1694,6 +1708,35 @@ def _fs_grouped_mm(node: "OpNode") -> dict:
     return _fs_mm(node)
 
 
+def _fs_mega_moe(node: "OpNode") -> dict:
+    meta = node.annotations.get("mega_moe_meta") or node.attrs.get("mega_moe_meta")
+    if not meta:
+        return _fs_default(node)
+
+    from zrt.training.models.mega_moe import mega_moe_cost_terms_from_meta
+
+    terms = mega_moe_cost_terms_from_meta(meta)
+    m = int(meta.get("m", terms.tokens))
+    micro_batch = int(meta.get("micro_batch", 1))
+    top_k = int(meta.get("top_k", terms.top_k))
+    k_eff = terms.k_eff
+    n = terms.n
+    fwd_multiplier = terms.fwd_multiplier
+    read = terms.activation_input_bytes + terms.weight_bytes
+    write = terms.activation_output_bytes
+    return _mk(
+        "MegaMoE: 2路tokens路top_k路k_eff路n路fwd_multiplier",
+        (
+            f"2路({micro_batch}路{m})路{top_k}路{k_eff}路{n}"
+            f"路{fwd_multiplier:g} = {int(terms.fwd_flops)}"
+        ),
+        "activation input + local expert weight",
+        f"{int(read)}",
+        "activation output",
+        f"{int(write)}",
+    )
+
+
 def _fs_concat_fp16(node: "OpNode") -> dict:
     ri = node.total_input_bytes()
     wo = node.total_output_bytes()
@@ -1806,6 +1849,7 @@ _FORMULA_DISPATCH: dict[str, "callable"] = {
     "RepoInterleave": _fs_repo_interleave, "RepoComplex": _fs_repo_complex,
     "LightningIndexer": _fs_lightning_indexer, "IndexerProlog": _fs_indexer_prolog,
     "GroupedMm": _fs_grouped_mm, "GroupedMatMul": _fs_grouped_mm,
+    "mega_moe": _fs_mega_moe,
     "ConcatFP16": _fs_concat_fp16,
 }
 

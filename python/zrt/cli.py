@@ -152,6 +152,19 @@ def main() -> None:
              "full = all forward ops recomputed; "
              "selective = attention ops only.",
     )
+    parser.add_argument(
+        "--mega-moe",
+        action="store_true",
+        default=False,
+        help="Fuse captured forward routed MoE expert compute into one MegaMoE op "
+             "with internal dispatch/compute/combine modelling.",
+    )
+    parser.add_argument(
+        "--mega-moe-waves",
+        type=int,
+        default=0,
+        help="Requested MegaMoE wave count for internal EP overlap (0 = hardware/default).",
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     parser.add_argument("--output-dir", "-o",
@@ -657,6 +670,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             args.recompute_policy
             or ("full" if args.gradient_checkpointing else "none")
         ),
+        mega_moe=getattr(args, "mega_moe", False),
+        mega_moe_waves=getattr(args, "mega_moe_waves", 0),
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,
