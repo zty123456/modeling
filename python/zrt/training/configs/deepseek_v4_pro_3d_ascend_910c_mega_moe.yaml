@@ -8,7 +8,7 @@ model:
 
 system:
   hw: ascend_910c
-  nodes: 8
+  nodes: 256
   gpus_per_node: 8
   host_mem_gb: 2048
 
@@ -17,9 +17,9 @@ strategy:
   cp: 1
   pp: 4
   ep: 64
-  dp: 2
+  dp: 64
   micro_batch: 1
-  global_batch: 512
+  global_batch: 64
   pp_schedule: dualpipev
   zero_stage: 1
   mega_moe: true
