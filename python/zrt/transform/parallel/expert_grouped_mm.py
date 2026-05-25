@@ -125,6 +125,35 @@ def _mega_moe_node_id(layer_key: str, src_node: OpNode) -> str:
     return f"{layer_key.replace('.', '_')}_mega_moe"
 
 
+def _is_routed_expert_add(node: OpNode, layer_key: str, hidden: int) -> bool:
+    if node.scope != layer_key:
+        return False
+    if node.op_type not in {"aten.add.Tensor", "aten.add_.Tensor"}:
+        return False
+    return bool(node.outputs) and node.outputs[0].shape[-1] == hidden
+
+
+def _collect_routed_add_chain(
+    g: "OpGraph",
+    layer_key: str,
+    seed_ids: set[str],
+    hidden: int,
+) -> set[str]:
+    collected: set[str] = set()
+    queue = list(seed_ids)
+    while queue:
+        current = queue.pop(0)
+        for succ_id in g.successors(current):
+            if succ_id in collected:
+                continue
+            succ = g.nodes.get(succ_id)
+            if succ is None or not _is_routed_expert_add(succ, layer_key, hidden):
+                continue
+            collected.add(succ_id)
+            queue.append(succ_id)
+    return collected
+
+
 def _make_mega_moe(node_id: str, scope: str,
                    input_tensor: TensorMeta,
                    output_tensor: TensorMeta,
@@ -254,11 +283,13 @@ class ExpertGroupedMMPass(GraphPass):
                 )
                 continue
 
-            old_ids = {n.id for n in nodes}
+            expert_ids = {n.id for n in nodes}
+            old_ids = expert_ids | _collect_routed_add_chain(
+                g, layer_key, {n.id for n in downs}, H_out)
 
             # Collect ALL external edges at once before any mutation
             # external-in: edge from outside → any old node
-            in_edges = [e for e in g.edges if e.dst in old_ids and e.src not in old_ids]
+            in_edges = [e for e in g.edges if e.dst in expert_ids and e.src not in old_ids]
             # external-out: edge from any old node → outside
             out_edges = [e for e in g.edges if e.src in old_ids and e.dst not in old_ids]
 
@@ -355,8 +386,9 @@ class ExpertGroupedMMPass(GraphPass):
                                      num_experts: int, ep: int, topk: int,
                                      H_in: int, H_out: int, ffn: int,
                                      ctx: "TransformContext") -> None:
-        old_ids = {n.id for n in nodes}
-        in_edges = [e for e in g.edges if e.dst in old_ids and e.src not in old_ids]
+        expert_ids = {n.id for n in nodes}
+        old_ids = expert_ids | _collect_routed_add_chain(g, layer_key, {down.id}, H_out)
+        in_edges = [e for e in g.edges if e.dst in expert_ids and e.src not in old_ids]
         out_edges = [e for e in g.edges if e.src in old_ids and e.dst not in old_ids]
         if not in_edges or not out_edges:
             return

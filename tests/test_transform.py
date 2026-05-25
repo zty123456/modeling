@@ -102,6 +102,48 @@ def routed_moe_graph():
     )
 
 
+def routed_moe_graph_with_expert_add_chain():
+    graph = routed_moe_graph()
+    add1 = OpNode(
+        id="expert_add_1",
+        op_type="aten.add.Tensor",
+        inputs=[_t("down_out", (8, 16)), _t("other_expert_out", (8, 16))],
+        outputs=[_t("expert_add_1_out", (8, 16))],
+        scope="transformer.layers.0.ffn",
+        category="compute",
+    )
+    add2 = OpNode(
+        id="expert_add_2",
+        op_type="aten.add.Tensor",
+        inputs=[_t("expert_add_1_out", (8, 16)), _t("last_expert_out", (8, 16))],
+        outputs=[_t("expert_add_2_out", (8, 16))],
+        scope="transformer.layers.0.ffn",
+        category="compute",
+    )
+    scale = OpNode(
+        id="route_scale",
+        op_type="aten.mul.Tensor",
+        inputs=[_t("expert_add_2_out", (8, 16)), _t("scores", (8, 1))],
+        outputs=[_t("route_scale_out", (8, 16))],
+        scope="transformer.layers.0.ffn",
+        category="compute",
+    )
+    for n in (add1, add2, scale):
+        n.annotations["phase"] = "fwd"
+        graph.nodes[n.id] = n
+    graph.edges = [e for e in graph.edges if not (e.src == "down" and e.dst == "sink")]
+    graph.edges.extend(
+        [
+            Edge("down", 0, "expert_add_1", 0, graph.nodes["down"].outputs[0]),
+            Edge("expert_add_1", 0, "expert_add_2", 0, add1.outputs[0]),
+            Edge("expert_add_2", 0, "route_scale", 0, add2.outputs[0]),
+            Edge("route_scale", 0, "sink", 0, scale.outputs[0]),
+        ]
+    )
+    graph._rebuild_adjacency()
+    return graph
+
+
 def _ctx(tp=1, ep=1, hw_name="nvidia_h100_sxm",
          compute_streams=1, comm_streams=1, quant=None, flags=None):
     hw = hw_registry.load(hw_name)
@@ -431,6 +473,20 @@ def test_expert_grouped_mm_mega_moe_off_keeps_grouped_forward_path():
     assert by_role["gate_up"].annotations["ep_tokens_per_expert"] == 8
 
 
+def test_expert_grouped_mm_removes_routed_expert_add_chain():
+    graph = routed_moe_graph_with_expert_add_chain()
+    ctx = _ctx(ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=False)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = ExpertGroupedMMPass().run(graph, ctx)
+
+    assert "expert_add_1" not in out.nodes
+    assert "expert_add_2" not in out.nodes
+    assert "route_scale" in out.nodes
+    assert "transformer_layers_0_ffn_grouped_down" in out.predecessors("route_scale")
+
+
 def test_default_pipeline_mega_moe_forward_fuses_without_external_a2a():
     graph = routed_moe_graph()
     ctx = _ctx(ep=2)
@@ -544,6 +600,21 @@ def test_graph_capture_mega_moe_meta_uses_logical_tokens_not_routed_tokens():
         * meta["moe_act_bytes"]
         * meta["top_k"]
     )
+
+
+def test_graph_capture_mega_moe_removes_routed_expert_add_chain():
+    graph = routed_moe_graph_with_expert_add_chain()
+    ctx = _ctx(ep=2)
+    ctx.training = TrainingConfig(micro_batch=1, mega_moe=True)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = build_default_pipeline().run(graph, ctx)
+
+    mega = [n for n in out.nodes.values() if n.op_type == "mega_moe"][0]
+    assert "expert_add_1" not in out.nodes
+    assert "expert_add_2" not in out.nodes
+    assert "route_scale" in out.nodes
+    assert mega.id in out.predecessors("route_scale")
 
 
 def test_graph_capture_mega_moe_latency_includes_internal_ep_comm():
