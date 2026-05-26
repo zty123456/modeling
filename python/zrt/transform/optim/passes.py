@@ -22,7 +22,10 @@ class QuantizationPass(GraphPass):
         for node in g.nodes.values():
             if node.category == "compute":
                 node.annotations["quant_weight"] = ctx.quant.weight
-                node.annotations["quant_act"]    = ctx.quant.activation
+                node.annotations["quant_act"]    = ctx.quant.activation_for_component(node.component)
+                # KV cache dtype only relevant for attention ops
+                if node.component.startswith("attn."):
+                    node.annotations["quant_kv"] = ctx.quant.kv_cache
         return g
 
 

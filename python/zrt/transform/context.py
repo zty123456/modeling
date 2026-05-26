@@ -54,11 +54,27 @@ class QuantConfig:
     weight:     str = "bf16"   # "int8", "int4", "w8a8", "w4a16", ...
     activation: str = "bf16"
     kv_cache:   str = "bf16"
+    # Per-component overrides (empty = inherit from activation)
+    attn_activation:    str = ""   # attention Q/K/V/O projections
+    expert_activation:  str = ""   # routed MoE expert GEMMs
+    shared_activation:  str = ""   # shared expert GEMMs
 
     @property
     def weight_bytes(self) -> float:
         _map = {"int4": 0.5, "int8": 1.0, "fp8": 1.0, "bf16": 2.0, "fp16": 2.0, "fp32": 4.0}
         return _map.get(self.weight.lower(), 2.0)
+
+    def activation_for_component(self, component: str) -> str:
+        """Return per-component activation dtype, falling back to global activation."""
+        # Check per-component overrides first
+        if component.startswith("attn.") and self.attn_activation:
+            return self.attn_activation
+        if component.startswith("moe.experts.") and self.expert_activation:
+            return self.expert_activation
+        if component.startswith("moe.shared.") and self.shared_activation:
+            return self.shared_activation
+        # Fallback to global activation
+        return self.activation
 
 
 @dataclass
