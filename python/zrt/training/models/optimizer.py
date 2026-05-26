@@ -5,6 +5,43 @@ Reference: Muon optimizer (Kumar et al. 2025), ZeRO paper.
 from __future__ import annotations
 
 
+# ── Adam DRAM traffic ──────────────────────────────────────────────────────
+# Each Adam update reads (grad, m, v, master) and writes (m, v, master,
+# low-prec copy) = 4 reads + 4 writes = 28 bytes per parameter.
+ADAM_UPDATE_BYTES_PER_PARAM: int = 28
+
+
+def adam_state_bytes(P: int, master_dtype_bytes: int = 4) -> int:
+    """Adam optimizer state *storage* bytes (master + m + v)."""
+    return P * master_dtype_bytes * 3
+
+
+def adam_step_traffic_bytes(P: int) -> int:
+    """HBM bytes moved during a single Adam update (memory-bound roofline)."""
+    return P * ADAM_UPDATE_BYTES_PER_PARAM
+
+
+def adam_step_time_s(
+    P: int,
+    hbm_bw_bps: float,
+    *,
+    gpu_name: str | None = None,
+    efficiency_override: float | None = None,
+) -> float:
+    """Memory-bound Adam step time using achieved HBM bandwidth."""
+    bytes_ = adam_step_traffic_bytes(P)
+    if bytes_ <= 0 or hbm_bw_bps <= 0:
+        return 0.0
+    if efficiency_override is not None:
+        eff_bw = hbm_bw_bps * efficiency_override
+    elif gpu_name:
+        from zrt.training.io.perf_tables import achieved_bandwidth_efficiency
+        eff_bw = hbm_bw_bps * achieved_bandwidth_efficiency(gpu_name, bytes_)
+    else:
+        eff_bw = hbm_bw_bps
+    return bytes_ / eff_bw if eff_bw > 0 else 0.0
+
+
 def ns_flops(m: int, n: int, K: int) -> int:
     """FLOPs for K-step Newton-Schulz orthogonalization on (m, n) matrix.
 

@@ -42,6 +42,7 @@ def estimate_training_from_graphs(
     muon_rotation: bool = True,
     muon_ns_steps: int | None = None,
     model_type: str | None = None,
+    vocab_size: int | None = None,
     micro_batch: int = 1,
     global_batch: int = 32,
     recompute_policy: str = "none",
@@ -90,6 +91,12 @@ def estimate_training_from_graphs(
     }
     if moe_total_experts > 0:
         metadata["moe_total_experts"] = moe_total_experts
+    if moe_ffn_hidden is not None:
+        metadata["moe_ffn_hidden"] = moe_ffn_hidden
+    if layer_type_counts is not None:
+        metadata["layer_type_counts"] = layer_type_counts
+    if vocab_size is not None:
+        metadata["vocab_size"] = vocab_size
     if moe_active_experts > 1:
         metadata["moe_active_experts"] = moe_active_experts
     if total_params is not None:
@@ -268,6 +275,7 @@ def estimate_training_from_graphs(
         total_comm_volume_ms=total_comm_ms,
         optimizer_time_ms=optimizer_time_ms,
         optimizer_comm_ms=optimizer_comm_ms,
+        optimizer_comm_hidden_ms=pipeline_metrics.optimizer_comm_hidden_ms if pipeline_metrics else 0.0,
     )
 
     if return_transformed:

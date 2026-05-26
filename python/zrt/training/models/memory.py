@@ -316,6 +316,56 @@ def _routed_expert_params_on_rank(model: ModelSpec, strategy: Strategy) -> int:
 # (already supported via `getattr` default of 1)
 
 
+def adam_params_on_rank(
+    *,
+    total_params: int,
+    n_layers: int,
+    embed_params: int,
+    expert_params_full: int,
+    tp: int,
+    pp: int,
+    ep: int,
+    dp: int,
+    zero_stage: int,
+    apply_dp_for_zero: int = 1,
+) -> int:
+    """Per-rank parameter count after TP → PP → EP (routed/non-routed split)
+    → ZeRO DP sharding.  Primitive-typed so Stack B (graph path) can call it
+    without constructing ``ModelSpec``/``Strategy`` objects.
+
+    Mirrors ``compose/schedules.py::_compute_optimizer_time`` (Stack A).
+
+    Args:
+        total_params: Full model parameter count.
+        n_layers: Total number of transformer layers.
+        embed_params: Embedding parameter count (vocab × hidden × 2).
+        expert_params_full: Full routed-expert param count across all MoE layers
+            (``n_moe × 3 × hidden × moe_ffn × num_experts``).  0 for dense.
+        tp, pp, ep, dp: Parallelism dimensions.
+        zero_stage: ZeRO stage (0, 1, 2, 3).
+        apply_dp_for_zero: Divide by ``dp`` when ``zero_stage >= this value``.
+            Use 3 for storage (``state_bytes``), 1 for step-time (``step_bytes``).
+    """
+    P = total_params
+    if tp > 1:
+        P //= tp
+    if pp > 1 and n_layers > 0:
+        non_embed = P - embed_params
+        non_embed = int(non_embed * (n_layers / pp) / n_layers)
+        P = non_embed + embed_params // pp
+    if ep > 1 and expert_params_full > 0:
+        expert_p = expert_params_full
+        if tp > 1:
+            expert_p //= tp
+        if pp > 1:
+            expert_p //= pp
+        non_expert = max(0, P - expert_p)
+        P = non_expert + expert_p // ep
+    if zero_stage >= apply_dp_for_zero and dp > 1:
+        P //= dp
+    return P
+
+
 def _optimizer_state_bytes(P: int, model: ModelSpec, strategy: Strategy) -> int:
     """Optimizer state memory in bytes for P parameters.
 

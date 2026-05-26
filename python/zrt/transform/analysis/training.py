@@ -414,6 +414,7 @@ class PipelineStepMetrics:
     dp_hidden_ms: float = 0.0
     optimizer_time_ms: float = 0.0
     optimizer_comm_ms: float = 0.0
+    optimizer_comm_hidden_ms: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
         # The graph metadata value is the authoritative source used by reports;
@@ -439,6 +440,7 @@ class PipelineStepMetrics:
             "dp_hidden_ms": self.dp_hidden_ms,
             "optimizer_time_ms": self.optimizer_time_ms,
             "optimizer_comm_ms": self.optimizer_comm_ms,
+            "optimizer_comm_hidden_ms": self.optimizer_comm_hidden_ms,
         }
 
 
@@ -853,6 +855,7 @@ class TrainingPipelinePass(GraphPass):
             g.metadata["optimizer_ag_exposed_us"] = ag_exposed_us
 
             metrics.optimizer_comm_ms = opt_comm_exposed_us / 1000.0
+            metrics.optimizer_comm_hidden_ms = opt_comm_hidden_us / 1000.0
             metrics.optimizer_time_ms = opt_compute_us / 1000.0
 
             step_time_us += opt_compute_us + opt_comm_exposed_us
@@ -893,9 +896,33 @@ class TrainingPipelinePass(GraphPass):
             peak_flops = hw.peak_flops(DType.BF16)
             compute_time_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
         else:
-            opt_state_bytes = float(opt_node.attrs.get("state_bytes", 0))
-            hbm_bw = hw.memory.hbm_bandwidth_gbps * 1e9
-            compute_time_us = (opt_state_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
+            step_bytes = float(opt_node.attrs.get("step_bytes", 0))
+            # Legacy compat: nodes without step_bytes fall back to state_bytes
+            # (underestimates traffic by 28/12 ≈ 2.3× since state_bytes uses
+            # 12 B/P storage vs 28 B/P DRAM traffic).
+            if step_bytes <= 0:
+                import warnings
+                warnings.warn(
+                    "optimizer node lacks 'step_bytes'; falling back to "
+                    "'state_bytes' (underestimates DRAM traffic by ~2.3×). "
+                    "Re-run with OptimizerPass to populate step_bytes.",
+                    stacklevel=2,
+                )
+                step_bytes = float(opt_node.attrs.get("state_bytes", 0))
+            hbm_bw_bps = hw.memory.hbm_bandwidth_gbps * 1e9
+            if step_bytes > 0 and hbm_bw_bps > 0:
+                from zrt.training.io.perf_tables import achieved_bandwidth_efficiency
+                gpu_name = getattr(hw, "name", None)
+                raw_eff = getattr(hw.memory, "mem_bw_efficiency", None)
+                eff_override = raw_eff if isinstance(raw_eff, (int, float)) else None
+                eff = (
+                    eff_override if eff_override is not None
+                    else achieved_bandwidth_efficiency(gpu_name, step_bytes) if gpu_name
+                    else 1.0
+                )
+                compute_time_us = (step_bytes / (hbm_bw_bps * eff)) * 1e6
+            else:
+                compute_time_us = 0.0
 
         ag_time_us = 0.0
         rs_time_us = 0.0
