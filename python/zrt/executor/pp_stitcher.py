@@ -300,6 +300,42 @@ def _add_device_serial_dualpipe(
                     tasks[next_fwd_id].dependencies.append(bwd_id)
 
 
+def _add_device_serial_dualpipe_v(
+    tasks: dict[str, GridTask],
+    pp: int,
+    vpp: int,
+    M: int,
+) -> None:
+    """Edge ③ (DualPipeV with V>1): cross-vstage DualPipe hand-off.
+
+    Each physical device holds virtual stages from both the forward
+    pipeline (v < eff_pp/2) and the backward pipeline (v >= eff_pp/2).
+    The two pipelines run concurrently on the device — the cross-vstage
+    skip creates the anti-parallel hand-off:
+
+      B_{B-first}[m] → F_{F-first}[m+2]
+
+    No F-chain/B-chain are added; the list scheduler's stream_id constraint
+    naturally serializes tasks on the same physical device.  The cross-vstage
+    skip is the minimal edge needed to express the DualPipe bidirectional
+    interleaving when V>1.
+    """
+    eff_pp = pp * vpp
+    pivot = eff_pp // 2
+
+    for dev in range(pp):
+        fwd_v = next((v for v in range(eff_pp) if v % pp == dev and v < pivot), None)
+        bwd_v = next((v for v in range(eff_pp) if v % pp == dev and v >= pivot), None)
+        if fwd_v is None or bwd_v is None:
+            continue
+        for m in range(M):
+            bwd_id = _task_id(bwd_v, m, "bwd")
+            if m + 2 < M:
+                next_fwd_id = _task_id(fwd_v, m + 2, "fwd")
+                if bwd_id in tasks and next_fwd_id in tasks:
+                    tasks[next_fwd_id].dependencies.append(bwd_id)
+
+
 def _add_device_serial_zb(
     tasks: dict[str, GridTask],
     pp: int,
@@ -583,11 +619,14 @@ class PPStitcher:
     ) -> None:
         """Apply per-device serialization edges (Edge ③).
 
-        For VPP (interleaved) and DualPipeV, the P2P constraints +
-        list-scheduler's device-free tracking naturally enforce correct
-        device serial ordering across virtual stages — explicit
-        per-virtual-stage chains would serialize all virtual-stage work
-        on a physical device instead of interleaving them.
+        For 1F1B/VPP (interleaved) without VPP, explicit device-serial
+        edges prevent the list scheduler from reordering microbatches.
+
+        For DualPipeV with V>1, explicit F/B chains and cross-vstage
+        DualPipe skip edges are needed to create the bidirectional
+        interleaving — P2P constraints alone cannot express the
+        anti-parallel hand-off between F-first and B-first virtual
+        stages on the same physical device.
         """
         if kind == PPScheduleKind.ONE_F_ONE_B:
             _add_device_serial_1f1b(task_map, eff_pp, self._M)
@@ -599,6 +638,8 @@ class PPStitcher:
         elif kind == PPScheduleKind.DUALPIPE_V:
             if self._vpp <= 1:
                 _add_device_serial_dualpipe(task_map, eff_pp, self._M)
+            else:
+                _add_device_serial_dualpipe_v(task_map, self._pp, self._vpp, self._M)
         elif kind == PPScheduleKind.ZERO_BUBBLE:
             _add_device_serial_zb(task_map, eff_pp, self._M)
 
