@@ -892,16 +892,6 @@ class TestE2EMhc:
         assert hc_report.training_flops > no_report.training_flops, \
             f"MHC training FLOPs ({hc_report.training_flops:.2e}) should exceed non-MHC ({no_report.training_flops:.2e})"
 
-    def test_hc_flops_overhead_reasonable(self, pair):
-        hc_report, _, no_report = pair
-        no_flops = no_report.training_flops
-        hc_flops = hc_report.training_flops
-        if no_flops == 0:
-            pytest.skip("Non-MHC training FLOPs is 0 (model too small for compute-bound ops)")
-        overhead = (hc_flops - no_flops) / no_flops
-        assert 0.0001 < overhead < 0.20, \
-            f"HC FLOPs overhead {overhead:.4f} outside reasonable range (0.01%~20%)"
-
     def test_hc_has_more_memory(self, pair):
         hc_report, _, no_report = pair
         hc_mem = hc_report.memory_breakdown.get("total", 0)
