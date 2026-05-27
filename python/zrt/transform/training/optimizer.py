@@ -11,10 +11,12 @@ from python.zrt.transform.base import GraphPass
 from python.zrt.transform.context import TransformContext
 from python.zrt.training.models.optimizer import (
     adam_step_flops,
+    adam_state_bytes,
+    adam_step_traffic_bytes,
     muon_optimizer_step_flops,
     muon_flops_from_geometry,
 )
-from zrt.training.models.memory import routed_expert_params
+from zrt.training.models.memory import adam_params_on_rank, routed_expert_params
 
 logger = logging.getLogger(__name__)
 
@@ -74,25 +76,48 @@ class OptimizerPass(GraphPass):
         tp = ctx.parallel.tp if ctx.parallel else 1
         dp = ctx.parallel.dp if ctx.parallel else 1
         pp = ctx.parallel.pp if ctx.parallel else 1
-        cp = getattr(ctx.parallel, "cp", 1) if ctx.parallel else 1
 
-        # Apply PP sharding: optimizer runs in the last stage, so only 1/pp of parameters
-        if pp > 1:
-            params = int(total_params / pp)
-        else:
-            params = total_params
-
-        # Apply TP/DP sharding
         zero_stage = ctx.training.zero_stage if ctx.training else 0
-        if zero_stage >= 3:
-            params //= (tp * dp)
-        else:
-            params //= tp
+
+        # Compute geometry metadata for adam_params_on_rank
+        n_layers = g.metadata.get("num_layers", 0)
+        hidden = g.metadata.get("hidden", 0)
+        vocab = g.metadata.get("vocab_size", 0)
+        embed_params = vocab * hidden * 2 if vocab and hidden else 0
+        if n_layers == 0:
+            logger.warning(
+                "OptimizerPass: num_layers=0 in graph metadata; PP shrinking "
+                "and EP sharding will be skipped. Ensure the caller injects "
+                "num_layers/hidden/vocab_size into graph metadata."
+            )
+        moe_total_experts = g.metadata.get("moe_total_experts", 0)
+        moe_ffn = g.metadata.get("moe_ffn_hidden", 0) or 0
+        layer_type_counts = g.metadata.get("layer_type_counts") or {}
+        n_moe = layer_type_counts.get("moe", 0)
+        expert_params_full = n_moe * 3 * hidden * moe_ffn * moe_total_experts if (n_moe and moe_ffn and moe_total_experts) else 0
+        ep = ctx.parallel.ep if ctx.parallel else 1
+
+        # Two per-rank views via shared helper:
+        # P_storage: state_bytes semantics (DP only when ZeRO ≥ 3)
+        # P_step: step_bytes semantics (DP when ZeRO ≥ 1)
+        P_storage = adam_params_on_rank(
+            total_params=total_params, n_layers=n_layers,
+            embed_params=embed_params, expert_params_full=expert_params_full,
+            tp=tp, pp=pp, ep=ep, dp=dp,
+            zero_stage=zero_stage, apply_dp_for_zero=3,
+        )
+        P_step = adam_params_on_rank(
+            total_params=total_params, n_layers=n_layers,
+            embed_params=embed_params, expert_params_full=expert_params_full,
+            tp=tp, pp=pp, ep=ep, dp=dp,
+            zero_stage=zero_stage, apply_dp_for_zero=1,
+        )
+        # params is the storage view for backward-compatible Muon logic below
+        params = P_storage
 
         opt = ctx.training.optimizer if ctx.training else "adam"
         muon_fraction = ctx.training.muon_param_fraction if ctx.training else None
         muon_rotation = getattr(ctx.training, "muon_rotation", True) if ctx.training else True
-        dp = ctx.parallel.dp if ctx.parallel else 1
 
         # Optimizer runs in the last stage (after all backward ops complete)
         optimizer_stage_id = max(0, pp - 1)
@@ -184,6 +209,7 @@ class OptimizerPass(GraphPass):
                 "params_muon": params_muon,
                 "params_adam": params_adam,
                 "state_bytes": self._opt_state_bytes(opt, params, muon_fraction=muon_fraction),
+                "step_bytes": adam_step_traffic_bytes(P_step) if opt in ("adam", "adamw") else 0,
                 "step_flops": step_flops_val,
                 "ns_steps": ns_steps_resolved,
                 "ns_rotation": muon_rotation if opt == "muon" else False,
@@ -266,7 +292,7 @@ class OptimizerPass(GraphPass):
             - Muon: P_muon × 8B + P_adam × 12B = P × (12 - f_muon × 4)
         """
         if optimizer in ("adam", "adamw"):
-            return params * master_bytes * 3
+            return adam_state_bytes(params, master_dtype_bytes=master_bytes)
         elif optimizer == "muon":
             f_muon = muon_fraction if muon_fraction is not None else 0.85
             return int(params * (12 - f_muon * 4))

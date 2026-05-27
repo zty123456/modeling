@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import html as html_lib
 import json
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -661,6 +662,7 @@ def _build_summary(
             "dp_exposed_ms": getattr(report, "dp_exposed_ms", 0.0),
             "tp_hidden_ms": getattr(report, "tp_hidden_ms", 0.0),
             "ep_hidden_ms": getattr(report, "ep_hidden_ms", 0.0),
+            "pp_hidden_ms": getattr(report, "pp_hidden_ms", 0.0),
             "dp_hidden_ms": getattr(report, "dp_hidden_ms", 0.0),
             "total_comm_volume_ms": getattr(report, "total_comm_volume_ms", 0.0),
         },
@@ -1173,7 +1175,7 @@ def _json_parse_literal_for_script(data) -> str:
     JS string literal argument to JSON.parse, so substrings such as ${...} or
     backticks inside model/op names are data, not executable template syntax.
     """
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(_json_safe(data), ensure_ascii=False, separators=(",", ":"))
 
     # Prevent data from closing the script element.
     payload = payload.replace("</", "<\\/")
@@ -1184,6 +1186,17 @@ def _json_parse_literal_for_script(data) -> str:
     # Return a quoted JS string literal. ensure_ascii=True makes the outer JS
     # literal ASCII-safe even when the report contains Chinese text.
     return json.dumps(payload, ensure_ascii=True)
+
+
+def _json_safe(value):
+    """Convert exporter data to plain JSON-compatible containers."""
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {_json_safe(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 _HTML_TEMPLATE = r"""<!doctype html>

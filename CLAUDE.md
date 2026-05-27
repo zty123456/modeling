@@ -94,16 +94,18 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 **Stage 1 — Graph Capture** (`python/zrt/graph/`)
 - `model_loader.py`: loads HF model via `FakeTensorMode` — no real weights or memory allocated
 - `dispatch.py` + `tracker.py`: intercept aten ops during forward pass via `TorchDispatchMode` + `ModuleTracker`
-- `fusion.py`: two-stage fusion — group by leaf module, then merge up to parent if ≤30 child ops
-- `graph_builder.py`: produces raw `OpGraph` and fused `OpGraph`
-- `patches.py`: MoE meta patch (replaces `.cpu().numpy()` on meta tensors); Indexer patch for DeepSeek V3.2
+- `graph_builder.py`: produces raw `OpGraph`
+- `transform_runner.py`: runs the transform pipeline on a captured graph
+- `patches.py`: MoE meta patch (replaces `.cpu().numpy()` on meta tensors); Indexer patch for DeepSeek V3.2; V4 inference stubs
 - `compat.py`: version shims for transformers 4.x vs 5.x API differences
+- `v4_fake_kernels.py`: FakeTensor stubs for DeepSeek-V4 custom kernels
+- Capture entry point lives in `python/zrt/pipeline.py` (`run_trace`, `run_trace_phases`), re-exported under `python.zrt.graph`. Fusion now lives in `transform/fusion/` (see Stage 2).
 
 **Stage 2 — Transform Pipeline** (`python/zrt/transform/`)
 - `context.py`: `TransformContext`, `ParallelConfig` (TP/EP/PP/DP/SP), `StreamConfig`
 - `pipeline.py`: `build_default_pipeline()` — pluggable pass system
 - `parallel/`: tensor_parallel.py, expert_parallel.py, pipeline_parallel.py, data_parallel.py, context_parallel.py, comm_inserter.py
-- `fusion/`: MRO-based fusion system (v2) — rules keyed by `type(module).__mro__`, single-pass algorithm, preserves `name` + `provenance`. See `docs/fusion_v2_zh.md` for rule registration guide.
+- `fusion/`: fusion package (subdirs: `core/`, `rules/`, `matching/`, `building/`, `bucketing/`, `loading/`, `pipeline/`, `registry/`, `semantics/`, `configs/`). Platform SubPatterns (`cuda`/`ascend_npu`/`cpu`/`generic`) live under `rules/`. See `docs/fusion-architecture.md` / `docs/fusion_module_zh.md`. Top-level `python/zrt/fusion/discover/` generates fusion-rule YAML drafts for new models (see `discover-fusion-rules` skill).
 - `analysis/`: FLOPs, Roofline, communication latency, training modeling (modeller.py, training.py)
 - `optim/`: optimization passes (quant, recomp, EPLB, MTP)
 - `training/`: training-specific graph passes — `RecomputePass` (activation recompute annotation), `OffloadPass`, `OptimizerPass`, `ZeroFSDPPass`
@@ -112,7 +114,7 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 
 **Stage 3 — Executor** (`python/zrt/executor/`)
 - `scheduler.py`: topological sort + greedy multi-stream assignment → `Timeline`
-- `overlap.py`: compute-communication overlap analysis
+- compute-communication overlap analysis (CoC, MC2, wave-overlap)
 
 **Stage 4 — Simulator** (`python/zrt/simulator/`)
 - `hub.py`: `SimulatorHub` with fallback chain — Roofline → Regression → ProfileDB → Tiling
@@ -216,31 +218,39 @@ Local model configs (no weights) live in `hf_models/` (deepseek_v3, llama3_8b, e
 ## 关键文件速查
 
 ```
-python/zrt/graph/
-├── compat.py         # transformers 版本 shim + 本地模型注册表（新）
-├── patches.py        # 运行时 patch（MoE、Indexer、legacy 属性）
-├── model_loader.py   # 分层加载器：load_model() -> (model, config, fake_mode)
-├── main.py           # run_trace() 入口 + CLI
-├── dispatch.py       # RecordingDispatch + TensorTracker（aten 拦截）
-├── tracker.py        # ModuleTracker（forward hooks，模块路径）
-├── fusion.py         # FusionEngine（两阶段算子融合）
-├── classifier.py     # 组件分类 + 颜色映射
-├── excel_writer.py   # Excel + JSON 输出
-├── graph_builder.py  # build_op_graph / build_fused_op_graph
-├── graph_exporter.py # export_all() -> JSON/ONNX
-└── __init__.py       # 公开 API 导出
+python/zrt/
+├── pipeline.py             # run_trace / run_trace_phases（图捕获顶层入口）
+├── cli.py / __main__.py    # CLI 参数解析与入口（python -m python.zrt）
+│
+├── graph/                  # 抓图：FakeTensor + TorchDispatchMode
+│   ├── compat.py           # transformers 版本 shim + 本地模型注册表
+│   ├── patches.py          # 运行时 patch（MoE、Indexer、V4 stubs、legacy 属性）
+│   ├── model_loader.py     # load_model() -> (model, config, fake_mode)
+│   ├── dispatch.py         # RecordingDispatch + TensorTracker（aten 拦截）
+│   ├── tracker.py          # ModuleTracker（forward hooks，模块路径）
+│   ├── classifier.py       # 组件分类 + 颜色映射
+│   ├── graph_builder.py    # build_op_graph
+│   ├── transform_runner.py # 在抓到的图上跑 transform pipeline
+│   ├── v4_fake_kernels.py  # DeepSeek-V4 自定义算子的 FakeTensor stub
+│   └── pattern_extractor.py
+│
+├── transform/fusion/       # 算子融合（rules / core / matching / building / ...）
+├── fusion/discover/        # 为新模型生成 fusion-rule YAML 草稿
+└── report/                 # excel/html/onnx/dot/chrome_trace 等导出
 
-hf_models/            # 只读！来自 HF 官网
-├── deepseek_v3/      # config.json + modeling_deepseek.py + configuration_deepseek.py
-├── deepseek_v3_2/    # 同上（V3.2，含 Indexer 模块；config.json 加了 auto_map）
-├── llama3_8b/        # 仅 config.json（标准架构无需 modeling 文件）
+hf_models/                  # 只读！来自 HF 官网
+├── deepseek_v3/            # config.json + modeling_deepseek.py + configuration_deepseek.py
+├── deepseek_v3_2/          # V3.2，含 Indexer 模块；config.json 加了 auto_map
+├── deepseek_v4/            # SWA/CSA/HCA 三种 Attention 变体；V4 推理 stubs
+├── llama3_8b/              # 仅 config.json（标准架构无需 modeling 文件）
 ├── llama3_70b/
 ├── qwen2_7b/
 ├── qwen2_72b/
 ├── mistral_7b/
-└── mixtral_8x7b/
+├── mixtral_8x7b/
+└── modeling_sources/       # 原始 modeling 文件归档
 
-tests/                   # pytest 测试套件（见上方 Commands 章节）
+tests/                      # pytest 测试套件（见上方 Commands 章节）
 ```
 
 ---
@@ -257,30 +267,25 @@ fake_mode.__exit__(None, None, None)
 
 ### `run_trace_phases(...)` ← 推荐：prefill + decode 一次完成
 ```python
-from python.zrt.graph import run_trace_phases
-output_dir, phase_records = run_trace_phases(
+from python.zrt.pipeline import run_trace_phases  # 也可从 python.zrt.graph 导入（re-export）
+result = run_trace_phases(
     model_id="deepseek-ai/DeepSeek-V3-0324",
     num_layers=4,
     batch_size=1,
     seq_len=128,
-    output_dir="output/graph/DeepSeek-V3-0324",  # 可选
-    phases=("prefill", "decode"),                 # 默认同时抓两阶段
+    phases=("prefill", "decode"),
 )
-# phase_records["prefill"] / phase_records["decode"] → op-record 列表
-# 输出文件：
-#   DeepSeek_V3_0324_prefill_ops.xlsx / _prefill_raw_graph.json / .onnx / _prefill_fused_graph.*
-#   DeepSeek_V3_0324_decode_ops.xlsx  / _decode_raw_graph.json  / .onnx / _decode_fused_graph.*
+raw_graph, fused_graph = result.graphs["prefill"]
+records = result.phase_records["prefill"]
+output_dir = result.output_dir
 ```
 
 ### `run_trace(...)` ← 单阶段（向后兼容）
 ```python
-from python.zrt.graph import run_trace
+from python.zrt.pipeline import run_trace
 output_dir, records = run_trace(
     model_id="deepseek-ai/DeepSeek-V3-0324",
     num_layers=4,
-    batch_size=1,
-    seq_len=128,
-    output_dir="output/graph/DeepSeek-V3-0324",  # 可选，默认 output/graph/<slug>
     phase="prefill",   # "prefill"（默认）/ "decode" / "forward"（"prefill" 的别名）
 )
 ```
@@ -354,7 +359,8 @@ patch 在运行时替换 `Indexer.forward`，模型文件保持不变。
 | 本地路径 | HF Hub ID | 备注 |
 |---------|-----------|------|
 | `hf_models/deepseek_v3` | `deepseek-ai/DeepSeek-V3` | MoE patch 必需 |
-| `hf_models/deepseek_v3_2` | `deepseek-ai/DeepSeek-V3.2` | MoE + Indexer patch|
+| `hf_models/deepseek_v3_2` | `deepseek-ai/DeepSeek-V3.2` | MoE + Indexer patch |
+| `hf_models/deepseek_v4` | — | MoE patch + V4 推理 stubs；CUDA 融合 `v4_q_norm`/`v4_kv_quant`/`v4_sparse_attn`；NPU 融合 `npu_sas`（SWA/CSA/HCA）|
 | — | `deepseek-ai/DeepSeek-V3-0324` | V3 的 3 月 24 日更新版，**不是** V3.2 |
 | `hf_models/llama3_8b` | `meta-llama/Llama-3.1-8B` | 需 HF 授权 |
 | `hf_models/qwen2_7b` | `Qwen/Qwen2.5-7B-Instruct` | — |

@@ -1,7 +1,7 @@
 """Tests for YAML quant_preset expansion + extended _parse_dtype."""
 import pytest
 
-from zrt.training.io.config_loader import _expand_quant_preset, _parse_dtype
+from zrt.training.io.config_loader import _expand_quant_preset, _parse_dtype, _resolve_model
 from zrt.training.spec.dtype import Dtype
 
 
@@ -61,3 +61,27 @@ def test_preset_bf16_baseline_is_pure_bf16():
     assert out["routed_expert_compute_dtype"] == "bf16"
     assert out["routed_expert_weight_dtype"] == "bf16"
     assert out["attn_compute_dtype"] == "bf16"
+
+
+def test_parse_model_preserves_per_component_weight_and_grad_dtypes():
+    m = _resolve_model({
+        "hidden": 128,
+        "ffn": 256,
+        "num_heads": 4,
+        "num_kv_heads": 4,
+        "head_dim": 32,
+        "vocab": 1000,
+        "seq_len": 64,
+        "layers": ["moe"],
+        "num_experts": 8,
+        "moe_ffn": 128,
+        "top_k": 2,
+        "attn_weight_dtype": "fp8_e4m3",
+        "shared_expert_weight_dtype": "fp8_e4m3",
+        "attn_grad_dtype": "bf16",
+        "shared_expert_grad_dtype": "bf16",
+    })
+    assert m.attn_weight_dtype is Dtype.FP8_E4M3
+    assert m.shared_expert_weight_dtype is Dtype.FP8_E4M3
+    assert m.attn_grad_dtype is Dtype.BF16
+    assert m.shared_expert_grad_dtype is Dtype.BF16

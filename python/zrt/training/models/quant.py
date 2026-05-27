@@ -171,14 +171,13 @@ def expected_input_dtype(op: Op, ti: int, model: ModelSpec) -> Dtype:
     bundle = resolve_op_dtypes(op, model)
 
     if op.kind == "add":
-        # Residual-add boundary: both sides must arrive in the residual
-        # dtype (BF16/FP32), regardless of which region produced them.
-        # ``component`` is set to "routed_expert" on expert_agg adds in
-        # builders.py:528, so we treat any add inside an expert region as
-        # a residual-add boundary.
+        # Residual adds are untagged and use the residual stream dtype.
+        # Expert aggregation adds are tagged as routed/shared expert and stay
+        # inside the MoE region; casting them to residual dtype would insert
+        # spurious FP8->BF16 casts before the actual residual boundary.
         if op.component in {"routed_expert", "shared_expert"}:
-            return model.effective_residual_dtype()
-        return bundle.in_act
+            return bundle.in_act
+        return model.effective_residual_dtype()
 
     if op.kind in ("dispatch", "combine"):
         # Token routing happens in MoE-region activation dtype.

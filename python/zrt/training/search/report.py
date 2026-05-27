@@ -51,6 +51,7 @@ def report_to_dict(report: Report) -> dict:
         "dp_hidden_ms": round(report.dp_hidden_ms, 3),
         "tp_hidden_ms": round(report.tp_hidden_ms, 3),
         "ep_hidden_ms": round(report.ep_hidden_ms, 3),
+        "pp_hidden_ms": round(report.pp_hidden_ms, 3),
         "total_comm_volume_ms": round(report.total_comm_volume_ms, 3),
         "tokens_per_sec": round(report.tokens_per_sec, 1),
         "effective_params": report.effective_params,
@@ -153,6 +154,7 @@ def report_summary(report: Report) -> str:
             lines.append(f"    {'DP hidden':<36s} {report.dp_hidden_ms:>10.2f} ms")
             lines.append(f"    {'TP hidden':<36s} {report.tp_hidden_ms:>10.2f} ms")
             lines.append(f"    {'EP hidden':<36s} {report.ep_hidden_ms:>10.2f} ms")
+            lines.append(f"    {'PP hidden':<36s} {report.pp_hidden_ms:>10.2f} ms")
             lines.append(f"    {'Total hidden':<36s} {report.hidden_comm_ms:>10.2f} ms")
 
         # Recompute raw (pre-hide) vs critical (post-hide). raw is NOT summed

@@ -218,7 +218,7 @@ def test_pipeline_pass_dp_in_bubble_adds_exposed_time():
         "num_layers": 2, "num_layers_traced": 2, "training_flops": 1e12,
     }
     # Inject a pre-annotated DP comm node with a large bucket (forces AR >> bubble)
-    # AR time: 2*(dp-1)/dp * 1e9 bytes / (100 Gbps * 1e9/8 / 1e6) = big
+    # AR time: 2*(dp-1)/dp * 1e9 bytes / (100 GB/s * 1e9 / 1e6) = big
     large_bucket = 10_000_000_000  # 10 GB → AR >> bubble
     matmul = _OpNode(
         id="mm_0", op_type="aten.mm.default",

@@ -156,6 +156,19 @@ def test_residual_add_inputs_cast_to_residual_dtype_under_moe_quant():
 # ── Dense block: attention region only ──────────────────────────────────
 
 
+def test_expert_agg_inputs_remain_moe_dtype_under_moe_quant():
+    """expert_agg is internal to MoE and should not be cast to residual dtype."""
+    m = _moe_model(moe_act_dtype=Dtype.FP8_E4M3)
+    g = build_graph(m, Strategy())
+    agg = _find_op(g, "expert_agg")
+    assert [t.dtype for t in agg.inputs] == [Dtype.FP8_E4M3, Dtype.FP8_E4M3]
+    assert agg.outputs[0].dtype is Dtype.FP8_E4M3
+    assert not any(
+        op.kind == "cast" and "expert_agg" in op.name
+        for op in g.ops
+    )
+
+
 def test_dense_block_attn_region_splits_ffn():
     m = _dense_model(attn_act_dtype=Dtype.FP8_E4M3)
     g = build_graph(m, Strategy())

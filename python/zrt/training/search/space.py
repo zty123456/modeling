@@ -75,7 +75,7 @@ class SearchSpace:
                                     for opt in self.optimizer_values:
                                         if opt == OptKind.MUON:
                                             for rot in self.muon_rotation_values:
-                                                if sched == PPSched.INTERLEAVED:
+                                                if sched in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
                                                     for vc in self.vpp_chunks_values:
                                                         s = self._make_strategy(
                                                             tp, cp, pp, ep, dp, zero_stage,
@@ -95,7 +95,7 @@ class SearchSpace:
                                                         seen.add(key)
                                                         results.append(s)
                                         else:
-                                            if sched == PPSched.INTERLEAVED:
+                                            if sched in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
                                                 for vc in self.vpp_chunks_values:
                                                     s = self._make_strategy(
                                                         tp, cp, pp, ep, dp, zero_stage,

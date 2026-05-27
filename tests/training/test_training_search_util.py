@@ -206,6 +206,13 @@ class TestMakeStrategyFromConfig:
         assert strategy.pp_schedule == PPSched.INTERLEAVED
         assert strategy.vpp_chunks == 4
 
+    def test_pp_schedule_dualpipev_with_vpp(self):
+        config = {"pp_schedule": "dualpipev", "vpp_chunks": 4}
+        strategy = _make_strategy_from_config(config)
+
+        assert strategy.pp_schedule == PPSched.DUALPIPE_V
+        assert strategy.vpp_chunks == 4
+
     def test_pp_schedule_non_interleaved_ignores_vpp(self):
         config = {"pp_schedule": "1f1b", "vpp_chunks": 4}
         strategy = _make_strategy_from_config(config)
@@ -439,6 +446,60 @@ class TestTrainingConfigManager:
         configs = manager.generate_static_configs()
         assert manager.count_total_configs() == len(configs)
 
+    def test_total_token_derives_exact_global_batch_from_each_seq_len(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [1],
+                "seq_len": [512, 256],
+                "total_token": [1024],
+                "tp": [1],
+                "cp": [1],
+                "pp": [1],
+                "ep": [1],
+                "dp": [1],
+                "micro_batch": [1],
+                "global_batch": [128, 256],
+                "zero_stage": [0],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["adam"],
+            }
+        )
+
+        configs = manager.generate_static_configs()
+
+        assert [(c["seq_len"], c["global_batch"]) for c in configs] == [
+            (512, 2),
+            (256, 4),
+        ]
+        assert manager.count_total_configs() == len(configs)
+
+    def test_total_token_rejects_seq_len_with_remainder(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [1],
+                "seq_len": [512],
+                "total_token": [1025],
+                "tp": [1],
+                "cp": [1],
+                "pp": [1],
+                "ep": [1],
+                "dp": [1],
+                "micro_batch": [1],
+                "zero_stage": [0],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["adam"],
+            }
+        )
+
+        with pytest.raises(ValueError, match="total_token.*divisible.*seq_len"):
+            manager.generate_static_configs()
+
     def test_search_filters_non_divisible_ep_dp_combos(self):
         manager = TrainingConfigManager(
             param_grid={
@@ -524,6 +585,7 @@ class TestTrainingConfigManager:
             "pp_schedule": "1f1b",
             "recompute": "none",
             "optimizer": "adam",
+            "max_memory_gb": 1024,
         })
 
         assert result["status"] == "success"
@@ -549,6 +611,7 @@ class TestTrainingConfigManager:
             "recompute": "none",
             "optimizer": "muon",
             "muon_rotation": True,
+            "max_memory_gb": 1024,
         }
 
         result = run_training_task_wrapper(cfg)
@@ -565,6 +628,117 @@ class TestTrainingConfigManager:
         assert row["optimizer_comm_ms"] == pytest.approx(
             round(report.optimizer_comm_hidden_ms, 2)
         )
+
+    def test_worker_skips_memory_infeasible_config_before_graph_build(self, monkeypatch):
+        import zrt.training.ir.builders as builders
+        import zrt.training.search.training_search_util as search_util
+
+        class FakeStrategy:
+            def validate(self, model, system):
+                return None
+
+        search_util._WORKER_MODEL_CACHE.clear()
+        search_util._WORKER_HW_CACHE.clear()
+        search_util._WORKER_GRAPH_CACHE.clear()
+
+        monkeypatch.setattr(
+            search_util,
+            "_load_model_spec",
+            lambda *a, **k: SimpleNamespace(seq_len=4096),
+        )
+        monkeypatch.setattr(search_util, "_make_strategy_from_config", lambda cfg: FakeStrategy())
+        monkeypatch.setattr(
+            search_util,
+            "_make_system_from_config",
+            lambda cfg: SimpleNamespace(gpu=SimpleNamespace(hbm_gb=10), world_size=1),
+        )
+        monkeypatch.setattr(
+            search_util,
+            "memory_breakdown",
+            lambda graph, model, system, strategy: MemBreakdown(weights=9e9),
+        )
+
+        def fail_build_graph(*args, **kwargs):
+            raise AssertionError("build_graph should not run for memory-skipped configs")
+
+        monkeypatch.setattr(builders, "build_graph", fail_build_graph)
+
+        result = run_training_task_wrapper({"model": "fake", "hw": "fake", "world_size": 1})
+
+        assert result["status"] == "skipped"
+        assert result["type"] == "memory"
+
+    def test_worker_reuses_graph_cache_for_equivalent_graph_configs(self, monkeypatch):
+        import zrt.training.ir.builders as builders
+        import zrt.training.search.training_search_util as search_util
+
+        class FakeStrategy:
+            def __init__(self, dp, global_batch):
+                self.dp = dp
+                self.global_batch = global_batch
+
+            def validate(self, model, system):
+                return None
+
+        search_util._WORKER_MODEL_CACHE.clear()
+        search_util._WORKER_HW_CACHE.clear()
+        search_util._WORKER_GRAPH_CACHE.clear()
+
+        build_calls = []
+        monkeypatch.setattr(
+            search_util,
+            "_load_model_spec",
+            lambda *a, **k: SimpleNamespace(seq_len=4096),
+        )
+        monkeypatch.setattr(
+            search_util,
+            "_make_system_from_config",
+            lambda cfg: SimpleNamespace(
+                gpu=SimpleNamespace(hbm_gb=80),
+                world_size=cfg.get("world_size", 1),
+            ),
+        )
+        monkeypatch.setattr(
+            search_util,
+            "_make_strategy_from_config",
+            lambda cfg: FakeStrategy(dp=cfg.get("dp", 1), global_batch=cfg.get("global_batch", 0)),
+        )
+        monkeypatch.setattr(
+            search_util,
+            "memory_breakdown",
+            lambda graph, model, system, strategy: MemBreakdown(weights=1e9),
+        )
+
+        def fake_build_graph(model, strategy):
+            build_calls.append((strategy.dp, strategy.global_batch))
+            return SimpleNamespace(ops=[], collectives=[])
+
+        monkeypatch.setattr(builders, "build_graph", fake_build_graph)
+        monkeypatch.setattr(
+            search_util,
+            "estimate",
+            lambda model, system, strategy, graph=None: TrainingReport(mfu=0.1),
+        )
+
+        base = {
+            "model": "fake",
+            "hw": "fake",
+            "world_size": 8,
+            "seq_len": 4096,
+            "micro_batch": 1,
+            "tp": 1,
+            "cp": 1,
+            "pp": 1,
+            "ep": 1,
+            "cp_kind": "none",
+        }
+
+        first = run_training_task_wrapper({**base, "dp": 8, "global_batch": 8})
+        second = run_training_task_wrapper({**base, "dp": 4, "global_batch": 16})
+
+        assert first["status"] == "success"
+        assert second["status"] == "success"
+        assert len(build_calls) == 1
 
     def test_output_path_generation(self):
         manager = TrainingConfigManager(
@@ -656,7 +830,8 @@ class TestFormatResults:
             ep_hidden_ms=1.0,
             ep_total_ms=5.0,
             pp_exposed_ms=2.0,
-            pp_total_ms=2.0,
+            pp_hidden_ms=0.5,
+            pp_total_ms=2.5,
             dp_exposed_ms=6.0,
             dp_hidden_ms=3.0,
             dp_total_ms=9.0,
@@ -673,6 +848,7 @@ class TestFormatResults:
         assert "ep_exposed_ms" in df.columns
         assert "pp_total_ms" in df.columns
         assert "pp_exposed_ms" in df.columns
+        assert "pp_hidden_ms" in df.columns
         assert "dp_total_ms" in df.columns
         assert "dp_exposed_ms" in df.columns
         assert df.iloc[0]["tp_total_ms"] == 7.0
@@ -681,8 +857,9 @@ class TestFormatResults:
         assert df.iloc[0]["cp_exposed_ms"] == 3.0
         assert df.iloc[0]["ep_total_ms"] == 5.0
         assert df.iloc[0]["ep_exposed_ms"] == 4.0
-        assert df.iloc[0]["pp_total_ms"] == 2.0
+        assert df.iloc[0]["pp_total_ms"] == 2.5
         assert df.iloc[0]["pp_exposed_ms"] == 2.0
+        assert df.iloc[0]["pp_hidden_ms"] == 0.5
         assert df.iloc[0]["dp_total_ms"] == 9.0
         assert df.iloc[0]["dp_exposed_ms"] == 6.0
 

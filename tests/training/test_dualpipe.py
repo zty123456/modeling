@@ -80,6 +80,40 @@ def test_dualpipev_vpp1_equals_dualpipe():
     assert dpv_result.step_time == pytest.approx(dp_result.step_time, rel=1e-9)
 
 
+def test_dualpipe_steady_uses_same_stage_bottleneck():
+    """Steady-state service time is max_s(F_s + B_s), not max(F)+max(B)."""
+    st = [
+        StageTime(fwd=0.10, bwd=0.01),
+        StageTime(fwd=0.01, bwd=0.10),
+        StageTime(fwd=0.02, bwd=0.02),
+        StageTime(fwd=0.02, bwd=0.02),
+    ]
+    s = _make_strategy(pp=4)
+    M = s.num_microbatches()
+
+    result = DualPipeComposer().compose(st, M, 4, 0.0, s)
+
+    assert result.steady_per_mb == pytest.approx(0.11, rel=1e-9)
+    assert result.steady == pytest.approx(M * 0.11, rel=1e-9)
+
+
+def test_dualpipev_steady_uses_same_stage_bottleneck():
+    """DualPipeV keeps the same per-stage steady bottleneck as DualPipe."""
+    st = [
+        StageTime(fwd=0.10, bwd=0.01),
+        StageTime(fwd=0.01, bwd=0.10),
+        StageTime(fwd=0.02, bwd=0.02),
+        StageTime(fwd=0.02, bwd=0.02),
+    ]
+    s = _make_strategy(pp=4, vpp_chunks=2, schedule=PPSched.DUALPIPE_V)
+    M = s.num_microbatches()
+
+    result = DualPipeVComposer().compose(st, M, 4, 0.0, s)
+
+    assert result.steady_per_mb == pytest.approx(0.11, rel=1e-9)
+    assert result.steady == pytest.approx(M * 0.11, rel=1e-9)
+
+
 def test_dualpipe_schedule_identity():
     """Regression: DualPipeComposer should return schedule_name='dualpipe'."""
     st = _make_stage_times(4)

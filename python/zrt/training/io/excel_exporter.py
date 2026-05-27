@@ -150,6 +150,7 @@ def export_estimate_excel(
         ["  DP hidden", f"{report.dp_hidden_ms:.2f}" if report.dp_hidden_ms > 0 else "-", "ms"],
         ["  TP hidden", f"{report.tp_hidden_ms:.2f}" if report.tp_hidden_ms > 0 else "-", "ms"],
         ["  EP hidden", f"{report.ep_hidden_ms:.2f}" if report.ep_hidden_ms > 0 else "-", "ms"],
+        ["  PP hidden", f"{report.pp_hidden_ms:.2f}" if report.pp_hidden_ms > 0 else "-", "ms"],
         ["  Optimizer comm hidden", f"{report.optimizer_comm_hidden_ms:.2f}" if report.optimizer_comm_hidden_ms > 0 else "-", "ms"],
         ["  Total hidden", f"{report.hidden_comm_ms:.2f}" if report.hidden_comm_ms > 0 else "-", "ms"],
         ["", "", ""],
@@ -201,7 +202,11 @@ def export_estimate_excel(
     _LAYER_KIND_MAP = {
         "dense": "Dense", "moe": "MoE", "mtp": "MTP",
     }
-    from zrt.training.compose.stage import has_heterogeneous_compute, _cost_phase_time
+    from zrt.training.compose.stage import (
+        has_heterogeneous_compute,
+        _cost_phase_time,
+        _resolve_compute_dtype,
+    )
     _act_dtype = model.act_dtype if hasattr(model, "act_dtype") else Dtype.BF16
 
     def _fmt_num(x: float | None) -> str:
@@ -236,9 +241,10 @@ def export_estimate_excel(
         # Compute latency from FLOPs/bytes using roofline model (hetero-aware)
         gpu_name = system.gpu.name
         overlap = system.gpu.overlap_ratio.get(op.kind, 0.0) if has_heterogeneous_compute(system) else 0.0
-        fwd_time = _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
-        bwd_time = (_cost_phase_time(cost, "dx", system, gpu_name, overlap)
-                    + _cost_phase_time(cost, "dw", system, gpu_name, overlap))
+        op_dtype = _resolve_compute_dtype(op, model)
+        fwd_time = _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
+        bwd_time = (_cost_phase_time(cost, "dx", system, gpu_name, overlap, op_dtype)
+                    + _cost_phase_time(cost, "dw", system, gpu_name, overlap, op_dtype))
         latency_us = (fwd_time + bwd_time) * 1e6
 
         op_rows.append([

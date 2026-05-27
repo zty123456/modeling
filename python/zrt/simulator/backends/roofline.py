@@ -189,6 +189,27 @@ def _itemsize(node: "OpNode") -> float:
     return _primary_dtype(node).itemsize
 
 
+# ── quantization-aware itemsize helpers ─────────────────────────────────────────
+
+_QUANT_BYTES: dict[str, float] = {
+    "int4": 0.5, "int8": 1.0,
+    "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
+    "bf16": 2.0, "fp16": 2.0, "fp32": 4.0,
+}
+
+
+def _weight_itemsize(node: "OpNode") -> float:
+    """Return bytes-per-element for the weight tensor, respecting quant_weight annotation."""
+    qw = node.annotations.get("quant_weight", "") if node.annotations else ""
+    return _QUANT_BYTES.get(qw.lower(), 2.0)
+
+
+def _kv_itemsize(node: "OpNode") -> float:
+    """Return bytes-per-element for KV cache tensors, respecting quant_kv annotation."""
+    qkv = node.annotations.get("quant_kv", "") if node.annotations else ""
+    return _QUANT_BYTES.get(qkv.lower(), 2.0)
+
+
 # ── per-op formula functions ──────────────────────────────────────────────────
 # Each returns (flops: float, read_bytes: float, write_bytes: float)
 
@@ -206,9 +227,10 @@ def _mm(node: "OpNode") -> FMR:
         return _default(node)
     M, K = a.shape[-2], a.shape[-1]
     N = b.shape[-1]
-    it = a.dtype.itemsize
+    it = a.dtype.itemsize           # activation itemsize
+    w_it = _weight_itemsize(node)   # weight itemsize (quantized)
     flops = 2.0 * M * N * K
-    read  = (M * K + K * N) * it
+    read  = M * K * it + K * N * w_it
     write = M * N * it
     return flops, read, write
 
@@ -226,9 +248,10 @@ def _addmm(node: "OpNode") -> FMR:
         return _default(node)
     M, K = mat1.shape[0], mat1.shape[1]
     N = mat2.shape[1]
-    it = mat1.dtype.itemsize
+    it = mat1.dtype.itemsize           # activation itemsize
+    w_it = _weight_itemsize(node)     # weight itemsize (mat2)
     flops = 2.0 * M * N * K + M * N   # mm + bias add
-    read  = (M * K + K * N + _numel(bias.shape)) * it
+    read  = M * K * it + K * N * w_it + _numel(bias.shape) * it
     write = M * N * it
     return flops, read, write
 
@@ -244,9 +267,10 @@ def _bmm(node: "OpNode") -> FMR:
         return _mm(node)   # fallback to 2-D mm
     B, M, K = a.shape[0], a.shape[1], a.shape[2]
     N = b.shape[2]
-    it = a.dtype.itemsize
+    it = a.dtype.itemsize           # activation itemsize
+    w_it = _weight_itemsize(node)   # weight itemsize (b)
     flops = 2.0 * B * M * N * K
-    read  = (B * M * K + B * K * N) * it
+    read  = B * M * K * it + B * K * N * w_it
     write = B * M * N * it
     return flops, read, write
 
@@ -264,9 +288,10 @@ def _linear(node: "OpNode") -> FMR:
     I = inp.shape[-1]
     O = weight.shape[0]
     batch = _numel(inp.shape[:-1])
-    it = inp.dtype.itemsize
+    it = inp.dtype.itemsize           # activation itemsize
+    w_it = _weight_itemsize(node)     # weight itemsize (quantized)
     flops = 2.0 * batch * O * I
-    read  = (batch * I + O * I) * it
+    read  = batch * I * it + O * I * w_it
     write = batch * O * it
     if len(node.inputs) >= 3:   # bias
         bias = node.inputs[2]
@@ -372,12 +397,13 @@ def _scaled_dot_product_attention(node: "OpNode") -> FMR:
     # Assume (N, H, Sq, D) layout
     N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
     Sk = k.shape[2]
-    it = q.dtype.itemsize
+    it = q.dtype.itemsize       # activation dtype for Q
+    kv_it = _kv_itemsize(node)  # KV cache dtype for K,V
     # QK matmul: 2*N*H*Sq*Sk*D,  AV matmul: 2*N*H*Sq*Sk*D
     flops = 4.0 * N * H * Sq * Sk * D
     # Softmax ops ~ 4*N*H*Sq*Sk (sub-dominant, included for completeness)
     flops += 4.0 * N * H * Sq * Sk
-    read  = (N*H*Sq*D + N*H*Sk*D + N*H*Sk*D) * it   # Q + K + V
+    read  = N*H*Sq*D * it + 2 * N*H*Sk*D * kv_it   # Q uses it, K+V use kv_it
     write = (N*H*Sq*D) * it                           # output
     return flops, read, write
 
@@ -414,7 +440,8 @@ def _paged_attention(node: "OpNode") -> FMR:
     else:
         return _default(node)
 
-    it = q.dtype.itemsize
+    it = q.dtype.itemsize       # activation dtype for Q
+    kv_it = _kv_itemsize(node)  # KV cache dtype for K,V
 
     # KV cache length 需从 block_tables 或 node.annotations 估算
     # 若无信息，假设 Sk = Sq * 4 (典型解码场景)
@@ -426,7 +453,7 @@ def _paged_attention(node: "OpNode") -> FMR:
 
     # 内存带宽：Q + K + V + block_tables 索引
     q_bytes = N * H * Sq * D * it
-    kv_bytes = N * H * Sk * D * it * 2  # K + V
+    kv_bytes = 2 * N * H * Sk * D * kv_it  # K + V with KV dtype
     block_table_bytes = N * Sk * 8  # int64 indices, 每个 KV block 一个索引
     read = q_bytes + kv_bytes + block_table_bytes
     write = N * H * Sq * D * it

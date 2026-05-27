@@ -102,6 +102,13 @@ class ModelSpec:
     # === Per-region activation dtype (None → fallback) ===
     attn_act_dtype: Dtype | None = None
     moe_act_dtype: Dtype | None = None
+    # PP P2P boundary carries the residual stream between adjacent stages.
+    # ``None`` falls back to ``act_dtype`` (legacy behavior: BF16 even under
+    # FP8/FP4 quant presets). Set this explicitly (typically FP8) to drop the
+    # PP P2P payload size when the residual can tolerate lower precision —
+    # otherwise the residual stream is the only BF16 transfer left after a
+    # quant preset and dominates inter-stage comm on slow inter-pod links.
+    residual_dtype: Dtype | None = None
 
     # === Per-component grad dtype ===
     routed_expert_grad_dtype: Dtype = Dtype.FP32
@@ -236,10 +243,14 @@ class ModelSpec:
     def effective_residual_dtype(self) -> Dtype:
         """Residual stream dtype — PP P2P + cross-region cast targets.
 
-        V4 keeps the residual stream in ``act_dtype`` (typically BF16) even
-        when MoE/attention internals are FP8/FP4. Exposed as a helper so a
-        future ``residual_dtype`` override field can be added without churn.
+        Resolves ``residual_dtype`` if explicitly set; otherwise falls back
+        to ``act_dtype`` (legacy behavior: BF16 even when MoE/attention
+        internals are FP8/FP4). Lowering the residual to FP8 cuts the PP
+        P2P boundary payload in half, which becomes significant when the
+        PP group spans inter-pod / over-subscribed links.
         """
+        if self.residual_dtype is not None:
+            return self.residual_dtype
         return self.act_dtype
 
     # ── Attention parameter helpers ──────────────────────────────────────

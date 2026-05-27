@@ -99,6 +99,30 @@ def insert_collectives(graph: Graph, model: ModelSpec, strategy: Strategy) -> No
 
     # Apply TP/CP sharding to global ops (layer_id < 0: lm_head, final_ln, etc.)
     # These are outside the per-layer ranges and would otherwise be skipped.
+    _apply_global_hc_sharding(graph, strategy, model.seq_len)
+
+
+def _shard_hc_sequence(op, factor: int, seq: int) -> None:
+    """Shard Hyper-Connection token dimension by an additional factor."""
+    if factor <= 1:
+        return
+    if "s" in op.meta and op.meta["s"] > 0:
+        op.meta["s"] = max(1, op.meta["s"] // factor)
+    if "bytes_fwd" in op.meta:
+        op.meta["bytes_fwd"] = max(1, int(op.meta["bytes_fwd"]) // factor)
+    for t in op.inputs + op.outputs:
+        if t.shape_local:
+            t.shape_local = (max(1, t.shape_local[0] // factor),) + t.shape_local[1:]
+
+
+def _apply_global_hc_sharding(graph: Graph, strategy: Strategy, seq: int) -> None:
+    """Apply TP/CP token sharding to HC ops outside layer_index."""
+    factor = max(1, strategy.tp) * max(1, strategy.cp)
+    if factor <= 1:
+        return
+    for op in graph.ops:
+        if op.layer_id < 0 and op.kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
+            _shard_hc_sequence(op, factor, seq)
 
 
 def _insert_tp_collectives(
@@ -426,12 +450,20 @@ def _insert_ep_collectives(
     # halves the A2A volume vs BF16 baseline).
     act_bytes = model.effective_moe_act_dtype().bytes
 
-    # EP A2A payload: micro_batch * seq * hidden * topk * dtype / EP
-    # Each token is routed to topk experts, but A2A distributes tokens across EP ranks
-    # So each rank sends/receives 1/EP of the total routed data
+    # EP A2A payload — per-rank participating buffer (bus-bw convention).
+    #
+    # Each rank holds ``(micro_batch, seq/cp, hidden/tp)`` activation and
+    # top-k routes each token, so its dispatch input buffer is
+    # ``micro_batch * seq * h * topk * act_bytes`` (seq, h already CP/TP
+    # sharded). ``collective_time()`` applies ``× (N-1)/N`` to extract the
+    # cross-rank portion, so we MUST NOT pre-divide by EP here — doing so
+    # under-counts EP A2A by exactly ``ep`` (history: a /ep divisor sat
+    # here for years; calibration absorbed the error until ep > 16 grids
+    # made it visible — see verify_ep_a2a_bug.py for the 94× delta on
+    # ep=128, top_k=6).
     micro_batch = strategy.micro_batch
     topk = model.top_k
-    a2a_bytes = micro_batch * seq * h * topk * act_bytes // shard.ep
+    a2a_bytes = micro_batch * seq * h * topk * act_bytes
 
     for layer_id, (start, end) in graph.layer_index.items():
         # Check if this is an MoE layer
@@ -557,7 +589,7 @@ def _apply_tp_sharding(
             # every TP rank, so introducing TP here would only add comm without
             # reducing compute.  CP (sequence-parallel) handling — when added —
             # would scale the seq dim of meta["s"] independently.
-            pass
+            _shard_hc_sequence(op, shard.tp, seq)
         elif op.kind == "indexer_topk":
             # Shard indexer heads by TP: ih → ih_local
             ih = op.meta.get("ih", 0)
@@ -599,7 +631,7 @@ def _apply_tp_sharding(
                 op.meta["world_factor"] = shard.tp
                 if "bytes_fwd" in op.meta:
                     op.meta["bytes_fwd"] = op.meta["bytes_fwd"] // shard.tp
-        elif op.kind in ("ln", "rope", "swiglu", "add"):
+        elif op.kind in ("ln", "rmsnorm", "rope", "swiglu", "add"):
             for t in op.inputs + op.outputs:
                 if t.shape_logical and t.shape_logical[-1] in (h, h_attn, h_kv, ffn):
                     t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))
@@ -620,15 +652,13 @@ def _apply_cp_sharding(
     if not shard.has_cp:
         return
 
-    seq_local = max(1, seq // shard.cp)
-
     for i in range(start, end):
         op = graph.ops[i]
 
         for t in op.inputs + op.outputs:
             if t.shape_logical and len(t.shape_logical) > 0:
                 if t.shape_logical[0] == seq:
-                    t.shape_local = (seq_local,) + t.shape_local[1:]
+                    t.shape_local = (max(1, t.shape_local[0] // shard.cp),) + t.shape_local[1:]
 
         if op.kind == "matmul":
             # For meta-authoritative matmuls (grouped/fused where meta k != input shape),
@@ -664,6 +694,11 @@ def _apply_cp_sharding(
                     op.meta["s"] = op.meta["s"] // shard.cp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
             pass  # shape_local already updated by the generic loop above
+        elif op.kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
+            if "s" in op.meta and op.meta["s"] > 0:
+                op.meta["s"] = max(1, op.meta["s"] // shard.cp)
+            if "bytes_fwd" in op.meta:
+                op.meta["bytes_fwd"] = max(1, int(op.meta["bytes_fwd"]) // shard.cp)
         elif op.kind == "compressor_pool":
             # Sequence dimension is sharded by CP. Each rank pools its local
             # chunk independently (m=4 pooling is local, no cross-rank comm).

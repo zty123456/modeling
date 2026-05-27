@@ -31,9 +31,28 @@ from pathlib import Path
 
 import pytest
 
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
-def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: int = 900) -> dict:
-    """Run `python -m python.zrt` with given dp and return parsed report JSON.
+class _DPResult:
+    """Report dict + output directory, with dict-like access for backward compat."""
+
+    def __init__(self, report: dict, out_dir: Path):
+        self._report = report
+        self.out_dir = out_dir
+
+    def __getitem__(self, key):
+        return self._report[key]
+
+    def get(self, key, default=None):
+        return self._report.get(key, default)
+
+
+def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: int = 900) -> _DPResult:
+    """Run `python -m python.zrt` with given dp and return report + out_dir.
 
     Raises subprocess.CalledProcessError on failure.
     """
@@ -67,7 +86,7 @@ def _run_cli_and_load_report(repo_root: Path, outdir: Path, dp: int, timeout: in
 
     report_path = outdir / "reports" / "deepseek_v4_training_report.json"
     assert report_path.exists(), f"Report not found at {report_path}"
-    return json.loads(report_path.read_text())
+    return _DPResult(json.loads(report_path.read_text()), outdir)
 
 
 @pytest.fixture(scope="session")
@@ -85,6 +104,56 @@ def dp_reports(tmp_path_factory):
         reports[dp] = _run_cli_and_load_report(repo_root, out_dir, dp=dp)
 
     return reports
+
+
+def _load_xlsx_sheets(xlsx_path: Path) -> dict[str, list[dict]]:
+    """Load all sheets from training xlsx, return {sheet_name: [row_dict]}."""
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    result = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            result[sheet_name] = []
+            continue
+        headers = [
+            str(h) if h is not None else f"col_{i}"
+            for i, h in enumerate(rows[0])
+        ]
+        data = []
+        for row in rows[1:]:
+            vals = [v for v in row]
+            if all(v is None or v == "" for v in vals):
+                continue
+            data.append(dict(zip(headers, vals)))
+        result[sheet_name] = data
+    wb.close()
+    return result
+
+
+def _filter_dp_comm(comm_sheet: list[dict]) -> list[dict]:
+    """Return only DP gradient reduction communication rows."""
+    return [
+        r for r in comm_sheet
+        if r.get("Role") == "dp_grad_reduce"
+        or "dp_grad" in str(r.get("Role", ""))
+    ]
+
+
+@pytest.fixture(scope="session")
+def dp_excel_data(dp_reports):
+    """Session fixture: load Excel sheets from CLI runs cached by dp_reports."""
+    if not HAS_OPENPYXL:
+        pytest.skip("openpyxl required: pip install openpyxl")
+
+    data = {}
+    for dp in (1, 4):
+        out_dir = dp_reports[dp].out_dir
+        xlsx_path = out_dir / "deepseek_v4_training.xlsx"
+        assert xlsx_path.exists(), f"Excel not found at {xlsx_path}"
+        data[dp] = _load_xlsx_sheets(xlsx_path)
+
+    return data
 
 
 # ── ZeRO-1 optimizer state scaling ─────────────────────────────────────────
@@ -191,3 +260,136 @@ def test_dp_comm_volume_monotonic(dp_reports):
         f"DP comm volume should increase with dp: "
         f"dp4={dp_comm[4]:.2f}ms, dp8={dp_comm[8]:.2f}ms"
     )
+
+
+# ── Excel: DP comm operator existence ──────────────────────────────────────
+
+class TestDpCommExistence:
+    """DP communication operator count and presence by dp value."""
+
+    def test_count_matches_layers(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        dp_rows = _filter_dp_comm(comm)
+        assert len(dp_rows) == 4, (
+            f"Expected 4 DP comm ops (one per layer), got {len(dp_rows)}"
+        )
+
+    def test_none_for_dp1(self, dp_excel_data):
+        comm = dp_excel_data[1].get("Communication Ops", [])
+        dp_rows = _filter_dp_comm(comm)
+        assert len(dp_rows) == 0, (
+            f"Expected 0 DP comm ops for dp=1, got {len(dp_rows)}"
+        )
+
+
+# ── Excel: DP comm operator attributes ─────────────────────────────────────
+
+class TestDpCommAttributes:
+    """DP communication node attribute correctness."""
+
+    def test_collective_is_reduce_scatter(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            assert row.get("Collective Op") == "reduce_scatter", (
+                f"Expected reduce_scatter, got {row.get('Collective Op')}"
+            )
+
+    def test_group_size_equals_dp(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            assert row.get("Group Size") == 4, (
+                f"Expected 4, got {row.get('Group Size')}"
+            )
+
+    def test_role_is_dp_grad_reduce(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            assert row.get("Role") == "dp_grad_reduce", (
+                f"Expected dp_grad_reduce, got {row.get('Role')}"
+            )
+
+    def test_scope_pattern(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            scope = str(row.get("Scope", ""))
+            assert "data_parallel.grad_reduce.layer_" in scope, (
+                f"Unexpected scope: {scope}"
+            )
+
+    def test_inserted_by(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            inserted = str(row.get("Inserted By", "")).lower()
+            assert "data_parallel" in inserted, (
+                f"Expected data_parallel_pass, got {inserted}"
+            )
+
+    def test_has_stream_info(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            assert row.get("Stream Type"), (
+                f"Missing Stream Type on {row.get('Node ID')}"
+            )
+            assert row.get("Stream ID") is not None, (
+                f"Missing Stream ID on {row.get('Node ID')}"
+            )
+
+    def test_node_id_pattern(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        for row in _filter_dp_comm(comm):
+            nid = str(row.get("Node ID", ""))
+            assert nid.startswith("comm_grad_reduce_layer_"), (
+                f"Unexpected Node ID: {nid}"
+            )
+
+
+# ── Excel: DP comm scope encodes layer info ────────────────────────────────
+
+class TestDpCommScope:
+    """DP comm node scope carries per-layer info even when Layer column is empty
+    (injected nodes do not populate `layer`)."""
+
+    def test_scopes_contain_layer_keys(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        scopes = {str(r.get("Scope", "")) for r in _filter_dp_comm(comm)}
+        for lk in ("0", "1", "2", "3"):
+            assert any(f"layer_{lk}" in s for s in scopes), (
+                f"No scope found for layer_{lk} in {scopes}"
+            )
+
+    def test_one_comm_per_scope(self, dp_excel_data):
+        comm = dp_excel_data[4].get("Communication Ops", [])
+        scopes = [str(r.get("Scope", "")) for r in _filter_dp_comm(comm)]
+        assert len(scopes) == len(set(scopes)), (
+            f"Duplicate scopes: {scopes}"
+        )
+
+
+# ── Excel: grad scale ops (aten.div.Scalar) ────────────────────────────────
+
+class TestDpScaleOps:
+    """DP gradient averaging scale nodes (aten.div.Scalar)
+    in the Backward Operators sheet."""
+
+    def _scale_rows(self, data: dict) -> list[dict]:
+        t_ops = data.get("Backward Operators", [])
+        return [
+            r for r in t_ops
+            if r.get("Op Type") == "aten.div.Scalar"
+            and "grad_scale" in str(r.get("Node ID", ""))
+        ]
+
+    def test_count_eq_layers(self, dp_excel_data):
+        assert len(self._scale_rows(dp_excel_data[4])) == 4, "Expected 4 grad scale ops"
+
+    def test_none_for_dp1(self, dp_excel_data):
+        assert len(self._scale_rows(dp_excel_data[1])) == 0, (
+            "Expected 0 scale ops for dp=1"
+        )
+
+    def test_node_id_pattern(self, dp_excel_data):
+        for row in self._scale_rows(dp_excel_data[4]):
+            nid = str(row.get("Node ID", ""))
+            assert nid.startswith("grad_scale_layer_"), (
+                f"Unexpected scale node ID: {nid}"
+            )

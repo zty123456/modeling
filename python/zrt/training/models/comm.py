@@ -104,7 +104,7 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
 def collective_time_hierarchical(
     c: Collective, group_size: int, system: SystemSpec,
 ) -> float:
-    """AG/RS/AR over a (possibly multi-node) group using 2-level hierarchy.
+    """AG/RS/AR/A2A over a (possibly multi-node) group using 2-level hierarchy.
 
     Megatron-Core / NCCL pattern when the group spans nodes:
       Stage 1 (intra-node, D ranks): each rank gathers/reduces its
@@ -112,8 +112,17 @@ def collective_time_hierarchical(
       Stage 2 (inter-node, L = N/D nodes): node-leaders gather/reduce
         across nodes over IB.
 
+    A2A follows the DeepSpeed-MoE / NCCL hierarchical-A2A pattern: the
+    slow inter-node link only carries ``S × (L-1)/L`` (an A2A among the L
+    nodes) instead of the flat ``S × (N-1)/N`` it would carry if every
+    rank-pair traversed it directly. Because the naive 2-stage additive
+    model can over-count the intra phase for bandwidth-bound messages,
+    the cost returned is ``min(flat_inter, hier_2stage)`` — a stand-in
+    for NCCL's runtime algorithm auto-selection. See
+    :func:`collective_time_multi_tier` for the N-tier generalization.
+
     Falls back to flat ``collective_time`` for kinds we don't decompose
-    (P2P / A2A — A2A hierarchy is non-trivial and not modeled here) or
+    (P2P — point-to-point between 2 ranks crosses exactly one link), or
     when the group fits in one node, or when N is not D-aligned.
     """
     intra = system.interconnect.intra_node
@@ -124,7 +133,7 @@ def collective_time_hierarchical(
 
     if N <= D:
         return collective_time(c, N, intra)
-    if N % D != 0 or c.kind not in ("AG", "RS", "AR"):
+    if N % D != 0 or c.kind not in ("AG", "RS", "AR", "A2A"):
         return collective_time(c, N, inter)
 
     L = N // D
@@ -137,6 +146,24 @@ def collective_time_hierarchical(
         inter_c = Collective(name=c.name + "_inter", kind=c.kind,
                              group=c.group, bytes_=S)
         return collective_time(intra_c, D, intra) + collective_time(inter_c, L, inter)
+
+    if c.kind == "A2A":
+        # Stage 1: intra A2A of D ranks, payload S (full per-rank send;
+        #   each rank re-permutes its data and packs by destination node).
+        # Stage 2: inter A2A of L nodes, payload S (cross-node exchange).
+        # Slow inter link carries S·(L-1)/L instead of flat S·(N-1)/N.
+        # NCCL auto-selects flat vs hierarchical at runtime; without an
+        # auto-tuner here, return min(flat_inter, hier) so the model is
+        # never worse than the pre-hier path — hier wins for
+        # latency-bound messages, flat wins for bandwidth-bound ones
+        # where the added intra phase costs more than it saves on inter.
+        intra_c = Collective(name=c.name + "_intra_a2a", kind="A2A",
+                             group=c.group, bytes_=S)
+        inter_c = Collective(name=c.name + "_inter_a2a", kind="A2A",
+                             group=c.group, bytes_=S)
+        t_hier = collective_time(intra_c, D, intra) + collective_time(inter_c, L, inter)
+        t_flat = collective_time(c, N, inter)
+        return min(t_flat, t_hier)
 
     # AR decomposes into RS + AG, each hierarchical.
     rs_c = Collective(name=c.name + "_rs", kind="RS", group=c.group, bytes_=S)
@@ -217,11 +244,22 @@ def collective_time_multi_tier(
     each stage the per-rank output-byte volume is
     ``S × (∏_{j≤i} d_j) / N``. AR runs as RS + AG, each hierarchical.
 
-    P2P / A2A pick the *outermost* tier the group spans and run flat —
-    A2A hierarchy is non-trivial and not modeled here. Cost is
-    additive across tier steps; this assumes the simulator wants a
-    sequential decomposition (worst-case for non-overlapping
-    implementations), matching the existing 2-tier formula.
+    A2A also decomposes across every tier (DeepSpeed-MoE / NCCL
+    hierarchical-A2A pattern): at each tier the per-rank exchange is a
+    sub-A2A among the ``d_i`` peers of that tier, with full per-rank
+    payload ``S`` (each tier re-permutes the full payload by destination
+    group). The slow outer link therefore carries ``S·(d_outer-1)/d_outer``
+    instead of the flat ``S·(N-1)/N`` it would carry as a flat A2A on
+    the outermost tier. The returned cost is ``min(flat_outermost, hier)``
+    — a stand-in for NCCL's runtime algorithm auto-selection, so the
+    model is never worse than the pre-hier flat-outermost path.
+
+    P2P picks the *outermost* tier the group spans and runs flat —
+    a point-to-point transfer between two ranks traverses exactly one
+    link. Cost is additive across tier steps; this assumes the
+    simulator wants a sequential decomposition (worst-case for
+    non-overlapping implementations), matching the existing 2-tier
+    formula.
 
     For a 2-tier system this is bit-for-bit identical to
     :func:`collective_time_hierarchical` when ``ranks = range(N)``
@@ -239,8 +277,8 @@ def collective_time_multi_tier(
         # No useful decomposition (group fits a single trivial domain).
         return collective_time(c, N, system.interconnect.tiers[0].link)
 
-    # P2P / A2A — pick the outermost spanned tier, run flat.
-    if c.kind not in ("AG", "RS", "AR"):
+    # P2P — pick the outermost spanned tier, run flat (one link traversal).
+    if c.kind == "P2P":
         outermost_link = breakdown[-1][1]
         return collective_time(c, N, outermost_link)
 
@@ -251,6 +289,25 @@ def collective_time_multi_tier(
             collective_time_multi_tier(rs_c, ranks, system)
             + collective_time_multi_tier(ag_c, ranks, system)
         )
+
+    if c.kind == "A2A":
+        # Hierarchical A2A: at each tier, A2A among d_i peers with full
+        # payload S. Inner tiers re-permute by destination outer-group;
+        # outer tier exchanges the resulting packed payload.
+        # As in the 2-tier path, take min(flat, hier) — NCCL auto-selects
+        # the better algorithm at runtime; without an auto-tuner the
+        # min() approximates that behavior and is never worse than the
+        # pre-hier flat-outermost path.
+        total = 0.0
+        for d_i, link_i in breakdown:
+            sub_c = Collective(
+                name=f"{c.name}_a2a_t{d_i}", kind="A2A", group=c.group,
+                bytes_=S,
+            )
+            total += collective_time(sub_c, d_i, link_i)
+        outermost_link = breakdown[-1][1]
+        t_flat = collective_time(c, N, outermost_link)
+        return min(t_flat, total)
 
     # AG / RS — hierarchical decomposition.
     total = 0.0

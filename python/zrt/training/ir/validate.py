@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from zrt.training.spec.model import LayerKind, ModelSpec
-from zrt.training.spec.strategy import CPKind, Strategy, TPOverlap
+from zrt.training.spec.strategy import CPKind, PPSched, Strategy, TPOverlap
 from zrt.training.spec.system import SystemSpec
 
 
@@ -147,10 +147,10 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
         )
 
     if strategy.vpp_chunks > 1:
-        if strategy.pp_schedule.value != "i1f1b":
+        if strategy.pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
             warnings.append(
                 f"vpp_chunks ({strategy.vpp_chunks}) > 1 but schedule is "
-                f"{strategy.pp_schedule.value}; VPP requires i1f1b schedule"
+                f"{strategy.pp_schedule.value}; VPP chunks require i1f1b or dualpipev schedule"
             )
         if n_layers % (strategy.pp * strategy.vpp_chunks) != 0:
             warnings.append(

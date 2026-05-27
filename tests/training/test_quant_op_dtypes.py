@@ -153,22 +153,29 @@ def test_explicit_override_wins_over_sentinel():
 # ── expected_input_dtype: multi-input quirks ──────────────────────────────
 
 
-def test_residual_add_pulls_to_residual_dtype():
+def test_expert_agg_add_stays_in_moe_dtype():
     m = _model(
         act_dtype=Dtype.BF16,
         moe_act_dtype=Dtype.FP8_E4M3,
         routed_expert_compute_dtype=Dtype.FP4,
     )
-    # expert_agg is the residual-add boundary
+    # expert_agg combines shared/routed expert outputs inside the MoE region.
+    # It is not the residual stream boundary; residual1/residual2 are.
     add_op = _op("L0.expert_agg", kind="add", component="routed_expert")
+    assert expected_input_dtype(add_op, ti=0, model=m) is Dtype.FP8_E4M3
+    assert expected_input_dtype(add_op, ti=1, model=m) is Dtype.FP8_E4M3
+
+
+def test_untagged_add_uses_residual_dtype():
+    # An untagged add (e.g. L*.residual1 / L*.residual2 / hc_post.add) is the
+    # residual-stream boundary. Force ``residual_dtype`` to differ from
+    # ``act_dtype`` so the assertion actually exercises
+    # ``effective_residual_dtype()`` rather than passing by coincidence when
+    # the two happen to be equal.
+    m = _model(act_dtype=Dtype.FP8_E4M3, residual_dtype=Dtype.BF16)
+    add_op = _op("L0.residual1", kind="add", component=None)
     assert expected_input_dtype(add_op, ti=0, model=m) is Dtype.BF16
     assert expected_input_dtype(add_op, ti=1, model=m) is Dtype.BF16
-
-
-def test_non_residual_add_uses_in_act():
-    m = _model(act_dtype=Dtype.BF16)
-    add_op = _op("L0.hc_post.add", kind="add", component=None)
-    assert expected_input_dtype(add_op, ti=0, model=m) is Dtype.BF16
 
 
 def test_dispatch_combine_uses_moe_act_dtype():

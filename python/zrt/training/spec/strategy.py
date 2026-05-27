@@ -177,6 +177,13 @@ class Strategy:
     # overlap
     tp_overlap: TPOverlap = TPOverlap.NONE
     ep_overlap: bool = False
+    # PP P2P (activation send between adjacent stages) hide-in-bwd_dw, only
+    # meaningful for dual-stream schedules (DualPipe / DualPipeV). Default
+    # OFF: even with DualPipe(V), PP P2P stays on the critical path unless
+    # the user explicitly opts in. Modeling rationale: dual-stream PP overlap
+    # requires the kernel/runtime to actually schedule the P2P on the comm
+    # stream parallel to bwd_dw — not a free property of the schedule.
+    pp_overlap: bool = False
     dualbatch: bool = False
     dp_overlap_in_bubble: bool = True
     # Fraction of steady-state backward compute that DP grad-reduce can overlap
@@ -213,6 +220,11 @@ class Strategy:
             errors.append(
                 f"TP({self.tp})*CP({self.cp})*PP({self.pp})*DP({self.dp})="
                 f"{total} != world_size({system.world_size})"
+            )
+
+        if model.hidden % self.tp != 0:
+            errors.append(
+                f"hidden({model.hidden}) not divisible by TP({self.tp})"
             )
 
         if model.num_heads % self.tp != 0:

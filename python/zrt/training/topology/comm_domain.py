@@ -227,16 +227,18 @@ class CommDomain:
 
         - 3+ tier systems with a non-degenerate strategy → cost is
           :func:`collective_time_multi_tier` over the group's explicit
-          rank set (AG/RS decompose innermost → outermost across every
-          tier, AR = RS + AG, P2P/A2A take the outermost spanned tier
+          rank set (AG/RS/A2A decompose innermost → outermost across every
+          tier, AR = RS + AG, P2P takes the outermost spanned tier
           flat).
         - 2-tier systems (and graph-level collectives where TP/CP/EP
-          historically used a single LINK) → AG/RS/AR runs through
+          historically used a single LINK) → AG/RS/AR/A2A runs through
           :func:`collective_time_hierarchical` (the legacy 2-stage
-          intra+inter decomposition), other kinds run flat on the
-          size-resolved link. Matches pre-refactor behavior bit-exact
-          for every kind that previously went through the hierarchical
-          path (DP grad-reduce, Muon AG/RS).
+          intra+inter decomposition extended with A2A), other kinds run
+          flat on the size-resolved link. Matches pre-refactor behavior
+          bit-exact for every kind that previously went through the
+          hierarchical path (DP grad-reduce, Muon AG/RS); A2A now
+          benefits from the intra+inter decomposition when the group
+          spans nodes (D-aligned).
         - Degenerate group (size 1) → 0.
         """
         from zrt.training.models.comm import (
@@ -269,9 +271,12 @@ class CommDomain:
             return 0.0
         # AG/RS/AR previously used the 2-stage intra+inter hierarchical
         # decomposition for ALL multi-node groups. Preserve that path
-        # exactly. Other kinds (P2P / A2A) historically ran flat on a
-        # single link picked by tier_for_group — keep that behavior.
-        if c.kind in ("AG", "RS", "AR"):
+        # exactly. A2A now joins this branch — cross-node EP A2A
+        # decomposes into intra-A2A + inter-A2A (DeepSpeed-MoE pattern)
+        # instead of running flat on the inter link. P2P still runs flat
+        # on a single link picked by tier_for_group (2-rank groups
+        # traverse exactly one link).
+        if c.kind in ("AG", "RS", "AR", "A2A"):
             return collective_time_hierarchical(c, size, self.system)
         return collective_time(c, size, self.link(c.group))
 

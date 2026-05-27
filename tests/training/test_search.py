@@ -79,6 +79,23 @@ def test_search_space_skips_invalid_zero():
     assert len(strategies) == 0
 
 
+def test_search_space_expands_dualpipev_vpp_chunks():
+    space = SearchSpace(
+        tp_values=[1],
+        cp_values=[1],
+        pp_values=[2],
+        ep_values=[1],
+        dp_values=[4],
+        zero_stages=[0],
+        pp_schedules=[PPSched.DUALPIPE_V],
+        recompute_policies=["none"],
+        vpp_chunks_values=[1, 2, 4],
+    )
+    strategies = space.strategies(world_size=8)
+
+    assert {s.vpp_chunks for s in strategies} == {1, 2, 4}
+
+
 def test_pareto_frontier_basic():
     """Test Pareto frontier with memory dominance."""
     from zrt.training.models.memory import MemBreakdown

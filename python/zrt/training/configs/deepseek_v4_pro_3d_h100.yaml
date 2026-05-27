@@ -16,6 +16,7 @@ strategy:
   micro_batch: 1
   global_batch: 512
   pp_schedule: dualpipev
+  vpp_chunks: 2
   zero_stage: 3
   recompute:
     per_layer:

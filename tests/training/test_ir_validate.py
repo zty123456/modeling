@@ -177,6 +177,19 @@ class TestVPPConstraints:
             f"Expected VPP+schedule mismatch warning, got: {warnings}"
         )
 
+    def test_dualpipev_with_vpp_chunks_is_valid_schedule(self):
+        model = _model(num_layers=8)
+        system = _system()
+        strategy = Strategy(
+            tp=1, pp=2, dp=1,
+            micro_batch=1, global_batch=16,
+            pp_schedule=PPSched.DUALPIPE_V, vpp_chunks=2,
+        )
+        warnings = validate(model, system, strategy)
+        assert not _warnings_contain(warnings, "VPP requires"), (
+            f"DualPipeV should accept vpp_chunks > 1, got: {warnings}"
+        )
+
     def test_vpp_layer_indivisibility_warns(self):
         """num_layers must be divisible by pp * vpp_chunks.
 

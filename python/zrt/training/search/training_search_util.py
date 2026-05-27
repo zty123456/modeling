@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from zrt.hardware.registry import load as load_hw
 from zrt.training.io.config_loader import _parse_model, _parse_system, _parse_strategy
+from zrt.training.models.memory import memory_breakdown
 from zrt.training.search.estimator import estimate
 from zrt.training.search.report import report_summary
 from zrt.training.spec.model import ModelSpec
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _WORKER_MODEL_CACHE: Dict[Tuple[str, Optional[str]], ModelSpec] = {}
 _WORKER_HW_CACHE: Dict[Tuple[str, int], SystemSpec] = {}
+_WORKER_GRAPH_CACHE: Dict[Tuple[Any, ...], Any] = {}
 
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 _DEFAULT_POD_PACKING_AXES = ("tp", "cp")
@@ -69,6 +71,36 @@ def _reject_gpus_per_node_config(config_or_grid: Dict[str, Any]) -> None:
             "gpus_per_node has been removed from search configs; express "
             "hardware topology via the hardware YAML interconnect.tiers"
         )
+
+
+def _exact_global_batch_from_total_token(total_token: int | float, seq_len: int | float) -> int:
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive when deriving global_batch from total_token")
+    total = int(total_token)
+    seq = int(seq_len)
+    if total != float(total_token) or seq != float(seq_len):
+        raise ValueError("total_token and seq_len must be integers")
+    if total % seq != 0:
+        raise ValueError(
+            f"total_token must be divisible by seq_len in exact-token mode: "
+            f"total_token={total}, seq_len={seq}"
+        )
+    return total // seq
+
+
+def _apply_total_token_batch_rule(
+    config: Dict[str, Any],
+    *,
+    default_seq_len: int,
+    model: ModelSpec | None = None,
+) -> None:
+    total_token = config.get("total_token")
+    seq_len = config.get("seq_len", default_seq_len)
+    if total_token is not None and total_token > 0:
+        config["seq_len"] = int(seq_len)
+        config["global_batch"] = _exact_global_batch_from_total_token(total_token, seq_len)
+    if model is not None and seq_len is not None:
+        model.seq_len = int(seq_len)
 
 
 def _warn_if_partial_allocation(system: SystemSpec) -> None:
@@ -247,7 +279,7 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
 
     pp_schedule = PPSched(config.get("pp_schedule", "1f1b"))
     vpp_chunks = config.get("vpp_chunks", 1)
-    if pp_schedule != PPSched.INTERLEAVED:
+    if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
         vpp_chunks = 1
 
     return Strategy(
@@ -318,7 +350,7 @@ class TrainingConfigManager:
     ) -> Strategy:
         pp_schedule = PPSched(other_config.get("pp_schedule", "1f1b"))
         vpp_chunks = other_config.get("vpp_chunks", 1)
-        if pp_schedule != PPSched.INTERLEAVED:
+        if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
             vpp_chunks = 1
 
         recompute = RecomputePolicy()
@@ -450,6 +482,8 @@ class TrainingConfigManager:
             if model is not None:
                 if model.num_heads % tp != 0:
                     continue
+                if model.hidden % tp != 0:
+                    continue
                 if model.num_kv_heads % tp != 0 and model.num_kv_heads >= tp:
                     continue
                 if model.ffn % tp != 0:
@@ -462,10 +496,6 @@ class TrainingConfigManager:
 
                 for pp in pp_vals:
                     if model is not None and pp > len(model.layers):
-                        continue
-                    # Pipeline schedules other than 1F1B require pp > 1; at
-                    # pp=1 they degenerate to OneF1B and just pollute the grid.
-                    if pp == 1 and pp_schedule_str != "1f1b":
                         continue
 
                     remaining = target_ws // (tp * cp * pp)
@@ -508,9 +538,6 @@ class TrainingConfigManager:
 
                             yield (tp, cp, pp, ep, dp)
 
-    def get_valid_parallel_combos(self, grid: Dict[str, List[Any]], target_ws: int) -> List[Tuple[int, ...]]:
-        return list(self._enumerate_valid_parallel_configs(grid, target_ws))
-
     def count_total_configs(self) -> int:
         grid = {k: (v if isinstance(v, list) else [v]) for k, v in self.param_grid.items()}
         _reject_gpus_per_node_config(grid)
@@ -532,8 +559,8 @@ class TrainingConfigManager:
         has_total_token = total_token_vals and any(v is not None and v > 0 for v in total_token_vals)
         
         other_keys = [k for k in grid.keys() if k not in parallel_keys and k != "world_size"]
-        if has_total_token and "seq_len" in other_keys:
-            other_keys.remove("seq_len")
+        if has_total_token and "global_batch" in other_keys:
+            other_keys.remove("global_batch")
 
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
 
@@ -566,6 +593,9 @@ class TrainingConfigManager:
         total = 0
         for other_vals in itertools.product(*[grid[k] for k in other_keys]):
             base_config = dict(zip(other_keys, other_vals))
+            _apply_total_token_batch_rule(
+                base_config, default_seq_len=seq_len, model=model,
+            )
             total += sum(1 for _ in self._enumerate_valid_parallel_configs(
                 grid, target_ws, model, system, base_config
             ))
@@ -597,8 +627,8 @@ class TrainingConfigManager:
         has_total_token = total_token_vals and any(v is not None and v > 0 for v in total_token_vals)
         
         other_keys = [k for k in grid.keys() if k not in parallel_keys and k != "world_size"]
-        if has_total_token and "seq_len" in other_keys:
-            other_keys.remove("seq_len")
+        if has_total_token and "global_batch" in other_keys:
+            other_keys.remove("global_batch")
 
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
 
@@ -630,18 +660,9 @@ class TrainingConfigManager:
             base_config = dict(zip(other_keys, other_vals))
             base_config["world_size"] = target_ws
 
-            total_token = base_config.get("total_token")
-            if total_token is not None and total_token > 0:
-                global_batch = base_config.get("global_batch", 0)
-                if global_batch > 0:
-                    seq_len = int(total_token / global_batch)
-                    base_config["seq_len"] = seq_len
-                    if model is not None:
-                        model.seq_len = seq_len
-            else:
-                seq_len = base_config.get("seq_len")
-                if seq_len is not None and model is not None:
-                    model.seq_len = seq_len
+            _apply_total_token_batch_rule(
+                base_config, default_seq_len=seq_len, model=model,
+            )
 
             for p_vals in self._enumerate_valid_parallel_configs(
                     grid, target_ws, model, system, base_config
@@ -655,8 +676,59 @@ class TrainingConfigManager:
 
 
 def _worker_initializer(model_name: str = "deepseek_v3_2"):
-    global _WORKER_MODEL_CACHE, _WORKER_HW_CACHE
+    global _WORKER_MODEL_CACHE, _WORKER_HW_CACHE, _WORKER_GRAPH_CACHE
     _WORKER_MODEL_CACHE[(model_name, None)] = _load_model_spec(model_name)
+    _WORKER_GRAPH_CACHE.clear()
+
+
+def _graph_cache_key(config: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Return the fields that determine the generated training IR graph.
+
+    The graph depends on model geometry/dtypes and sharding collectives. It
+    does not depend on DP/global batch/optimizer/ZeRO, which are consumed by
+    the later estimator and memory formulas.
+    """
+    return (
+        config.get("model", "deepseek_v3_2"),
+        config.get("quant_preset") or None,
+        int(config.get("seq_len", 4096)),
+        int(config.get("micro_batch", 1)),
+        int(config.get("tp", 1)),
+        int(config.get("cp", 1)),
+        int(config.get("ep", 1)),
+        config.get("cp_kind", "none"),
+    )
+
+
+def _memory_limit_gb(config: Dict[str, Any], system: SystemSpec) -> float:
+    if "max_memory_gb" in config:
+        return float(config["max_memory_gb"])
+    ratio = float(config.get("memory_limit_ratio", 0.8))
+    return float(system.gpu.hbm_gb) * ratio
+
+
+def _is_memory_feasible(config: Dict[str, Any], model: ModelSpec,
+                        system: SystemSpec, strategy: Strategy) -> tuple[bool, float, float]:
+    mb = memory_breakdown(None, model, system, strategy)
+    memory_gb = mb.total / 1e9
+    limit_gb = _memory_limit_gb(config, system)
+    return memory_gb <= limit_gb, memory_gb, limit_gb
+
+
+def run_training_batch_wrapper(configs: List[Dict]) -> List[Optional[Dict]]:
+    return [run_training_task_wrapper(config) for config in configs]
+
+
+def _batched(iterable, batch_size: int):
+    batch_size = max(1, int(batch_size))
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
@@ -693,11 +765,25 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
 
         strategy = _make_strategy_from_config(config)
         strategy.validate(model, system)
+
+        feasible, memory_gb, limit_gb = _is_memory_feasible(config, model, system, strategy)
+        if not feasible:
+            return {
+                "status": "skipped",
+                "config": config,
+                "type": "memory",
+                "memory_gb": memory_gb,
+                "memory_limit_gb": limit_gb,
+            }
     except Exception as e:
         return {"status": "error", "config": config, "type": "validation_error", "message": str(e)}
 
     try:
-        graph = build_graph(model, strategy)
+        graph_key = _graph_cache_key(config)
+        graph = _WORKER_GRAPH_CACHE.get(graph_key)
+        if graph is None:
+            graph = build_graph(model, strategy)
+            _WORKER_GRAPH_CACHE[graph_key] = graph
         report = estimate(model, system, strategy, graph=graph)
 
         return {
@@ -740,6 +826,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["ep_exposed_ms"] = round(report.ep_exposed_ms, 2)
         d["pp_total_ms"] = round(report.pp_total_ms, 2)
         d["pp_exposed_ms"] = round(report.pp_exposed_ms, 2)
+        d["pp_hidden_ms"] = round(report.pp_hidden_ms, 2)
         d["dp_total_ms"] = round(report.dp_total_ms, 2)
         d["dp_exposed_ms"] = round(report.dp_exposed_ms, 2)
         d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 4)
@@ -774,7 +861,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     metric_cols = ["compute_time_ms", "fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
                    "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                    "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
-                   "dp_total_ms", "dp_exposed_ms",
+                   "pp_hidden_ms", "dp_total_ms", "dp_exposed_ms",
                    "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms", "recompute_time_ms",
                    "recompute_time_raw_ms", "step_time_ms", "pipeline_time_ms",
                    "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",
@@ -876,6 +963,8 @@ def run_training_search_parallel(
         param_grid: Dict[str, List[Any]],
         workers: int = 8,
         mfu_threshold: float = 0.0,
+        batch_size: int = 32,
+        export_best_excel: bool = True,
 ) -> pd.DataFrame:
     model_name = param_grid.get("model", ["unknown"])
     if isinstance(model_name, list):
@@ -903,6 +992,7 @@ def run_training_search_parallel(
 
     all_results: List[Dict] = []
     error_count = 0
+    skipped_count = 0
 
     config_generator = manager.generate_static_configs_stream()
     futures_map = {}
@@ -913,36 +1003,43 @@ def run_training_search_parallel(
             initargs=(model_name,),
     ) as executor:
         with tqdm(total=total_configs, desc="Evaluating configs", unit="config") as pbar:
-            for cfg in config_generator:
-                fut = executor.submit(run_training_task_wrapper, cfg)
-                futures_map[fut] = cfg
+            for batch in _batched(config_generator, batch_size):
+                fut = executor.submit(run_training_batch_wrapper, batch)
+                futures_map[fut] = len(batch)
 
                 while len(futures_map) >= adjusted_workers * 2:
                     done, _ = concurrent.futures.wait(
                         futures_map.keys(), return_when=concurrent.futures.FIRST_COMPLETED
                     )
                     for fut in done:
-                        futures_map.pop(fut)
-                        pbar.update(1)
-                        res = fut.result()
-                        if res and res["status"] == "success":
-                            all_results.append(res)
-                        elif res and res["status"] == "error":
-                            error_count += 1
+                        n = futures_map.pop(fut)
+                        pbar.update(n)
+                        for res in fut.result():
+                            if res and res["status"] == "success":
+                                all_results.append(res)
+                            elif res and res["status"] == "error":
+                                error_count += 1
+                            elif res and res["status"] == "skipped":
+                                skipped_count += 1
 
             while futures_map:
                 done, _ = concurrent.futures.wait(futures_map.keys())
                 for fut in done:
-                    futures_map.pop(fut)
-                    pbar.update(1)
-                    res = fut.result()
-                    if res and res["status"] == "success":
-                        all_results.append(res)
-                    elif res and res["status"] == "error":
-                        error_count += 1
+                    n = futures_map.pop(fut)
+                    pbar.update(n)
+                    for res in fut.result():
+                        if res and res["status"] == "success":
+                            all_results.append(res)
+                        elif res and res["status"] == "error":
+                            error_count += 1
+                        elif res and res["status"] == "skipped":
+                            skipped_count += 1
 
     elapsed = time.time() - start_time
-    logger.info(f"Search completed in {elapsed:.2f} seconds, success={len(all_results)}, errors={error_count}")
+    logger.info(
+        f"Search completed in {elapsed:.2f} seconds, success={len(all_results)}, "
+        f"skipped={skipped_count}, errors={error_count}"
+    )
 
     if not all_results:
         logger.error("No valid configurations found.")
@@ -980,7 +1077,8 @@ def run_training_search_parallel(
 
     save_results(filtered_df, manager.output_path)
 
-    export_best_configs_excel(feasible_results, manager.output_path)
+    if export_best_excel:
+        export_best_configs_excel(feasible_results, manager.output_path)
 
     if not filtered_df.empty:
         best = filtered_df.iloc[0]
@@ -997,16 +1095,16 @@ if __name__ == "__main__":
         "model": ["deepseek_v4_pro"],
         "hw": ["nvidia_b300"],
         "world_size": [8192],
-        "tp": [1, 2, 4, 8, 16],
-        "cp": [1, 2, 4, 8, 16],
+        "tp": [1, 2, 4, 8, 16, 32, 64, 128],
+        "cp": [1, 2, 4, 8, 16, 32, 64, 128],
         "pp": [1, 2, 4, 8, 16],
         # EP must divide DP under the current expert-DP sharding model.
-        "ep": [128],
+        "ep": [32, 64, 128],
         "dp": "auto",
         "micro_batch": [1, 16, 32],
-        "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
-        "seq_len": [8192, 32768, 131072],
-        "total_token": [536870912],
+        # Derived per seq_len as exact total_token // seq_len.
+        "seq_len": [8192, 65536, 131072, 262144, 524288, 1048576],
+        "total_token": [100663296],
         "zero_stage": [3],
         "pp_schedule": ["dualpipev"],
         "cp_kind": ["ulysses"],
@@ -1016,11 +1114,12 @@ if __name__ == "__main__":
         "dp_overlap_in_bubble": [True],
         "recompute": ["none", "mhc"],
         "optimizer": ["muon"],
-        "quant_preset": ["deepseek_v4_fp8_fp4"],
+        "quant_preset": ["deepseek_v4_fp8_fp4", "deepseek_v4_full_fp8"],
     }
 
     df = run_training_search_parallel(
         param_grid=training_param_grid,
-        workers=32,
-        mfu_threshold=0.05,
+        workers=128,
+        mfu_threshold=0.00,
+        export_best_excel=False,
     )
