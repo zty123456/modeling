@@ -127,21 +127,27 @@ def _apply_global_hc_sharding(graph: Graph, strategy: Strategy, seq: int) -> Non
 
 
 def _apply_global_lm_head_sharding(graph: Graph, strategy: Strategy) -> None:
-    """Apply TP vocab sharding to global lm_head outside layer_index."""
+    """Apply TP vocab and CP sequence sharding to global lm_head."""
     tp = max(1, strategy.tp)
-    if tp <= 1:
+    cp = max(1, strategy.cp)
+    if tp <= 1 and cp <= 1:
         return
     for op in graph.ops:
         if op.layer_id >= 0 or op.kind != "lm_head":
             continue
+        m = op.meta.get("m", 0)
         n = op.meta.get("n", 0)
-        if n <= 0:
-            continue
-        n_local = max(1, n // tp)
-        op.meta["n_local"] = n_local
-        for t in op.outputs:
-            if t.shape_logical and t.shape_logical[-1] == n:
-                t.shape_local = (t.shape_logical[0], n_local)
+        if cp > 1 and m > 0:
+            op.meta["m"] = max(1, m // cp)
+            for t in op.inputs + op.outputs:
+                if t.shape_logical and t.shape_logical[0] == m:
+                    t.shape_local = (max(1, t.shape_local[0] // cp),) + t.shape_local[1:]
+        if tp > 1 and n > 0:
+            n_local = max(1, n // tp)
+            op.meta["n_local"] = n_local
+            for t in op.outputs:
+                if t.shape_logical and t.shape_logical[-1] == n:
+                    t.shape_local = t.shape_local[:-1] + (n_local,)
 
 
 def _insert_tp_collectives(

@@ -125,7 +125,7 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
     ]
 
     assert "Operator Time Share" in summary_values
-    assert "  Matmul family total" not in summary_values
+    assert "  Matmul family total" in summary_values
     assert "  Attention matmul family" in summary_values
     assert "  MoE/FFN matmul family" in summary_values
     assert "  LM head matmul" in summary_values
@@ -137,7 +137,7 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
     assert ws.cell(row=header_row, column=3).value == "% of Step"
     assert ws.cell(row=header_row, column=4).value == "% of Useful Compute"
 
-    for label in ("  Attention matmul family", "  MoE/FFN matmul family", "  LM head matmul"):
+    for label in ("  Matmul family total", "  Attention matmul family", "  MoE/FFN matmul family", "  LM head matmul"):
         matmul_row = summary_values.index(label) + 1
         step_share = ws.cell(row=matmul_row, column=3).value
         useful_compute_share = ws.cell(row=matmul_row, column=4).value

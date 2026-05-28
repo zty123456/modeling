@@ -231,6 +231,14 @@ def build_operator_time_stats(
 
     _append_if_present(
         rows,
+        "Matmul family total",
+        [op for op in op_dicts if _is_matmul_op(op) or _is_lm_head_op(op)],
+        step_time_ms,
+        useful_compute_ms,
+        time_scale,
+    )
+    _append_if_present(
+        rows,
         "Attention matmul family",
         [op for op in op_dicts if _is_attention_matmul_op(op)],
         step_time_ms,

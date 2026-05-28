@@ -26,7 +26,7 @@ def _by_label(rows: list[dict]) -> dict[str, dict]:
     return {row["label"]: row for row in rows}
 
 
-def test_operator_time_stats_splits_matmul_family_and_lm_head_without_total():
+def test_operator_time_stats_includes_matmul_total_plus_family_breakdown():
     rows = build_operator_time_stats(
         model=_base_model(),
         report=TrainingReport(step_time_ms=100.0, compute_time_ms=40.0),
@@ -39,7 +39,10 @@ def test_operator_time_stats_splits_matmul_family_and_lm_head_without_total():
     )
 
     by_label = _by_label(rows)
-    assert "Matmul family total" not in by_label
+    assert by_label["Matmul family total"]["time_ms"] == 30.0
+    assert by_label["Matmul family total"]["pct_of_step"] == 0.3
+    assert by_label["Matmul family total"]["pct_of_useful_compute"] == 0.75
+    assert by_label["Matmul family total"]["op_count"] == 3
     assert by_label["Attention matmul family"]["time_ms"] == 12.0
     assert by_label["Attention matmul family"]["pct_of_step"] == 0.12
     assert by_label["Attention matmul family"]["pct_of_useful_compute"] == 0.3

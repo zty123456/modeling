@@ -101,6 +101,28 @@ def test_global_lm_head_is_vocab_sharded_by_tp():
     assert cost_tp4.fwd_cube_flops == pytest.approx(cost_tp1.fwd_cube_flops / 4)
 
 
+def test_global_lm_head_is_sequence_sharded_by_cp():
+    model = ModelSpec(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE],
+    )
+    graph_base = build_graph(model, Strategy(tp=1, cp=1, pp=1, dp=1, micro_batch=1))
+    graph_cp4 = build_graph(model, Strategy(tp=2, cp=4, pp=1, dp=1, micro_batch=1))
+
+    lm_base = next(op for op in graph_base.ops if op.kind == "lm_head")
+    lm_cp4 = next(op for op in graph_cp4.ops if op.kind == "lm_head")
+
+    assert lm_cp4.inputs[0].shape_local == (512, 4096)
+    assert lm_cp4.outputs[0].shape_local == (512, 16000)
+    assert lm_cp4.meta["m"] == 512
+    assert lm_cp4.meta["n_local"] == 16000
+
+    cost_base = op_cost(lm_base, model)
+    cost_cp4 = op_cost(lm_cp4, model)
+    assert cost_cp4.fwd_cube_flops == pytest.approx(cost_base.fwd_cube_flops / 8)
+
+
 def test_ops_for_layer():
     """ops_for_layer should return the correct ops."""
     model = ModelSpec(

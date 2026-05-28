@@ -108,7 +108,7 @@ def test_html_export_includes_operator_time_share(tmp_path):
 
     html = out.read_text(encoding="utf-8")
     assert "Operator Time Share" in html
-    assert "Matmul family total" not in html
+    assert "Matmul family total" in html
     assert "Attention matmul family" in html
     assert "MoE/FFN matmul family" in html
     assert "LM head matmul" in html
