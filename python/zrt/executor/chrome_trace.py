@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 
 _FWD_COLOR = "#1a3a6b"
 _BWD_COLOR = "#8FBC8F"
+_BWD_DX_COLOR = "#6B8E6B"
+_BWD_DW_COLOR = "#A8D8A8"
 
 _COLORS: dict[str, str] = {
     "fwd_compute":        "good",
@@ -494,13 +496,18 @@ class ChromeTraceExporter:
 
     @staticmethod
     def _name_for_task(task) -> str:
-        prefix = "F" if task.phase == "fwd" else "B"
+        mapping = {"fwd": "F", "bwd": "B", "bwd_dx": "B_dx", "bwd_dw": "B_dw"}
+        prefix = mapping.get(task.phase, task.phase.upper()[:4])
         return f"{prefix} {task.mb_id}"
 
     @staticmethod
     def _color_for_task(task) -> str:
         if task.phase == "fwd":
             return _FWD_COLOR
+        if task.phase == "bwd_dx":
+            return _BWD_DX_COLOR
+        if task.phase == "bwd_dw":
+            return _BWD_DW_COLOR
         return _BWD_COLOR
 
     @staticmethod

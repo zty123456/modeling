@@ -66,6 +66,39 @@ Edge ③  device-serial protocol
 
 ### 1.3 各调度策略详解
 
+#### 1.3.0 ZeroBubble 调度
+
+ZeroBubble 将 bwd 拆分为 bwd_dx（激活梯度）和 bwd_dw（权重梯度）两个子阶段。
+bwd_dw 可以推迟到任意空闲时间执行，用权重梯度计算填满流水线气泡。
+
+**网格布局**（每个 stage 每 mb 三个任务）：
+```
+G[s][m] = { F[m], B_dx[m], B_dw[m] }
+```
+
+**三条 ZB 专有约束**（在通用 Edge ① ② ③ 之外）：
+
+| 约束 | 来源 | 说明 |
+|------|------|------|
+| `F[m] → B_dx[m]` | Edge ① 扩展 | 前向完成后才能计算激活梯度 |
+| `B_dx[m] → B_dw[m]` | Edge ③ 扩展 | 激活梯度完成后才能计算权重梯度（梯度链） |
+| `B_dx[s+1][m] → B_dx[s][m]` | Edge ② 扩展 | 跨 stage 激活梯度反向传递 |
+| `B_dw[s+1][m] → B_dw[s][m]` | Edge ② 扩展 | 跨 stage 权重梯度反向传递 |
+
+**B_dw 自由填空闲**（ZB 核心特性）：
+```
+bwd_dw 的依赖链：F → B_dx → B_dw  （B_dw 在 B_dx 之后）
+bwd_dw 不受 F[m+1] 约束           （不阻塞下一个前向）
+bwd_dw 可被 list scheduler 自由推迟 → 自然填入流水线气泡
+```
+
+示例（pp=4, M=6，仅 Stage 0 时间线）：
+```
+GPU 0: |F₀ B_dx₀ F₁ B_dw₀ B_dx₁ F₂ B_dw₁ B_dx₂ F₃ B_dw₂ ... B_dw₅|
+        └── 核心循环：F[m+1] 在 B_dx[m] 后立即启动 ──┘
+         └── B_dw[m] 在 B_dx[m] 后任意时刻插入 ──┘
+```
+
 #### 1.3.1 1F1B 调度
 
 以 pp=4, M=6 为例，各 stage 的 warmup 前向次数 `w = pp - s`：
@@ -258,6 +291,23 @@ pid=0 (GPU 0):
 - `pid`：进程 = Stage/GPU
 - `tid`：线程 = 流（compute/comm stream）
 - `ts`/`dur`：起始时间和持续时长（微秒）
+
+### 2.5 网格视图命名规则
+
+stitched 视图中每个 GridTask 的事件名格式为 `<前缀> <microbatch_id>`：
+
+| 前缀 | `task.phase` | 含义 |
+|------|-------------|------|
+| `F` | `fwd` | 前向计算（Forward） |
+| `B` | `bwd` | 反向计算（Backward，未拆分） |
+| `B_dx` | `bwd_dx` | 反向激活梯度计算（Backward dX，对激活值的梯度） |
+| `B_dw` | `bwd_dw` | 反向权重梯度计算（Backward dW，对权重的梯度） |
+
+**`B_dx` vs `B_dw` 区别**：
+- `B_dx`（激活梯度）：计算 loss 对中间激活张量的梯度，用于向更早的 stage 传播。必须串行执行，无法推迟
+- `B_dw`（权重梯度）：计算 loss 对该 stage 权重的梯度，仅在本 stage 使用。可推迟填空闲（ZeroBubble 核心特性）
+
+非 ZB 调度（1F1B、DualPipe 等）全部使用 `B` 前缀。ZB 调度将 `B` 拆分为 `B_dx` + `B_dw`，颜色上 `B_dx` 略深于 `B_dw` 以方便视觉区分。
 
 ---
 

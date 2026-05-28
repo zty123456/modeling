@@ -139,9 +139,9 @@ class PPStitchedTimeline:
 # ── edge builders (the three edge types) ──────────────────────────────────────
 
 def _add_activation_dependency(tasks: dict[str, GridTask]) -> None:
-    """Edge ①: within same stage+mb, fwd must finish before bwd starts."""
+    """Edge ①: within same stage+mb, fwd must finish before bwd/bwd_dx starts."""
     for task in tasks.values():
-        if task.phase == "bwd":
+        if task.phase in ("bwd", "bwd_dx"):
             fwd_id = _task_id(task.stage_id, task.mb_id, "fwd")
             if fwd_id in tasks:
                 task.dependencies.append(fwd_id)
@@ -158,6 +158,7 @@ def _add_cross_stage_p2p(
 
     Forward:  G[s][m].fwd → G[s+1][m].fwd
     Backward: G[s+1][m].bwd → G[s][m].bwd
+             (also bwd_dx/bwd_dw for ZeroBubble schedules)
 
     P2P transfer time is modelled by adding ``p2p_latency_us`` to the
     receiving task's latency — the destination GPU cannot begin real
@@ -176,6 +177,14 @@ def _add_cross_stage_p2p(
             if bwd_src in tasks and bwd_dst in tasks:
                 tasks[bwd_dst].dependencies.append(bwd_src)
                 tasks[bwd_dst].latency_us += p2p_latency_us
+
+            # ZeroBubble: backward split into bwd_dx + bwd_dw
+            for phase in ("bwd_dx", "bwd_dw"):
+                zb_src = _task_id(s + 1, m, phase)
+                zb_dst = _task_id(s, m, phase)
+                if zb_src in tasks and zb_dst in tasks:
+                    tasks[zb_dst].dependencies.append(zb_src)
+                    tasks[zb_dst].latency_us += p2p_latency_us
 
 
 def _add_device_serial_1f1b(
@@ -343,16 +352,31 @@ def _add_device_serial_zb(
 ) -> None:
     """Edge ③ (ZeroBubble): split bwd into bwd_dx and bwd_dw on the grid.
 
-    bwd_dw can be deferred to fill pipeline bubbles.
-    Protocol per device: F₀→B_dx₀→F₁→B_dx₁→... ; B_dw tasks float independently.
+    Two intra-device constraints beyond the base P2P + activation edges:
+
+      1. bwd_dx[m] → F[m+1]   (same as before: next fwd waits for dx)
+      2. bwd_dx[m] → bwd_dw[m] (activation gradient must complete before
+         weight-gradient computation — gradient chain of dependence)
+
+    bwd_dw has NO dependency on F[m+1], allowing the weight-gradient
+    computation to be deferred arbitrarily and fill pipeline bubbles.
     """
     for s in range(pp):
         for m in range(M):
             bwd_dx_id = _task_id(s, m, "bwd_dx")
+            bwd_dw_id = _task_id(s, m, "bwd_dw")
+
+            # bwd_dx[m] → bwd_dw[m]: gradient chain (dx before dw)
+            if bwd_dx_id in tasks and bwd_dw_id in tasks:
+                if bwd_dx_id not in tasks[bwd_dw_id].dependencies:
+                    tasks[bwd_dw_id].dependencies.append(bwd_dx_id)
+
+            # bwd_dx[m] → F[m+1]: existing constraint
             if m + 1 < M:
                 next_fwd_id = _task_id(s, m + 1, "fwd")
                 if bwd_dx_id in tasks and next_fwd_id in tasks:
-                    tasks[next_fwd_id].dependencies.append(bwd_dx_id)
+                    if bwd_dx_id not in tasks[next_fwd_id].dependencies:
+                        tasks[next_fwd_id].dependencies.append(bwd_dx_id)
 
 
 def _task_id(stage_id: int, mb_id: int, phase: str) -> str:
