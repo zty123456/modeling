@@ -125,7 +125,9 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
     ]
 
     assert "Operator Time Share" in summary_values
-    assert "  Matmul family total" in summary_values
+    assert "  Matmul family total" not in summary_values
+    assert "  Attention matmul family" in summary_values
+    assert "  MoE/FFN matmul family" in summary_values
     assert "  CSA attention block" in summary_values
     assert "  HCA attention block" in summary_values
     assert "  SWA operator" in summary_values
@@ -134,12 +136,13 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
     assert ws.cell(row=header_row, column=3).value == "% of Step"
     assert ws.cell(row=header_row, column=4).value == "% of Useful Compute"
 
-    matmul_row = summary_values.index("  Matmul family total") + 1
-    step_share = ws.cell(row=matmul_row, column=3).value
-    useful_compute_share = ws.cell(row=matmul_row, column=4).value
-    assert "ops" in step_share
-    assert "ops" in useful_compute_share
+    for label in ("  Attention matmul family", "  MoE/FFN matmul family"):
+        matmul_row = summary_values.index(label) + 1
+        step_share = ws.cell(row=matmul_row, column=3).value
+        useful_compute_share = ws.cell(row=matmul_row, column=4).value
+        assert "ops" in step_share
+        assert "ops" in useful_compute_share
 
-    step_pct = float(step_share.split("%", 1)[0])
-    useful_compute_pct = float(useful_compute_share.split("%", 1)[0])
-    assert abs(useful_compute_pct - step_pct * 2) <= 0.1
+        step_pct = float(step_share.split("%", 1)[0])
+        useful_compute_pct = float(useful_compute_share.split("%", 1)[0])
+        assert abs(useful_compute_pct - step_pct * 2) <= 0.1

@@ -26,22 +26,28 @@ def _by_label(rows: list[dict]) -> dict[str, dict]:
     return {row["label"]: row for row in rows}
 
 
-def test_operator_time_stats_counts_matmul_family_including_lm_head():
+def test_operator_time_stats_splits_matmul_family_without_total_or_lm_head_bucket():
     rows = build_operator_time_stats(
         model=_base_model(),
         report=TrainingReport(step_time_ms=100.0, compute_time_ms=40.0),
         op_dicts=[
-            {"name": "layer.q_proj", "kind": "matmul", "total_ms": 12.0},
+            {"name": "layer.q_proj", "kind": "matmul", "component": "attention", "total_ms": 12.0},
+            {"name": "layer.up_proj", "kind": "matmul", "component": "routed_expert", "total_ms": 10.0},
             {"name": "lm_head", "kind": "lm_head", "total_ms": 8.0},
             {"name": "layer.norm", "kind": "rmsnorm", "total_ms": 5.0},
         ],
     )
 
-    matmul = _by_label(rows)["Matmul family total"]
-    assert matmul["time_ms"] == 20.0
-    assert matmul["pct_of_step"] == 0.2
-    assert matmul["pct_of_useful_compute"] == 0.5
-    assert matmul["op_count"] == 2
+    by_label = _by_label(rows)
+    assert "Matmul family total" not in by_label
+    assert by_label["Attention matmul family"]["time_ms"] == 12.0
+    assert by_label["Attention matmul family"]["pct_of_step"] == 0.12
+    assert by_label["Attention matmul family"]["pct_of_useful_compute"] == 0.3
+    assert by_label["Attention matmul family"]["op_count"] == 1
+    assert by_label["MoE/FFN matmul family"]["time_ms"] == 10.0
+    assert by_label["MoE/FFN matmul family"]["pct_of_step"] == 0.1
+    assert by_label["MoE/FFN matmul family"]["pct_of_useful_compute"] == 0.25
+    assert by_label["MoE/FFN matmul family"]["op_count"] == 1
 
 
 def test_operator_time_stats_uses_compute_time_for_schedule_aware_step_scale():
@@ -55,7 +61,7 @@ def test_operator_time_stats_uses_compute_time_for_schedule_aware_step_scale():
         ],
     )
 
-    matmul = _by_label(rows)["Matmul family total"]
+    matmul = _by_label(rows)["Attention matmul family"]
     assert matmul["time_ms"] == 50.0
     assert matmul["pct_of_step"] == 0.25
     assert matmul["pct_of_useful_compute"] == 0.5
@@ -72,7 +78,7 @@ def test_operator_time_stats_falls_back_to_microbatch_pp_scale_without_compute_t
         ],
     )
 
-    matmul = _by_label(rows)["Matmul family total"]
+    matmul = _by_label(rows)["Attention matmul family"]
     assert matmul["time_ms"] == 40.0
     assert matmul["pct_of_step"] == 0.4
     assert matmul["pct_of_useful_compute"] == 0.0
@@ -166,8 +172,8 @@ def test_operator_time_stats_handles_zero_step_time():
     rows = build_operator_time_stats(
         model=_base_model(),
         report=TrainingReport(step_time_ms=0.0, compute_time_ms=0.0),
-        op_dicts=[{"name": "mm", "kind": "matmul", "total_ms": 10.0}],
+        op_dicts=[{"name": "mm", "kind": "matmul", "component": "attention", "total_ms": 10.0}],
     )
 
-    assert _by_label(rows)["Matmul family total"]["pct_of_step"] == 0.0
-    assert _by_label(rows)["Matmul family total"]["pct_of_useful_compute"] == 0.0
+    assert _by_label(rows)["Attention matmul family"]["pct_of_step"] == 0.0
+    assert _by_label(rows)["Attention matmul family"]["pct_of_useful_compute"] == 0.0

@@ -71,6 +71,67 @@ def _is_attention_op(op: dict) -> bool:
     )
 
 
+def _is_matmul_op(op: dict) -> bool:
+    return str(op.get("kind", "") or "").lower() == "matmul"
+
+
+def _is_attention_matmul_op(op: dict) -> bool:
+    if not _is_matmul_op(op):
+        return False
+    if _is_attention_op(op):
+        return True
+
+    name = str(op.get("name", "") or "").lower()
+    attention_name_markers = (
+        "qkv",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj",
+        "kv_b_proj",
+        "wq",
+        "wk",
+        "wv",
+        "wkv",
+        "o_proj",
+        "wo_a",
+        "wo_b",
+        "comp_wkv",
+        "idx_wq_b",
+    )
+    return any(marker in name for marker in attention_name_markers)
+
+
+def _is_ffn_matmul_op(op: dict) -> bool:
+    if not _is_matmul_op(op):
+        return False
+
+    component = str(op.get("component", "") or "").lower()
+    component_group = str(op.get("component_group", "") or "").lower()
+    if component in {"routed_expert", "shared_expert", "ffn", "moe"}:
+        return True
+    if component_group in {"routed_expert", "shared_expert", "ffn", "moe"}:
+        return True
+
+    name = str(op.get("name", "") or "").lower()
+    ffn_name_markers = (
+        "ffn",
+        "mlp",
+        "up_proj",
+        "gate_proj",
+        "down_proj",
+        "router",
+        "routed_expert",
+        "shared_expert",
+        "expert",
+        "comp_wgate",
+        "idx_comp_wgate",
+    )
+    return any(marker in name for marker in ffn_name_markers)
+
+
 def _is_dsv4(model: Any) -> bool:
     model_type = str(getattr(model, "model_type", "") or "").lower()
     return model_type == "deepseek_v4" or bool(getattr(model, "use_v4_attn", False))
@@ -150,14 +211,18 @@ def build_operator_time_stats(
     time_scale = _operator_time_scale(report, op_dicts, strategy)
     rows: list[dict] = []
 
-    matmul_ops = [
-        op for op in op_dicts
-        if str(op.get("kind", "") or "").lower() in {"matmul", "lm_head"}
-    ]
     _append_if_present(
         rows,
-        "Matmul family total",
-        matmul_ops,
+        "Attention matmul family",
+        [op for op in op_dicts if _is_attention_matmul_op(op)],
+        step_time_ms,
+        useful_compute_ms,
+        time_scale,
+    )
+    _append_if_present(
+        rows,
+        "MoE/FFN matmul family",
+        [op for op in op_dicts if _is_ffn_matmul_op(op)],
         step_time_ms,
         useful_compute_ms,
         time_scale,
