@@ -108,6 +108,27 @@ class TestUlyssesCPSharding:
         assert op.meta["heads"] == 4
         assert op.meta["heads_tp"] == 16
 
+    def test_global_token_ops_are_cp_sharded(self):
+        """Embedding, final norm, and lm_head are outside layer_index but still CP-token local."""
+        model = _model()
+        strategy = _strategy(CPKind.ULYSSES)
+        graph = build_graph(model, strategy)
+        expected_s = model.seq_len // strategy.cp
+
+        embed = next(op for op in graph.ops if op.kind == "embed")
+        final_ln = next(op for op in graph.ops if op.name == "final_ln")
+        lm_head = next(op for op in graph.ops if op.kind == "lm_head")
+
+        assert embed.inputs[0].shape_local[0] == expected_s
+        assert embed.outputs[0].shape_local[0] == expected_s
+        assert embed.meta["m"] == expected_s
+        assert final_ln.inputs[0].shape_local[0] == expected_s
+        assert final_ln.outputs[0].shape_local[0] == expected_s
+        assert final_ln.meta["bytes_fwd"] == model.seq_len * model.hidden * model.act_dtype.bytes * 2 // strategy.cp
+        assert lm_head.inputs[0].shape_local[0] == expected_s
+        assert lm_head.outputs[0].shape_local[0] == expected_s
+        assert lm_head.meta["m"] == expected_s
+
 
 class TestRingCPSharding:
     """Verify that Ring-CP divides s and leaves heads unchanged."""

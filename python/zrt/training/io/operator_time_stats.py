@@ -81,6 +81,12 @@ def _is_lm_head_op(op: dict) -> bool:
     return kind == "lm_head" or name == "lm_head" or name.endswith(".lm_head")
 
 
+def _is_embed_op(op: dict) -> bool:
+    kind = str(op.get("kind", "") or "").lower()
+    name = str(op.get("name", "") or "").lower()
+    return kind == "embed" or name == "embed" or name.endswith(".embed")
+
+
 def _has_any_name_marker(op: dict, markers: tuple[str, ...]) -> bool:
     name = str(op.get("name", "") or "").lower()
     return any(marker in name for marker in markers)
@@ -261,6 +267,14 @@ def build_operator_time_stats(
         useful_compute_ms,
         time_scale,
     )
+    _append_if_present(
+        rows,
+        "Embedding lookup",
+        [op for op in op_dicts if _is_embed_op(op)],
+        step_time_ms,
+        useful_compute_ms,
+        time_scale,
+    )
 
     if _is_dsv4(model):
         csa_ops: list[dict] = []
@@ -293,14 +307,68 @@ def build_operator_time_stats(
         )
 
     if _is_dsv32(model):
-        flash_ops = [
+        # Per-component matmul breakdown (parallel to V4's per-variant attention rows).
+        mla_proj_markers = ("q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj", "o_proj")
+        mla_proj_ops = [
+            op for op in op_dicts
+            if _is_matmul_op(op) and _has_any_name_marker(op, mla_proj_markers)
+        ]
+        indexer_aux_markers = ("idx_wq_b", "idx_weights", "idx_comp_wkv", "idx_comp_wgate")
+        indexer_aux_ops = [
+            op for op in op_dicts
+            if _is_matmul_op(op) and _has_any_name_marker(op, indexer_aux_markers)
+        ]
+        router_ops = [
+            op for op in op_dicts
+            if _is_matmul_op(op)
+            and str(op.get("name", "") or "").lower().rsplit(".", 1)[-1] == "router"
+        ]
+        shared_expert_ops = [
+            op for op in op_dicts
+            if _is_matmul_op(op)
+            and str(op.get("component", "") or "").lower() == "shared_expert"
+        ]
+        routed_expert_ops = [
+            op for op in op_dicts
+            if _is_matmul_op(op)
+            and "routed_expert_ffn" in str(op.get("name", "") or "").lower()
+        ]
+
+        _append_if_present(
+            rows, "MLA proj matmul (Q/KV/O)", mla_proj_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "Indexer aux matmul", indexer_aux_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "MoE router matmul", router_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "MoE shared expert matmul", shared_expert_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "MoE routed expert matmul (gmm)", routed_expert_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+
+        sparse_fa_ops = [
             op for op in op_dicts
             if str(op.get("kind", "") or "").lower() == "attn_core"
         ]
+        indexer_ops = [
+            op for op in op_dicts
+            if str(op.get("kind", "") or "").lower() == "indexer_topk"
+        ]
+        dsa_compute_ops = sparse_fa_ops + indexer_ops
         mla_ops = [op for op in op_dicts if _is_attention_op(op)]
 
         _append_if_present(
-            rows, "FlashAttention", flash_ops, step_time_ms, useful_compute_ms, time_scale
+            rows, "Sparse FA core (DSA)", sparse_fa_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "Lightning Indexer", indexer_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "DSA attention compute", dsa_compute_ops, step_time_ms, useful_compute_ms, time_scale
         )
         _append_if_present(
             rows, "MLA attention block", mla_ops, step_time_ms, useful_compute_ms, time_scale

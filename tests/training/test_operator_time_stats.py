@@ -170,7 +170,7 @@ def test_operator_time_stats_emits_dsv4_csa_hca_and_swa_rows():
     assert by_label["SWA operator"]["op_count"] == 3
 
 
-def test_operator_time_stats_emits_dsv32_flashattention_and_mla_rows():
+def test_operator_time_stats_emits_dsv32_sparse_fa_indexer_and_mla_rows():
     model = _base_model(
         q_lora_rank=16,
         kv_lora_rank=8,
@@ -184,17 +184,59 @@ def test_operator_time_stats_emits_dsv32_flashattention_and_mla_rows():
         model=model,
         report=TrainingReport(step_time_ms=100.0),
         op_dicts=[
+            # MLA projections
             {"name": "L0.q_a_proj", "kind": "matmul", "component": "attention", "layer_id": 0, "total_ms": 4.0},
+            {"name": "L0.q_b_proj", "kind": "matmul", "component": "attention", "layer_id": 0, "total_ms": 5.0},
+            {"name": "L0.kv_a_proj", "kind": "matmul", "component": "attention", "layer_id": 0, "total_ms": 2.0},
+            {"name": "L0.kv_b_proj", "kind": "matmul", "component": "attention", "layer_id": 0, "total_ms": 6.0},
+            {"name": "L0.o_proj", "kind": "matmul", "component": "attention", "layer_id": 0, "total_ms": 7.0},
+            # Indexer aux + scoring
+            {"name": "L0.idx_wq_b", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 1.0},
+            {"name": "L0.idx_weights", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 1.5},
+            {"name": "L0.idx_comp_wkv", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 1.5},
+            {"name": "L0.idx_comp_wgate", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 2.0},
             {"name": "L0.idx_score_topk", "kind": "indexer_topk", "component": "attention", "layer_id": 0, "total_ms": 3.0},
+            # Attention core
             {"name": "L0.attn_core", "kind": "attn_core", "component": "attention", "layer_id": 0, "total_ms": 8.0},
-            {"name": "L0.ffn", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 20.0},
+            # MoE: router + shared + routed expert
+            {"name": "L0.router", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 0.5},
+            {"name": "L0.shared_up_proj", "kind": "matmul", "component": "shared_expert", "layer_id": 0, "total_ms": 1.2},
+            {"name": "L0.shared_gate_proj", "kind": "matmul", "component": "shared_expert", "layer_id": 0, "total_ms": 1.3},
+            {"name": "L0.shared_down_proj", "kind": "matmul", "component": "shared_expert", "layer_id": 0, "total_ms": 1.5},
+            {"name": "L0.routed_expert_ffn", "kind": "matmul", "component": "routed_expert", "layer_id": 0, "total_ms": 18.0},
+            # Global non-layer ops
+            {"name": "embed", "kind": "embed", "layer_id": -1, "total_ms": 2.5},
+            {"name": "lm_head", "kind": "lm_head", "layer_id": -1, "total_ms": 6.0},
         ],
     )
 
     by_label = _by_label(rows)
-    assert by_label["FlashAttention"]["time_ms"] == 8.0
-    assert by_label["FlashAttention"]["pct_of_step"] == 0.08
-    assert by_label["MLA attention block"]["time_ms"] == 15.0
+    # V3.2 per-component matmul breakdown
+    assert by_label["MLA proj matmul (Q/KV/O)"]["time_ms"] == 24.0
+    assert by_label["MLA proj matmul (Q/KV/O)"]["op_count"] == 5
+    assert by_label["Indexer aux matmul"]["time_ms"] == 6.0
+    assert by_label["Indexer aux matmul"]["op_count"] == 4
+    assert by_label["MoE router matmul"]["time_ms"] == 0.5
+    assert by_label["MoE router matmul"]["op_count"] == 1
+    assert by_label["MoE shared expert matmul"]["time_ms"] == 4.0
+    assert by_label["MoE shared expert matmul"]["op_count"] == 3
+    assert by_label["MoE routed expert matmul (gmm)"]["time_ms"] == 18.0
+    assert by_label["MoE routed expert matmul (gmm)"]["op_count"] == 1
+    # DSA / attention block rows
+    assert by_label["Sparse FA core (DSA)"]["time_ms"] == 8.0
+    assert by_label["Sparse FA core (DSA)"]["op_count"] == 1
+    assert by_label["Lightning Indexer"]["time_ms"] == 3.0
+    assert by_label["Lightning Indexer"]["op_count"] == 1
+    assert by_label["DSA attention compute"]["time_ms"] == 11.0
+    assert by_label["DSA attention compute"]["op_count"] == 2
+    # MLA attention block = attention component + indexer_topk + rope/compressor by kind
+    # Here: 5 MLA proj + idx_score_topk + attn_core = 24 + 3 + 8 = 35
+    assert by_label["MLA attention block"]["time_ms"] == 35.0
+    # Global non-layer rows
+    assert by_label["LM head matmul"]["time_ms"] == 6.0
+    assert by_label["Embedding lookup"]["time_ms"] == 2.5
+    assert by_label["Embedding lookup"]["op_count"] == 1
+    assert "FlashAttention" not in by_label
 
 
 def test_operator_time_stats_handles_zero_step_time():
