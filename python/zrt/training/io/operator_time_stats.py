@@ -293,14 +293,25 @@ def build_operator_time_stats(
         )
 
     if _is_dsv32(model):
-        flash_ops = [
+        sparse_fa_ops = [
             op for op in op_dicts
             if str(op.get("kind", "") or "").lower() == "attn_core"
         ]
+        indexer_ops = [
+            op for op in op_dicts
+            if str(op.get("kind", "") or "").lower() == "indexer_topk"
+        ]
+        dsa_compute_ops = sparse_fa_ops + indexer_ops
         mla_ops = [op for op in op_dicts if _is_attention_op(op)]
 
         _append_if_present(
-            rows, "FlashAttention", flash_ops, step_time_ms, useful_compute_ms, time_scale
+            rows, "Sparse FA core (DSA)", sparse_fa_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "Lightning Indexer", indexer_ops, step_time_ms, useful_compute_ms, time_scale
+        )
+        _append_if_present(
+            rows, "DSA attention compute", dsa_compute_ops, step_time_ms, useful_compute_ms, time_scale
         )
         _append_if_present(
             rows, "MLA attention block", mla_ops, step_time_ms, useful_compute_ms, time_scale

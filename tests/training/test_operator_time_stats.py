@@ -170,7 +170,7 @@ def test_operator_time_stats_emits_dsv4_csa_hca_and_swa_rows():
     assert by_label["SWA operator"]["op_count"] == 3
 
 
-def test_operator_time_stats_emits_dsv32_flashattention_and_mla_rows():
+def test_operator_time_stats_emits_dsv32_sparse_fa_indexer_and_mla_rows():
     model = _base_model(
         q_lora_rank=16,
         kv_lora_rank=8,
@@ -192,9 +192,17 @@ def test_operator_time_stats_emits_dsv32_flashattention_and_mla_rows():
     )
 
     by_label = _by_label(rows)
-    assert by_label["FlashAttention"]["time_ms"] == 8.0
-    assert by_label["FlashAttention"]["pct_of_step"] == 0.08
+    assert by_label["Sparse FA core (DSA)"]["time_ms"] == 8.0
+    assert by_label["Sparse FA core (DSA)"]["pct_of_step"] == 0.08
+    assert by_label["Sparse FA core (DSA)"]["op_count"] == 1
+    assert by_label["Lightning Indexer"]["time_ms"] == 3.0
+    assert by_label["Lightning Indexer"]["pct_of_step"] == 0.03
+    assert by_label["Lightning Indexer"]["op_count"] == 1
+    assert by_label["DSA attention compute"]["time_ms"] == 11.0
+    assert by_label["DSA attention compute"]["pct_of_step"] == 0.11
+    assert by_label["DSA attention compute"]["op_count"] == 2
     assert by_label["MLA attention block"]["time_ms"] == 15.0
+    assert "FlashAttention" not in by_label
 
 
 def test_operator_time_stats_handles_zero_step_time():
