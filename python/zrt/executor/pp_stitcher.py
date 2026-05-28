@@ -228,13 +228,13 @@ def _add_cross_stage_p2p(
                 tasks[bwd_dst].dependencies.append(bwd_src)
                 tasks[bwd_dst].delayed_deps[bwd_src] = p2p
 
-            # ZeroBubble: backward split into bwd_dx + bwd_dw
-            for phase in ("bwd_dx", "bwd_dw"):
-                zb_src = _task_id(s + 1, m, phase)
-                zb_dst = _task_id(s, m, phase)
-                if zb_src in tasks and zb_dst in tasks:
-                    tasks[zb_dst].dependencies.append(zb_src)
-                    tasks[zb_dst].latency_us += p2p_latency_us
+            # ZeroBubble: bwd_dx crosses stages (activation gradient P2P);
+            # bwd_dw is local (weight gradient stays within stage).
+            zb_src = _task_id(s + 1, m, "bwd_dx")
+            zb_dst = _task_id(s, m, "bwd_dx")
+            if zb_src in tasks and zb_dst in tasks:
+                tasks[zb_dst].dependencies.append(zb_src)
+                tasks[zb_dst].latency_us += p2p_latency_us
 
 
 def _add_device_serial_1f1b(

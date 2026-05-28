@@ -83,7 +83,6 @@ G[s][m] = { F[m], B_dx[m], B_dw[m] }
 | `F[m] → B_dx[m]` | Edge ① 扩展 | 前向完成后才能计算激活梯度 |
 | `B_dx[m] → B_dw[m]` | Edge ③ 扩展 | 激活梯度完成后才能计算权重梯度（梯度链） |
 | `B_dx[s+1][m] → B_dx[s][m]` | Edge ② 扩展 | 跨 stage 激活梯度反向传递 |
-| `B_dw[s+1][m] → B_dw[s][m]` | Edge ② 扩展 | 跨 stage 权重梯度反向传递 |
 
 **B_dw 自由填空闲**（ZB 核心特性）：
 ```
