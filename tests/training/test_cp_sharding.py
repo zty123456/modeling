@@ -1,5 +1,7 @@
 """Regression tests for Ulysses / Ring / Hybrid CP sharding metadata."""
 
+import pytest
+
 from zrt.training.ir.builders import build_graph
 from zrt.training.spec import LayerKind, ModelSpec
 from zrt.training.spec import CPKind, Strategy
@@ -30,6 +32,43 @@ def _attn_ops(cp_kind: CPKind):
         op for op in graph.ops
         if op.kind in ("attn_core", "sparse_attn")
     ], model, strategy
+
+
+@pytest.mark.parametrize("cp_kind", [CPKind.ULYSSES, CPKind.RING, CPKind.HYBRID])
+def test_global_embed_and_final_norm_are_cp_sharded(cp_kind):
+    """Global token ops outside layer_index still operate on CP-local sequence."""
+    model = _model()
+    strategy = _strategy(cp_kind)
+    graph = build_graph(model, strategy)
+    expected_s = model.seq_len // strategy.cp
+
+    embed = next(op for op in graph.ops if op.kind == "embed")
+    final_ln = next(op for op in graph.ops if op.name == "final_ln")
+
+    assert embed.inputs[0].shape_local[0] == expected_s
+    assert embed.outputs[0].shape_local[0] == expected_s
+    assert embed.meta["m"] == expected_s
+    assert final_ln.inputs[0].shape_local[0] == expected_s
+    assert final_ln.outputs[0].shape_local[0] == expected_s
+    assert final_ln.meta["bytes_fwd"] == (
+        model.seq_len * model.hidden * model.act_dtype.bytes * 2 // strategy.cp
+    )
+
+
+def test_global_embed_and_final_norm_are_unchanged_without_cp():
+    """CP=1 should leave global token-op sequence dimensions unchanged."""
+    model = _model()
+    strategy = Strategy(tp=2, cp=1, pp=1, ep=1, dp=1, micro_batch=1)
+    graph = build_graph(model, strategy)
+
+    embed = next(op for op in graph.ops if op.kind == "embed")
+    final_ln = next(op for op in graph.ops if op.name == "final_ln")
+
+    assert embed.inputs[0].shape_local[0] == model.seq_len
+    assert embed.outputs[0].shape_local[0] == model.seq_len
+    assert embed.meta["m"] == model.seq_len
+    assert final_ln.inputs[0].shape_local[0] == model.seq_len
+    assert final_ln.outputs[0].shape_local[0] == model.seq_len
 
 
 class TestUlyssesCPSharding:

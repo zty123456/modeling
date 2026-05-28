@@ -6,18 +6,22 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pandas as pd
 
 from zrt.training.search.training_search_util import (
     TrainingConfigManager,
     _load_model_spec,
     _make_strategy_from_config,
     _make_system_from_config,
+    _analysis_value,
     _passes_pod_packing,
     export_best_configs_excel,
+    export_best_analysis_excel,
     format_results,
     run_training_search_parallel,
     run_training_task_wrapper,
     save_results,
+    select_best_configs_by_tokens,
 )
 from zrt.training.spec.report import TrainingReport
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -927,6 +931,135 @@ class TestFormatResults:
         assert row["memory_gb"] == 4.12
 
 
+class TestBestAnalysisReport:
+    def test_select_best_configs_uses_tokens_per_sec_per_hw_seq(self):
+        df = pd.DataFrame([
+            {"hw": "hw_a", "seq_len": 8192, "tokens_per_sec": 100.0, "step_time_ms": 10.0},
+            {"hw": "hw_a", "seq_len": 8192, "tokens_per_sec": 200.0, "step_time_ms": 20.0},
+            {"hw": "hw_b", "seq_len": 8192, "tokens_per_sec": 150.0, "step_time_ms": 15.0},
+        ])
+
+        best = select_best_configs_by_tokens(
+            df,
+            comparison_hw_groups=[["hw_a", "hw_b"]],
+            seq_lens=[8192],
+        )
+
+        assert list(best["hw"]) == ["hw_a", "hw_b"]
+        assert list(best["tokens_per_sec"]) == [200.0, 150.0]
+
+    def test_select_best_configs_allows_same_baseline_in_multiple_groups(self):
+        df = pd.DataFrame([
+            {"hw": "base", "seq_len": 8192, "tokens_per_sec": 100.0},
+            {"hw": "hw_b", "seq_len": 8192, "tokens_per_sec": 90.0},
+            {"hw": "hw_c", "seq_len": 8192, "tokens_per_sec": 80.0},
+        ])
+
+        best = select_best_configs_by_tokens(
+            df,
+            comparison_hw_groups=[["base", "hw_b"], ["base", "hw_c"]],
+            seq_lens=[8192],
+        )
+
+        assert list(best["hw"]) == ["base", "hw_b", "base", "hw_c"]
+        assert list(best["_group_idx"]) == [0, 0, 1, 1]
+
+    def test_analysis_values_use_compute_sum_and_group_seq_baseline(self):
+        row = pd.Series({
+            "组号": "对比1",
+            "hw": "hw_b",
+            "seq_len": 8192,
+            "step_time_ms": 100.0,
+            "tokens_per_sec": 150.0,
+            "fwd_compute_ms": 20.0,
+            "bwd_compute_ms": 30.0,
+            "recompute_time_ms": 10.0,
+            "tp_exposed_ms": 2.0,
+            "ep_exposed_ms": 3.0,
+            "pp_exposed_ms": 4.0,
+            "dp_exposed_ms": 5.0,
+            "cp_exposed_ms": 6.0,
+            "optimizer_compute_ms": 7.0,
+            "optimizer_exposed_ms": 8.0,
+            "bubble_time_ms": 9.0,
+        })
+
+        assert _analysis_value("硬件+seq", row, 100.0) == "hw_b_8k"
+        assert _analysis_value("计算时间", row, 100.0) == 60.0
+        assert _analysis_value("计算占比", row, 100.0) == 0.6
+        assert _analysis_value("优化器占比", row, 100.0) == 0.07
+        assert _analysis_value("单卡吞吐归一化", row, 100.0) == 1.5
+
+    def test_export_best_analysis_excel_merges_group_label_cells(self):
+        output_dir = Path("output") / "test_best_analysis_group_merge"
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+
+        df = pd.DataFrame([
+            {
+                "hw": "base",
+                "seq_len": 8192,
+                "tokens_per_sec": 100.0,
+                "step_time_ms": 10.0,
+                "fwd_compute_ms": 1.0,
+                "bwd_compute_ms": 2.0,
+                "recompute_time_ms": 0.0,
+            },
+            {
+                "hw": "hw_b",
+                "seq_len": 8192,
+                "tokens_per_sec": 90.0,
+                "step_time_ms": 11.0,
+                "fwd_compute_ms": 1.0,
+                "bwd_compute_ms": 2.0,
+                "recompute_time_ms": 0.0,
+            },
+            {
+                "hw": "hw_c",
+                "seq_len": 8192,
+                "tokens_per_sec": 80.0,
+                "step_time_ms": 12.0,
+                "fwd_compute_ms": 1.0,
+                "bwd_compute_ms": 2.0,
+                "recompute_time_ms": 0.0,
+            },
+        ])
+        best = select_best_configs_by_tokens(
+            df,
+            comparison_hw_groups=[["base", "hw_b"], ["base", "hw_c"]],
+            seq_lens=[8192],
+        )
+
+        try:
+            excel_path = export_best_analysis_excel(
+                best,
+                str(output_dir),
+                comparison_hw_groups=[["base", "hw_b"], ["base", "hw_c"]],
+            )
+
+            import openpyxl
+
+            wb = openpyxl.load_workbook(excel_path)
+            assert "A2:A3" in {str(rng) for rng in wb["raw_data"].merged_cells.ranges}
+            assert "A4:A5" in {str(rng) for rng in wb["raw_data"].merged_cells.ranges}
+            assert "A2:A3" in {str(rng) for rng in wb["analysis"].merged_cells.ranges}
+            assert "A4:A5" in {str(rng) for rng in wb["analysis"].merged_cells.ranges}
+            assert wb["analysis"]["A2"].value == "对比1"
+            assert wb["analysis"]["A2"].alignment.horizontal == "center"
+            assert wb["analysis"]["A2"].alignment.vertical == "center"
+            for sheet_name in ("raw_data", "analysis"):
+                ws = wb[sheet_name]
+                assert ws["A1"].fill.fgColor.rgb == "004F81BD"
+                assert ws["B1"].fill.fgColor.rgb == "004F81BD"
+                assert ws["A4"].fill.fgColor.rgb == "00C6EFCE"
+                assert ws["B4"].fill.fgColor.rgb == "00C6EFCE"
+                assert ws["B5"].fill.fgColor.rgb == "00C6EFCE"
+                assert ws["B2"].fill.fgColor.rgb != "00C6EFCE"
+        finally:
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+
+
 class TestSearchOutputs:
     """Test search output helper behavior."""
 
@@ -1125,6 +1258,82 @@ class TestSearchOutputs:
             assert len(exported) == 1
             exported_results, _ = exported[0]
             assert [r["config"]["id"] for r in exported_results] == ["above_threshold_slow"]
+        finally:
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+
+    def test_run_training_search_parallel_exports_model_named_analysis_without_best_csv(self, monkeypatch):
+        import concurrent.futures
+        import zrt.training.search.training_search_util as search_util
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def submit(self, fn, *args, **kwargs):
+                fut = concurrent.futures.Future()
+                fut.set_result(fn(*args, **kwargs))
+                return fut
+
+        config = {
+            "model": "deepseek_v4_pro",
+            "hw": "nvidia_h100_sxm",
+            "world_size": 1,
+            "seq_len": 8192,
+        }
+
+        monkeypatch.setattr(search_util, "ProcessPoolExecutor", FakeExecutor)
+        monkeypatch.setattr(search_util, "_worker_initializer", lambda model_name: None)
+        monkeypatch.setattr(
+            search_util,
+            "run_training_task_wrapper",
+            lambda cfg: {
+                "status": "success",
+                "config": cfg,
+                "report": TrainingReport(
+                    mfu=0.5,
+                    step_time_ms=10.0,
+                    tokens_per_sec=100.0,
+                    fwd_compute_ms=1.0,
+                    bwd_compute_ms=2.0,
+                ),
+                "model_name": cfg["model"],
+                "hw_name": cfg["hw"],
+            },
+        )
+        monkeypatch.setattr(TrainingConfigManager, "count_total_configs", lambda self: 1)
+        monkeypatch.setattr(
+            TrainingConfigManager,
+            "generate_static_configs_stream",
+            lambda self: iter([config]),
+        )
+
+        output_dir = Path("output") / "training_search" / "deepseek_v4_pro_ws_1"
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+
+        try:
+            run_training_search_parallel(
+                {
+                    "model": ["deepseek_v4_pro"],
+                    "hw": ["nvidia_h100_sxm"],
+                    "world_size": [1],
+                    "seq_len": [8192],
+                },
+                workers=1,
+                batch_size=1,
+                export_best_excel=False,
+            )
+
+            assert (output_dir / "deepseek_v4_pro_best_config_analysis.xlsx").exists()
+            assert not (output_dir / "best_config_analysis.xlsx").exists()
+            assert not (output_dir / "best_tokens_per_hw_seq_len.csv").exists()
         finally:
             if output_dir.exists():
                 shutil.rmtree(output_dir)

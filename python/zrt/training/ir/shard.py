@@ -99,7 +99,9 @@ def insert_collectives(graph: Graph, model: ModelSpec, strategy: Strategy) -> No
 
     # Apply TP/CP sharding to global ops (layer_id < 0: lm_head, final_ln, etc.)
     # These are outside the per-layer ranges and would otherwise be skipped.
-    _apply_global_op_sharding(graph, strategy, model.seq_len)
+    _apply_global_hc_sharding(graph, strategy, model.seq_len)
+    _apply_global_token_op_sharding(graph, strategy)
+    _apply_global_lm_head_sharding(graph, strategy)
 
 
 def _shard_hc_sequence(op, factor: int, seq: int) -> None:
@@ -127,21 +129,37 @@ def _shard_global_token_op_sequence(op, factor: int) -> None:
     if "bytes_fwd" in op.meta:
         op.meta["bytes_fwd"] = max(1, int(op.meta["bytes_fwd"]) // factor)
 
+def _shard_global_token_sequence(op, factor: int) -> None:
+    """Shard the leading token dimension for global sequence-local ops."""
+    if factor <= 1:
+        return
+    if "m" in op.meta and op.meta["m"] > 0:
+        op.meta["m"] = max(1, op.meta["m"] // factor)
+    if "s" in op.meta and op.meta["s"] > 0:
+        op.meta["s"] = max(1, op.meta["s"] // factor)
+    if "bytes_fwd" in op.meta:
+        op.meta["bytes_fwd"] = max(1, int(op.meta["bytes_fwd"]) // factor)
     for t in op.inputs + op.outputs:
         if t.shape_local:
             t.shape_local = (max(1, t.shape_local[0] // factor),) + t.shape_local[1:]
 
 
-def _apply_global_op_sharding(graph: Graph, strategy: Strategy, seq: int) -> None:
-    """Apply sharding to global ops outside layer_index.
+def _apply_global_token_op_sharding(graph: Graph, strategy: Strategy) -> None:
+    """Apply CP token sharding to non-lm_head global token ops."""
+    factor = max(1, strategy.cp)
+    if factor <= 1:
+        return
+    for op in graph.ops:
+        if op.layer_id < 0 and op.kind in ("embed", "ln", "rmsnorm"):
+            _shard_global_token_sequence(op, factor)
 
-    CP keeps non-attention token work sequence-local per rank, so global
-    embedding/final-norm/lm-head ops must see ``seq / cp`` tokens just like
-    block-local matmuls and norms. HC global ops keep their existing combined
-    TP/CP token scaling.
-    """
-    token_factor = max(1, strategy.cp)
-    hc_factor = max(1, strategy.tp) * max(1, strategy.cp)
+
+def _apply_global_lm_head_sharding(graph: Graph, strategy: Strategy) -> None:
+    """Apply TP vocab and CP sequence sharding to global lm_head."""
+    tp = max(1, strategy.tp)
+    cp = max(1, strategy.cp)
+    if tp <= 1 and cp <= 1:
+        return
     for op in graph.ops:
         if op.layer_id >= 0:
             continue

@@ -196,6 +196,69 @@ while True:
 
 ---
 
+## 训练寻优
+
+训练寻优有两类入口：
+
+1. `python -m python.zrt --search-config <yaml>`：基于单个 YAML 配置生成并行策略 Pareto 前沿，适合快速验证某个训练配置空间。
+2. `python/zrt/training/search/training_search_util.py`：批量扫描模型、硬件、seq、TP/CP/PP/EP/DP、重计算、量化策略等组合，输出全量结果和硬件对比报表，适合做大规模硬件/策略选型。
+
+运行批量寻优脚本：
+
+```bash
+python python\zrt\training\search\training_search_util.py
+```
+
+脚本底部的 `training_param_grid` 是主要配置入口，常用字段包括：
+
+| 字段 | 说明 |
+|------|------|
+| `model` / `hw` / `world_size` | 模型、硬件 YAML 名称和总卡数 |
+| `seq_len` / `total_token` / `micro_batch` | 序列长度、总 token 数、micro batch；当前逻辑按 `total_token // seq_len` 推导 `global_batch`，适合使用规整 token |
+| `tp` / `cp` / `pp` / `ep` / `dp` | 并行维度；`dp: "auto"` 时由 `world_size / (tp * cp * pp)` 自动推导 |
+| `recompute` / `quant_preset` / `optimizer` | 重计算、混合精度/量化预设、优化器 |
+| `pp_schedule` / `vpp_chunks` | PP 调度策略和虚拟流水段数 |
+
+如果要把不同硬件按组对比，使用 `comparison_hw_groups`：
+
+```python
+comparison_hw_groups = [
+    ["nvidia_b300", "nvidia_gb300_nvl576"],
+    ["nvidia_b300", "ascend_910c"],
+]
+```
+
+每个对比组的第一个硬件作为吞吐归一化基准。脚本会在每个 `对比组 × 硬件 × seq_len` 内按 `tokens_per_sec` 选出最优配置。
+
+主要输出目录为：
+
+```text
+output/training_search/{model}_ws_{world_size}/
+```
+
+关键输出：
+
+| 文件 | 内容 |
+|------|------|
+| `results_summary.csv` | 全量可行配置结果；包含 `step_time_ms`、`tokens_per_sec`、MFU/HFU、计算/通信/空泡/显存等字段 |
+| `{model}_best_config_analysis.xlsx` | 按硬件和 seq 选出的最优配置分析表；包含 `raw_data` 和 `analysis` 两个 sheet |
+| `{model}_{hw}_seq{seq}_ws{world}_best.xlsx` | 每个硬件和 seq 的最优配置明细（开启 `export_best_excel=True` 时生成） |
+
+`analysis` sheet 中的占比口径：
+
+| 指标 | 公式 |
+|------|------|
+| 计算时间 | `fwd_compute_ms + bwd_compute_ms + recompute_time_ms` |
+| 计算占比 | `计算时间 / step_time_ms` |
+| TP/EP/PP/DP/CP 通信占比 | 对应 `*_exposed_ms / step_time_ms` |
+| 优化器占比 | `optimizer_compute_ms / step_time_ms` |
+| 空泡占比 | `bubble_time_ms / step_time_ms` |
+| 单卡吞吐归一化 | 当前硬件 `tokens_per_sec / 同组同 seq 的基准硬件 tokens_per_sec` |
+
+Excel 报表会自动合并并居中 `组号` 列；表头为蓝底，偶数对比组整组数据行为绿底。
+
+---
+
 ## 多 tier 互联拓扑
 
 `estimate` 路线由 `zrt.training.topology.CommDomain` 统一分派通信成本。硬件 YAML 支持任意层数：
