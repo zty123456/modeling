@@ -233,8 +233,11 @@ def _add_cross_stage_p2p(
             zb_src = _task_id(s + 1, m, "bwd_dx")
             zb_dst = _task_id(s, m, "bwd_dx")
             if zb_src in tasks and zb_dst in tasks:
+                phys_s = _phys_dev(s + 1)
+                phys_d = _phys_dev(s)
+                p2p = _lookup_p2p(_bwd, phys_s, phys_d) if phys_s != phys_d else 0.0
                 tasks[zb_dst].dependencies.append(zb_src)
-                tasks[zb_dst].latency_us += p2p_latency_us
+                tasks[zb_dst].delayed_deps[zb_src] = p2p
 
 
 def _add_device_serial_1f1b(
