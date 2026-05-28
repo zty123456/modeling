@@ -132,6 +132,10 @@ class ChromeTraceExporter:
     def _sort_index_meta(pid: int, sort_index: int) -> dict:
         return {"ph": "M", "pid": pid, "ts": 0, "name": "sort_index", "args": {"sort_index": sort_index}}
 
+    @staticmethod
+    def _thread_sort_index_meta(pid: int, tid: int, sort_index: int) -> dict:
+        return {"ph": "M", "pid": pid, "tid": tid, "ts": 0, "name": "thread_sort_index", "args": {"sort_index": sort_index}}
+
     def _grid_meta_events(self, pp: int) -> list[dict]:
         meta: list[dict] = []
         for s in range(pp):
@@ -146,7 +150,9 @@ class ChromeTraceExporter:
             meta.append(self._process_name_meta(s, f"Stage {s}"))
             meta.append(self._sort_index_meta(s, -s))
             meta.append(self._thread_name_meta(s, 0, "Compute Ops"))
+            meta.append(self._thread_sort_index_meta(s, 0, 0))
             meta.append(self._thread_name_meta(s, 1, "Comm Ops"))
+            meta.append(self._thread_sort_index_meta(s, 1, 1))
         return meta
 
     def _combined_meta_events(self, pp: int) -> list[dict]:
@@ -155,8 +161,11 @@ class ChromeTraceExporter:
             meta.append(self._process_name_meta(s, f"Stage {s}"))
             meta.append(self._sort_index_meta(s, -s))
             meta.append(self._thread_name_meta(s, 0, "Grid Schedule"))
+            meta.append(self._thread_sort_index_meta(s, 0, 0))
             meta.append(self._thread_name_meta(s, 2, "Compute Ops"))
+            meta.append(self._thread_sort_index_meta(s, 2, 1))
             meta.append(self._thread_name_meta(s, 3, "Comm Ops"))
+            meta.append(self._thread_sort_index_meta(s, 3, 2))
         return meta
 
     # ── deduplication ─────────────────────────────────────────────────────
@@ -440,13 +449,16 @@ class ChromeTraceExporter:
             ).to_dict())
 
         for s, tl in enumerate(timelines):
+            fwd_lat = tl.phase_latency("fwd")
+            bwd_lat = tl.phase_latency("bwd")
+
             for m in range(stitched.M):
                 fwd_base = grid_index.get((s, m, "fwd"), 0.0)
                 for op in tl.scheduled_ops:
                     if op.phase == "fwd":
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                         events.append(ChromeTraceEvent(
-                            name=f"{op.op_type}",
+                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
                             cat="compute" if op.stream_type != "comm" else "communication",
                             pid=s,
                             tid=2 + op.stream_id,
@@ -464,12 +476,13 @@ class ChromeTraceExporter:
                 for op in tl.scheduled_ops:
                     if "bwd" in op.phase:
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
+                        relative_start = op.start_us - fwd_lat if len(op.phase) > 0 and "fwd" not in op.phase else op.start_us
                         events.append(ChromeTraceEvent(
-                            name=f"{op.op_type}",
+                            name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
                             cat="compute" if op.stream_type != "comm" else "communication",
                             pid=s,
                             tid=2 + op.stream_id,
-                            ts=(bwd_base + op.start_us) * self._mult,
+                            ts=(bwd_base + relative_start) * self._mult,
                             dur=dur_us * self._mult,
                             args={
                                 "phase": "bwd",

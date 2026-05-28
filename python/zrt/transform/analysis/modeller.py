@@ -213,9 +213,9 @@ def estimate_training_from_graphs(
                         str(trace_dir / "pp_per_stage.json"),
                         M=M,
                         pp_stitched=pp_timeline,
-                        replicate=False,
+                        replicate=True,
                     )
-                    exporter.export_combined(
+                    exporter.export_stitched_detailed(
                         pp_timeline, tl_list,
                         str(trace_dir / "pp_combined.json"),
                     )

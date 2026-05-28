@@ -60,6 +60,13 @@ class GridTask:
     # Dependencies: task_ids that must finish before this task starts
     dependencies: list[str] = field(default_factory=list)
 
+    # Delayed dependencies: dep_id → additional delay (µs).
+    # Used for cross-stage P2P: the receiving GPU cannot begin compute
+    # until activation/gradient arrives over the wire, but the P2P
+    # transfer time is NOT part of the receiving task's own latency —
+    # it is a gap between the predecessor's end and this task's start.
+    delayed_deps: dict[str, float] = field(default_factory=dict)
+
     # Scheduling result (filled by list scheduler)
     start_us: float = 0.0
     end_us: float = 0.0
@@ -151,7 +158,9 @@ def _add_cross_stage_p2p(
     tasks: dict[str, GridTask],
     pp: int,
     M: int,
-    p2p_latency_us: float,
+    default_p2p_us: float = 0.0,
+    p2p_fwd_us: dict[tuple[int, int], float] | None = None,
+    p2p_bwd_us: dict[tuple[int, int], float] | None = None,
     virtual_stages: list[int] | None = None,
 ) -> None:
     """Edge ②: inter-stage P2P links.
@@ -159,23 +168,29 @@ def _add_cross_stage_p2p(
     Forward:  G[s][m].fwd → G[s+1][m].fwd
     Backward: G[s+1][m].bwd → G[s][m].bwd
 
-    P2P transfer time is modelled by adding ``p2p_latency_us`` to the
-    receiving task's latency — the destination GPU cannot begin real
-    compute until the activation/gradient arrives over the wire.
+    P2P transfer time is modelled as a *delayed dependency*: the
+    receiving task cannot begin until the per-edge P2P latency after
+    the sender finishes.  When per-edge dicts (``p2p_fwd_us``,
+    ``p2p_bwd_us``) are provided they take precedence; otherwise
+    ``default_p2p_us`` is used for every edge.
     """
+    _fwd = p2p_fwd_us or {}
+    _bwd = p2p_bwd_us or {}
     for m in range(M):
         for s in range(pp - 1):
             fwd_src = _task_id(s, m, "fwd")
             fwd_dst = _task_id(s + 1, m, "fwd")
             if fwd_src in tasks and fwd_dst in tasks:
+                p2p = _fwd.get((s, s + 1), default_p2p_us)
                 tasks[fwd_dst].dependencies.append(fwd_src)
-                tasks[fwd_dst].latency_us += p2p_latency_us
+                tasks[fwd_dst].delayed_deps[fwd_src] = p2p
 
             bwd_src = _task_id(s + 1, m, "bwd")
             bwd_dst = _task_id(s, m, "bwd")
             if bwd_src in tasks and bwd_dst in tasks:
+                p2p = _bwd.get((s + 1, s), default_p2p_us)
                 tasks[bwd_dst].dependencies.append(bwd_src)
-                tasks[bwd_dst].latency_us += p2p_latency_us
+                tasks[bwd_dst].delayed_deps[bwd_src] = p2p
 
 
 def _add_device_serial_1f1b(
@@ -379,16 +394,27 @@ def _list_schedule(tasks: dict[str, GridTask]) -> list[GridTask]:
 
     scheduled: list[GridTask] = []
     while ready:
-        # Pick task with earliest possible start time (greedy)
+        # Pick task with earliest possible start time (greedy).
+        # For tasks with delayed_deps, the effective predecessor finish
+        # is bumped by the per-dependency delay (cross-stage P2P gap).
         ready.sort(key=lambda t: max(
             device_free.get(t.stream_id, 0.0),
-            max((finish.get(d, 0.0) for d in t.dependencies), default=0.0),
+            max(
+                (
+                    finish.get(d, 0.0) + t.delayed_deps.get(d, 0.0)
+                    for d in t.dependencies
+                ),
+                default=0.0,
+            ),
         ))
         task = ready.pop(0)
 
-        # Data dependency: wait for all predecessors
+        # Data dependency: wait for all predecessors, plus any delayed-dep gap
         pred_done = max(
-            (finish.get(d, 0.0) for d in task.dependencies),
+            (
+                finish.get(d, 0.0) + task.delayed_deps.get(d, 0.0)
+                for d in task.dependencies
+            ),
             default=0.0,
         )
         # Resource constraint: wait for device to be free
@@ -444,6 +470,12 @@ class PPStitcher:
         Number of microbatches.
     p2p_latency_us : float
         One-way P2P activation transfer time (µs) between adjacent stages.
+        If ``p2p_fwd_us`` or ``p2p_bwd_us`` are provided, those per-edge
+        values take precedence over this global default.
+    p2p_fwd_us : dict[tuple[int,int], float] | None
+        Per-edge forward P2P latency, keyed by (src_stage, dst_stage).
+    p2p_bwd_us : dict[tuple[int,int], float] | None
+        Per-edge backward P2P latency, keyed by (src_stage, dst_stage).
     schedule : str
         Pipeline schedule: "1f1b", "interleaved", "dualpipe", "dualpipev", "zb".
     vpp_chunks : int
@@ -458,6 +490,8 @@ class PPStitcher:
         pp: int,
         M: int,
         p2p_latency_us: float = 0.0,
+        p2p_fwd_us: dict[tuple[int, int], float] | None = None,
+        p2p_bwd_us: dict[tuple[int, int], float] | None = None,
         schedule: str = "1f1b",
         vpp_chunks: int = 1,
         stage_bwd_dw_us: dict[int, float] | None = None,
@@ -468,6 +502,8 @@ class PPStitcher:
         self._pp = pp
         self._M = M
         self._p2p_us = p2p_latency_us
+        self._p2p_fwd = p2p_fwd_us or {}
+        self._p2p_bwd = p2p_bwd_us or {}
         self._schedule = schedule
         self._vpp = vpp_chunks
 
@@ -490,7 +526,10 @@ class PPStitcher:
         task_map = _build_task_id_set(tasks)
 
         _add_activation_dependency(task_map)
-        _add_cross_stage_p2p(task_map, eff_pp, self._M, self._p2p_us)
+        _add_cross_stage_p2p(
+            task_map, eff_pp, self._M,
+            self._p2p_us, self._p2p_fwd, self._p2p_bwd,
+        )
 
         self._add_device_serial(task_map, kind, eff_pp)
 

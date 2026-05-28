@@ -523,13 +523,17 @@ class TrainingPipelinePass(GraphPass):
         from python.zrt.executor.pp_stitcher import PPStitcher
         from python.zrt.training.compose.schedules import _dp_hidden, StepResult
 
+        p2p_fwd_us, p2p_bwd_us = _extract_p2p_latency_per_edge(g)
+
         stitcher = PPStitcher(
             stage_fwd_us=stage_fwd,
             stage_bwd_us=stage_bwd,
             stage_bwd_dw_us=stage_bwd_dw,
             pp=pp,
             M=M,
-            p2p_latency_us=_extract_p2p_latency_us(g),
+            p2p_latency_us=0.0,
+            p2p_fwd_us=p2p_fwd_us,
+            p2p_bwd_us=p2p_bwd_us,
             schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
         )
@@ -925,6 +929,14 @@ class TrainingPipelinePass(GraphPass):
             step_time_us -= hidden_us
             step_time_ms = step_time_us / 1000.0
 
+        # PP intra-stage send_recv↔compute overlap is already absorbed by
+        # DAGScheduler wall-clock (stage_fwd/stage_bwd) and PPStitcher
+        # delayed_deps.  Undo the PP portion from step_time subtraction —
+        # the overlap benefit was priced in before we ever computed hidden_us.
+        if pp_mode == "trace":
+            step_time_us += per_strat.pp_hidden_us * M
+            step_time_ms = step_time_us / 1000.0
+
         exposed_comm_ms = total_exposed_us / 1000.0
         hidden_comm_ms = hidden_us / 1000.0
         total_comm_ms = total_comm_us / 1000.0
@@ -1291,10 +1303,44 @@ class TrainingPipelinePass(GraphPass):
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────
 
+def _extract_p2p_latency_per_edge(g) -> tuple[dict[tuple[int, int], float], dict[tuple[int, int], float]]:
+    """Extract per-edge P2P latency from send_recv nodes in the graph.
+
+    Groups comm.send_recv nodes by (src_stage, dst_stage, phase), taking
+    the maximum latency per group (bottleneck edge).
+
+    Returns
+    -------
+    fwd_us : dict[tuple[int,int], float]
+        Forward P2P latency keyed by (src_stage, dst_stage).
+    bwd_us : dict[tuple[int,int], float]
+        Backward P2P latency keyed by (src_stage, dst_stage).
+    """
+    fwd_us: dict[tuple[int, int], float] = {}
+    bwd_us: dict[tuple[int, int], float] = {}
+    for node in g.nodes.values():
+        if node.op_type != "comm.send_recv":
+            continue
+        src = node.attrs.get("src_stage", -1)
+        dst = node.attrs.get("dst_stage", -1)
+        if src < 0 or dst < 0:
+            continue
+        lat = node.annotations.get("latency_us", 0.0)
+        phase = node.annotations.get("phase", "")
+        key = (src, dst)
+        if phase == "fwd":
+            fwd_us[key] = max(fwd_us.get(key, 0.0), lat)
+        else:
+            bwd_us[key] = max(bwd_us.get(key, 0.0), lat)
+    return fwd_us, bwd_us
+
+
 def _extract_p2p_latency_us(g) -> float:
     """Extract maximum P2P communication latency from send_recv nodes in the graph.
 
     Returns 0.0 if no P2P nodes are found.
+
+    Deprecated: prefer ``_extract_p2p_latency_per_edge`` for per-edge resolution.
     """
     max_lat = 0.0
     for node in g.nodes.values():
