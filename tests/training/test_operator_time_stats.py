@@ -99,10 +99,31 @@ def test_operator_time_stats_emits_dsv4_csa_hca_and_swa_rows():
         report=TrainingReport(step_time_ms=100.0),
         op_dicts=[
             {"name": "L0.wq_a", "kind": "matmul", "component": "attention", "layer_id": 0, "total_ms": 3.0},
-            {"name": "L0.sparse_attn", "kind": "sparse_attn", "component": "attention", "layer_id": 0, "total_ms": 7.0},
+            {
+                "name": "L0.sparse_attn",
+                "kind": "sparse_attn",
+                "component": "attention",
+                "layer_id": 0,
+                "total_ms": 7.0,
+                "meta": {"sparse_topk": 16, "swa_window": 16},
+            },
             {"name": "L1.wq_a", "kind": "matmul", "component": "attention", "layer_id": 1, "total_ms": 4.0},
-            {"name": "L1.hca_attn", "kind": "hca_attn", "component": "attention", "layer_id": 1, "total_ms": 6.0},
-            {"name": "L2.swa_attn", "kind": "swa_attn", "component": "attention", "layer_id": 2, "total_ms": 5.0},
+            {
+                "name": "L1.hca_attn",
+                "kind": "hca_attn",
+                "component": "attention",
+                "layer_id": 1,
+                "total_ms": 6.0,
+                "meta": {"s": 128, "compress_ratio": 128, "swa_window": 1},
+            },
+            {
+                "name": "L2.swa_attn",
+                "kind": "swa_attn",
+                "component": "attention",
+                "layer_id": 2,
+                "total_ms": 5.0,
+                "meta": {"swa_window": 128},
+            },
         ],
     )
 
@@ -110,7 +131,8 @@ def test_operator_time_stats_emits_dsv4_csa_hca_and_swa_rows():
     assert by_label["CSA attention block"]["time_ms"] == 10.0
     assert by_label["CSA attention block"]["pct_of_step"] == 0.1
     assert by_label["HCA attention block"]["time_ms"] == 10.0
-    assert by_label["SWA operator"]["time_ms"] == 5.0
+    assert by_label["SWA operator"]["time_ms"] == 18.0
+    assert by_label["SWA operator"]["op_count"] == 3
 
 
 def test_operator_time_stats_emits_dsv32_flashattention_and_mla_rows():

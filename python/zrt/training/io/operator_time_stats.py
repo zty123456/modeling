@@ -124,6 +124,14 @@ def _append_if_present(
     )
 
 
+def _has_swa_window(op: dict) -> bool:
+    kind = str(op.get("kind", "") or "").lower()
+    if kind not in {"sparse_attn", "hca_attn", "swa_attn"}:
+        return False
+    meta = op.get("meta", {}) or {}
+    return _to_float(meta.get("swa_window", 0.0)) > 0
+
+
 def build_operator_time_stats(
     *,
     model: Any,
@@ -170,9 +178,9 @@ def build_operator_time_stats(
             elif cp_type == "hca":
                 hca_ops.append(op)
 
-        swa_ops = [
+        swa_component_ops = [
             op for op in op_dicts
-            if str(op.get("kind", "") or "").lower() == "swa_attn"
+            if _has_swa_window(op)
         ]
 
         _append_if_present(
@@ -182,7 +190,7 @@ def build_operator_time_stats(
             rows, "HCA attention block", hca_ops, step_time_ms, useful_compute_ms, time_scale
         )
         _append_if_present(
-            rows, "SWA operator", swa_ops, step_time_ms, useful_compute_ms, time_scale
+            rows, "SWA operator", swa_component_ops, step_time_ms, useful_compute_ms, time_scale
         )
 
     if _is_dsv32(model):
