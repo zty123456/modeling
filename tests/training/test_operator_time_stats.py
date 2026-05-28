@@ -26,7 +26,7 @@ def _by_label(rows: list[dict]) -> dict[str, dict]:
     return {row["label"]: row for row in rows}
 
 
-def test_operator_time_stats_splits_matmul_family_without_total_or_lm_head_bucket():
+def test_operator_time_stats_splits_matmul_family_and_lm_head_without_total():
     rows = build_operator_time_stats(
         model=_base_model(),
         report=TrainingReport(step_time_ms=100.0, compute_time_ms=40.0),
@@ -48,6 +48,10 @@ def test_operator_time_stats_splits_matmul_family_without_total_or_lm_head_bucke
     assert by_label["MoE/FFN matmul family"]["pct_of_step"] == 0.1
     assert by_label["MoE/FFN matmul family"]["pct_of_useful_compute"] == 0.25
     assert by_label["MoE/FFN matmul family"]["op_count"] == 1
+    assert by_label["LM head matmul"]["time_ms"] == 8.0
+    assert by_label["LM head matmul"]["pct_of_step"] == 0.08
+    assert by_label["LM head matmul"]["pct_of_useful_compute"] == 0.2
+    assert by_label["LM head matmul"]["op_count"] == 1
 
 
 def test_operator_time_stats_counts_compressor_and_indexer_matmuls_as_attention():

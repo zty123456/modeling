@@ -75,6 +75,12 @@ def _is_matmul_op(op: dict) -> bool:
     return str(op.get("kind", "") or "").lower() == "matmul"
 
 
+def _is_lm_head_op(op: dict) -> bool:
+    kind = str(op.get("kind", "") or "").lower()
+    name = str(op.get("name", "") or "").lower()
+    return kind == "lm_head" or name == "lm_head" or name.endswith(".lm_head")
+
+
 def _has_any_name_marker(op: dict, markers: tuple[str, ...]) -> bool:
     name = str(op.get("name", "") or "").lower()
     return any(marker in name for marker in markers)
@@ -235,6 +241,14 @@ def build_operator_time_stats(
         rows,
         "MoE/FFN matmul family",
         [op for op in op_dicts if _is_ffn_matmul_op(op)],
+        step_time_ms,
+        useful_compute_ms,
+        time_scale,
+    )
+    _append_if_present(
+        rows,
+        "LM head matmul",
+        [op for op in op_dicts if _is_lm_head_op(op)],
         step_time_ms,
         useful_compute_ms,
         time_scale,
