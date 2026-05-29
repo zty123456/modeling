@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .schemas import EstimateRequest, JobResponse, JobStatus, SearchRequest, TraceRequest
+from . import stats
 
 # Ensure 'python/' is on sys.path so that zrt.* imports inside the training
 # module (which uses 'from zrt.*') resolve correctly.
@@ -205,6 +206,12 @@ def get_model_raw(key: str):
     return {"content": cfg.read_text(encoding="utf-8")}
 
 
+@app.get("/stats", tags=["utility"], summary="Aggregate task submission counts")
+def get_stats():
+    """Totals per task kind across all users (per-user detail lives in stats.json)."""
+    return stats.read_totals()
+
+
 # ── Job polling ───────────────────────────────────────────────────────────────
 
 @app.get("/jobs", tags=["jobs"], summary="List all submitted jobs")
@@ -274,6 +281,10 @@ def _resolve_job_artifact(job_id: str, filename: str) -> Path:
 )
 def submit_trace(req: TraceRequest, bg: BackgroundTasks):
     job_id = _new_job()
+    try:
+        stats.record_submission(req.username, "trace")
+    except Exception:
+        pass
     bg.add_task(_trace_worker, job_id, req)
     return _snapshot(job_id)
 
@@ -412,6 +423,10 @@ def submit_estimate(req: EstimateRequest, bg: BackgroundTasks):
     if not req.config_path and not req.config_content:
         raise HTTPException(422, detail="Provide either config_path or config_content")
     job_id = _new_job()
+    try:
+        stats.record_submission(req.username, "estimate")
+    except Exception:
+        pass
     bg.add_task(_estimate_worker, job_id, req)
     return _snapshot(job_id)
 
@@ -577,6 +592,10 @@ def submit_search(req: SearchRequest, bg: BackgroundTasks):
     if not req.config_path and not req.config_content:
         raise HTTPException(422, detail="Provide either config_path or config_content")
     job_id = _new_job()
+    try:
+        stats.record_submission(req.username, "search")
+    except Exception:
+        pass
     bg.add_task(_search_worker, job_id, req)
     return _snapshot(job_id)
 
