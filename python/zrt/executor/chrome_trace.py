@@ -1,9 +1,9 @@
 """Chrome Trace exporter — convert pipeline scheduling results to JSON.
 
 Supports three input types:
-  - ``PPStitchedTimeline``   : per-stage x microbatch pipeline grid tasks
-  - ``Timeline`` (per-stage) : per-op trace from DAGScheduler
-  - ``List[Timeline]``       : multi-stage per-op trace, one per GPU
+  - ``PPStitchedTimeline``   : device x microbatch pipeline grid tasks
+  - ``Timeline`` (per-device) : per-op trace from DAGScheduler
+  - ``List[Timeline]``       : multi-device per-op trace, one per GPU
 
 Chrome Trace event format (JSON array of dicts):
 
@@ -11,18 +11,22 @@ Chrome Trace event format (JSON array of dicts):
     "ph":  "X",            // complete event (has duration)
     "name": "op_name",     // display name
     "cat":  "compute",     // category for filtering
-    "pid":  stage_id,      // process = pipeline stage
-    "tid":  stream_id,     // thread  = compute/comm stream within stage
+    "pid":  device_id,     // process = GPU device
+    "tid":  stage_or_stream,  // thread = virtual stage or compute/comm stream
     "ts":   123456.0,      // timestamp in microseconds
     "dur":  789.0,         // duration in microseconds
     "args": {"desc": "..."}
   }
 
+  VPP (Virtual Pipeline Parallelism): devices with multiple virtual stages
+  show each stage on a separate thread (tid).  This gives the "mbs blocks"
+  visual grouping in Chrome Trace.
+
 Usage
 -----
 >>> from python.zrt.executor.chrome_trace import ChromeTraceExporter
 >>> exporter = ChromeTraceExporter()
->>> exporter.export_stitched(result, "pipeline.json")      # PP grid
+>>> exporter.export_stitched(result, "pipeline.json")      # PP grid (device view)
 >>> exporter.export_per_stage(timelines, "detail.json")    # per-op detail
 >>> exporter.export_combined(result, timelines, "all.json") # combined
 """
@@ -138,36 +142,85 @@ class ChromeTraceExporter:
     def _thread_sort_index_meta(pid: int, tid: int, sort_index: int) -> dict:
         return {"ph": "M", "pid": pid, "tid": tid, "ts": 0, "name": "thread_sort_index", "args": {"sort_index": sort_index}}
 
-    def _grid_meta_events(self, pp: int) -> list[dict]:
+    # ── device layout helpers (VPP support) ─────────────────────────────
+
+    @staticmethod
+    def _compute_device_layout(
+        result: "PPStitchedTimeline",
+    ) -> tuple[int, dict[int, list[int]], dict[tuple[int, int], int]]:
+        """Compute VPP layout from stitched timeline.
+
+        Returns
+        -------
+        vpp : int
+            Max number of virtual stages per device.
+        device_stages : dict[int, list[int]]
+            device_id → sorted list of stage_ids on that device.
+        stage_to_tid : dict[(device_id, stage_id), int]
+            Maps (device, virtual_stage) → thread index on that device.
+        """
+        stages_per_dev: dict[int, set[int]] = {}
+        for task in result.tasks:
+            stages_per_dev.setdefault(task.stream_id, set()).add(task.stage_id)
+        device_stages: dict[int, list[int]] = {
+            d: sorted(s) for d, s in stages_per_dev.items()
+        }
+        vpp = max(len(s) for s in device_stages.values()) if device_stages else 1
+        stage_to_tid: dict[tuple[int, int], int] = {}
+        for d, stages in device_stages.items():
+            for idx, s in enumerate(stages):
+                stage_to_tid[(d, s)] = idx
+        return vpp, device_stages, stage_to_tid
+
+    def _grid_meta_events(
+        self, pp: int, *, vpp: int = 1,
+        device_stages: dict[int, list[int]] | None = None,
+    ) -> list[dict]:
         meta: list[dict] = []
-        for s in range(pp):
-            meta.append(self._process_name_meta(s, f"Stage {s}"))
-            meta.append(self._sort_index_meta(s, -s))
-            meta.append(self._thread_name_meta(s, 0, "Grid Schedule"))
+        for d in range(pp):
+            meta.append(self._process_name_meta(d, f"GPU {d}"))
+            meta.append(self._sort_index_meta(d, d))
+            if vpp <= 1:
+                meta.append(self._thread_name_meta(d, 0, "Grid Schedule"))
+            else:
+                stages = (device_stages or {}).get(d, [])
+                for idx, s in enumerate(stages):
+                    meta.append(self._thread_name_meta(d, idx, f"Stage {s}"))
+                    meta.append(self._thread_sort_index_meta(d, idx, idx))
         return meta
 
     def _per_stage_meta_events(self, pp: int) -> list[dict]:
         meta: list[dict] = []
-        for s in range(pp):
-            meta.append(self._process_name_meta(s, f"Stage {s}"))
-            meta.append(self._sort_index_meta(s, -s))
-            meta.append(self._thread_name_meta(s, 0, "Compute Ops"))
-            meta.append(self._thread_sort_index_meta(s, 0, 0))
-            meta.append(self._thread_name_meta(s, 1, "Comm Ops"))
-            meta.append(self._thread_sort_index_meta(s, 1, 1))
+        for d in range(pp):
+            meta.append(self._process_name_meta(d, f"GPU {d}"))
+            meta.append(self._sort_index_meta(d, d))
+            meta.append(self._thread_name_meta(d, 0, "Compute Ops"))
+            meta.append(self._thread_sort_index_meta(d, 0, 0))
+            meta.append(self._thread_name_meta(d, 1, "Comm Ops"))
+            meta.append(self._thread_sort_index_meta(d, 1, 1))
         return meta
 
-    def _combined_meta_events(self, pp: int) -> list[dict]:
+    def _combined_meta_events(
+        self, pp: int, *, vpp: int = 1,
+        device_stages: dict[int, list[int]] | None = None,
+    ) -> list[dict]:
         meta: list[dict] = []
-        for s in range(pp):
-            meta.append(self._process_name_meta(s, f"Stage {s}"))
-            meta.append(self._sort_index_meta(s, -s))
-            meta.append(self._thread_name_meta(s, 0, "Grid Schedule"))
-            meta.append(self._thread_sort_index_meta(s, 0, 0))
-            meta.append(self._thread_name_meta(s, 2, "Compute Ops"))
-            meta.append(self._thread_sort_index_meta(s, 2, 1))
-            meta.append(self._thread_name_meta(s, 3, "Comm Ops"))
-            meta.append(self._thread_sort_index_meta(s, 3, 2))
+        detail_base = max(vpp, 2)
+        for d in range(pp):
+            meta.append(self._process_name_meta(d, f"GPU {d}"))
+            meta.append(self._sort_index_meta(d, d))
+            if vpp <= 1:
+                meta.append(self._thread_name_meta(d, 0, "Grid Schedule"))
+                meta.append(self._thread_sort_index_meta(d, 0, 0))
+            else:
+                stages = (device_stages or {}).get(d, [])
+                for idx, s in enumerate(stages):
+                    meta.append(self._thread_name_meta(d, idx, f"Stage {s}"))
+                    meta.append(self._thread_sort_index_meta(d, idx, idx))
+            meta.append(self._thread_name_meta(d, detail_base + 0, "Compute Ops"))
+            meta.append(self._thread_sort_index_meta(d, detail_base + 0, vpp))
+            meta.append(self._thread_name_meta(d, detail_base + 1, "Comm Ops"))
+            meta.append(self._thread_sort_index_meta(d, detail_base + 1, vpp + 1))
         return meta
 
     # ── deduplication ─────────────────────────────────────────────────────
@@ -197,35 +250,36 @@ class ChromeTraceExporter:
 
     # ── public API ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _actual_n_stages(result: "PPStitchedTimeline") -> int:
-        return max((t.stage_id for t in result.tasks), default=result.pp) + 1 if result.tasks else result.pp
-
     def export_stitched(
         self, result: "PPStitchedTimeline", path: str | None = None,
     ) -> str:
-        """Export PPStitchedTimeline (stage x microbatch grid).
+        """Export PPStitchedTimeline (device x microbatch grid).
 
-        Each GridTask becomes one trace event.  pid = stage_id,
-        tid = 0 (grid schedule).  Same microbatch index gets the same
-        colour across all stages via ``cat = mb_{mb}``.
+        pid = device (stream_id), tid = stage chunk index within device.
 
-        Metadata events name each process "Stage N" and thread
-        "Grid Schedule".
+        For VPP, each device gets one thread per virtual stage so the
+        grid blocks for each stage appear in separate rows within the
+        same GPU process.
+
+        Metadata events name each process "GPU N" and threads
+        "Stage N" (VPP) or "Grid Schedule".
         """
         events: list[dict] = []
-        n_stages = self._actual_n_stages(result)
-        events.extend(self._grid_meta_events(n_stages))
+        n_devices = result.pp
+        vpp, device_stages, stage_to_tid = self._compute_device_layout(result)
+        events.extend(self._grid_meta_events(n_devices, vpp=vpp, device_stages=device_stages))
 
         for task in result.tasks:
             cat = self._grid_cat(task)
             name = self._name_for_task(task)
             color_val = self._color_for_task(task)
+            pid = task.stream_id
+            tid = stage_to_tid.get((pid, task.stage_id), 0)
             events.append(ChromeTraceEvent(
                 name=name,
                 cat=cat,
-                pid=task.stage_id,
-                tid=0,
+                pid=pid,
+                tid=tid,
                 ts=task.start_us * self._mult,
                 dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
                 color=color_val,
@@ -233,24 +287,25 @@ class ChromeTraceExporter:
                     "phase": task.phase,
                     "mb": task.mb_id,
                     "stage": task.stage_id,
+                    "device": pid,
                     "dep_count": len(task.dependencies),
                 },
             ).to_dict())
 
         if result.warmup_us > 0:
-            for s in range(n_stages):
+            for d in range(n_devices):
                 events.append(self._instant(
                     name=_NAMES.get("warmup", "warmup"),
-                    pid=s, tid=0,
+                    pid=d, tid=0,
                     ts=result.warmup_us * self._mult,
                     args={"phase": "warmup", "dur_us": result.warmup_us},
                 ))
         if result.cooldown_us > 0:
             cooldown_ts = (result.step_time_us - result.cooldown_us) * self._mult
-            for s in range(n_stages):
+            for d in range(n_devices):
                 events.append(self._instant(
                     name=_NAMES.get("cooldown", "cooldown"),
-                    pid=s, tid=0,
+                    pid=d, tid=0,
                     ts=cooldown_ts,
                     args={"phase": "cooldown", "dur_us": result.cooldown_us},
                 ))
@@ -269,19 +324,23 @@ class ChromeTraceExporter:
         pp_stitched: "PPStitchedTimeline | None" = None,
         replicate: bool = True,
     ) -> str:
-        """Export per-stage DAGScheduler Timelines (per-op detail).
+        """Export per-device DAGScheduler Timelines (per-op detail).
 
-        ``timelines[s]`` maps to ``pid=s``.  Within each stage, ops on
-        different streams are rendered on separate ``tid`` values
-        (0 = "Compute Ops", 1 = "Comm Ops").
+        ``timelines[d]`` maps to ``pid=d`` (one process per GPU).
+        Within each device, ops on different streams are rendered on
+        separate ``tid`` values (0 = "Compute Ops", 1 = "Comm Ops").
 
         When ``replicate=True`` and ``M > 1``, each microbatch's ops are
         expanded as time-offset replicas aligned with the pipeline grid
         schedule.  When ``replicate=False``, only one clean reference copy
-        of each per-stage timeline is exported.
+        of each per-device timeline is exported.
 
         Zero-latency ops receive a minimum visible duration so they
         are not invisible in Chrome Trace.
+
+        For VPP, each device's single Timeline already aggregates all
+        virtual stages — the per-stage distinction is visible in the
+        corresponding grid view (export_stitched / export_stitched_detailed).
         """
         pp = len(timelines)
         events: list[dict] = []
@@ -352,28 +411,36 @@ class ChromeTraceExporter:
         timelines: list["Timeline"],
         path: str | None = None,
     ) -> str:
-        """Combined export: PP grid + per-stage op detail shared on same pids.
+        """Combined export: PP grid + per-device op detail shared on same pids.
 
-        pid = stage_id (0 .. pp-1 or eff_pp-1 for virtual-stage schedules).
+        pid = device id (stream_id).
 
-        Within each stage:
-          tid 0 = "Grid Schedule"   — grid-level FWD/BWD blocks, coloured by mb
-          tid 2 = "Compute Ops"     — per-op compute detail (reference copy)
-          tid 3 = "Comm Ops"        — per-op communication detail (reference copy)
+        Within each device:
+          tid 0..vpp-1  = "Grid Schedule" per virtual stage (VPP) or
+                          tid 0 = "Grid Schedule" (non-VPP)
+          tid base+0    = "Compute Ops"    (per-op compute detail)
+          tid base+1    = "Comm Ops"       (per-op communication detail)
+          base = max(vpp, 2)
 
         Grid task categories use ``mb_{mb}`` so the same
         microbatch index gets the same colour across all stages.
         """
-        n_stages = self._actual_n_stages(stitched)
+        n_devices = stitched.pp
+        vpp, device_stages, stage_to_tid = self._compute_device_layout(stitched)
+        detail_base = max(vpp, 2)
         events: list[dict] = []
-        events.extend(self._combined_meta_events(n_stages))
+        events.extend(self._combined_meta_events(
+            n_devices, vpp=vpp, device_stages=device_stages,
+        ))
 
         for task in stitched.tasks:
+            pid = task.stream_id
+            tid = stage_to_tid.get((pid, task.stage_id), 0)
             events.append(ChromeTraceEvent(
                 name=self._name_for_task(task),
                 cat=self._grid_cat(task),
-                pid=task.stage_id,
-                tid=0,
+                pid=pid,
+                tid=tid,
                 ts=task.start_us * self._mult,
                 dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
                 color=self._color_for_task(task),
@@ -381,12 +448,13 @@ class ChromeTraceExporter:
                     "phase": task.phase,
                     "mb": task.mb_id,
                     "stage": task.stage_id,
+                    "device": pid,
                     "view": "grid",
                     "dep_count": len(task.dependencies),
                 },
             ).to_dict())
 
-        for s, tl in enumerate(timelines):
+        for d, tl in enumerate(timelines):
             for op in tl.scheduled_ops:
                 cat = "communication" if op.stream_type == "comm" else "compute"
                 name = f"{op.phase}:{op.op_type}" if op.phase else op.op_type
@@ -394,8 +462,8 @@ class ChromeTraceExporter:
                 events.append(ChromeTraceEvent(
                     name=name,
                     cat=cat,
-                    pid=s,
-                    tid=2 + op.stream_id,
+                    pid=d,
+                    tid=detail_base + op.stream_id,
                     ts=op.start_us * self._mult,
                     dur=dur_us * self._mult,
                     args={
@@ -418,20 +486,25 @@ class ChromeTraceExporter:
         timelines: list["Timeline"],
         path: str | None = None,
     ) -> str:
-        """Stitched grid with per-stage detail on separate tids (same pid).
+        """Stitched grid with per-device detail on separate tids (same pid).
 
-        pid = stage_id (0 .. pp-1 or eff_pp-1 for virtual-stage schedules).
-        Within each stage:
-          tid 0              = grid-level fwd/bwd blocks, coloured by mb
-          tid 2 + stream_id  = per-op detail from DAGScheduler Timeline
+        pid = device id (stream_id).
+        Within each device:
+          tid 0..vpp-1       = grid-level fwd/bwd blocks per virtual stage
+          tid base + 0..N    = per-op detail from DAGScheduler Timeline
+          base = max(vpp, 2)
 
         All microbatches share the same detail rows — they are distinguished
         by time offsets from the pipeline schedule, naturally serialised on
         their physical stream.
         """
-        n_stages = self._actual_n_stages(stitched)
+        n_devices = stitched.pp
+        vpp, device_stages, stage_to_tid = self._compute_device_layout(stitched)
+        detail_base = max(vpp, 2)
         events: list[dict] = []
-        events.extend(self._combined_meta_events(n_stages))
+        events.extend(self._combined_meta_events(
+            n_devices, vpp=vpp, device_stages=device_stages,
+        ))
 
         grid_index: dict[tuple[int, int, str], float] = {}
         for task in stitched.tasks:
@@ -439,31 +512,36 @@ class ChromeTraceExporter:
             grid_index[key] = task.start_us
 
         for task in stitched.tasks:
+            pid = task.stream_id
+            tid = stage_to_tid.get((pid, task.stage_id), 0)
             events.append(ChromeTraceEvent(
                 name=self._name_for_task(task),
                 cat=self._grid_cat(task),
-                pid=task.stage_id,
-                tid=0,
+                pid=pid,
+                tid=tid,
                 ts=task.start_us * self._mult,
                 dur=max(task.latency_us, self._MIN_VISIBLE_US) * self._mult,
                 color=self._color_for_task(task),
-                args={"phase": task.phase, "mb": task.mb_id, "view": "grid"},
+                args={
+                    "phase": task.phase, "mb": task.mb_id,
+                    "stage": task.stage_id, "device": pid, "view": "grid",
+                },
             ).to_dict())
 
-        for s, tl in enumerate(timelines):
+        for d, tl in enumerate(timelines):
             fwd_lat = tl.phase_latency("fwd")
             bwd_lat = tl.phase_latency("bwd")
 
             for m in range(stitched.M):
-                fwd_base = grid_index.get((s, m, "fwd"), 0.0)
+                fwd_base = grid_index.get((d, m, "fwd"), 0.0)
                 for op in tl.scheduled_ops:
                     if op.phase == "fwd":
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
                         events.append(ChromeTraceEvent(
                             name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
                             cat="compute" if op.stream_type != "comm" else "communication",
-                            pid=s,
-                            tid=2 + op.stream_id,
+                            pid=d,
+                            tid=detail_base + op.stream_id,
                             ts=(fwd_base + op.start_us) * self._mult,
                             dur=dur_us * self._mult,
                             args={
@@ -474,7 +552,7 @@ class ChromeTraceExporter:
                             },
                         ).to_dict())
 
-                bwd_base = grid_index.get((s, m, "bwd"), grid_index.get((s, m, "bwd_dx"), 0.0))
+                bwd_base = grid_index.get((d, m, "bwd"), grid_index.get((d, m, "bwd_dx"), 0.0))
                 for op in tl.scheduled_ops:
                     if "bwd" in op.phase:
                         dur_us = max(op.latency_us, self._MIN_VISIBLE_US) if op.stream_type == "comm" else op.latency_us
@@ -482,8 +560,8 @@ class ChromeTraceExporter:
                         events.append(ChromeTraceEvent(
                             name=f"m{m}:{op.phase}:{op.op_type}" if op.phase else f"m{m}:{op.op_type}",
                             cat="compute" if op.stream_type != "comm" else "communication",
-                            pid=s,
-                            tid=2 + op.stream_id,
+                            pid=d,
+                            tid=detail_base + op.stream_id,
                             ts=(bwd_base + relative_start) * self._mult,
                             dur=dur_us * self._mult,
                             args={

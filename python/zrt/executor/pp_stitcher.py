@@ -173,19 +173,6 @@ def _add_cross_stage_p2p(
     Forward:  G[s][m].fwd → G[s+1][m].fwd
     Backward: G[s+1][m].bwd → G[s][m].bwd
              (also bwd_dx/bwd_dw for ZeroBubble schedules)
-
-    P2P transfer time is modelled as a *delayed dependency*: the
-    receiving task cannot begin until the per-edge P2P latency after
-    the sender finishes.  When per-edge dicts (``p2p_fwd_us``,
-    ``p2p_bwd_us``) are provided they take precedence; otherwise
-    ``default_p2p_us`` is used for every edge.
-
-    The per-edge dicts are keyed by **physical device** pair
-    ``(phys_src, phys_dst)``.  When ``pp`` differs from
-    ``_phys_device_count`` (VPP / interleaved), the loop index ``s``
-    is a virtual-stage index and is mapped to a physical device
-    before lookup.  Intra-device virtual-stage boundaries have
-    zero P2P latency.
     """
     _fwd = p2p_fwd_us or {}
     _bwd = p2p_bwd_us or {}
@@ -195,11 +182,6 @@ def _add_cross_stage_p2p(
         return vstage % phys_pp
 
     def _lookup_p2p(lookup: dict[tuple[int, int], float], src: int, dst: int) -> float:
-        """Look up P2P latency for physical device pair (src, dst).
-
-        Falls back to reverse-direction value (same link, symmetric BW)
-        for VPP wrap-around pairs, then to default_p2p_us.
-        """
         key = (src, dst)
         if key in lookup:
             return lookup[key]
@@ -228,8 +210,7 @@ def _add_cross_stage_p2p(
                 tasks[bwd_dst].dependencies.append(bwd_src)
                 tasks[bwd_dst].delayed_deps[bwd_src] = p2p
 
-            # ZeroBubble: bwd_dx crosses stages (activation gradient P2P);
-            # bwd_dw is local (weight gradient stays within stage).
+            # ZeroBubble: bwd_dx crosses stages (activation gradient P2P)
             zb_src = _task_id(s + 1, m, "bwd_dx")
             zb_dst = _task_id(s, m, "bwd_dx")
             if zb_src in tasks and zb_dst in tasks:
@@ -245,41 +226,11 @@ def _add_device_serial_1f1b(
     pp: int,
     M: int,
 ) -> None:
-    """Edge ③ (1F1B): per-device 1F1B execution order.
-
-    The device serial is split into TWO independent chains:
-
-      Chain A (warmup forwards):
-        F[0] → F[1] → ... → F[w-1]          (w = pp - s)
-
-      Chain B (alternating + cooldown):
-        B[0] → F[w] → B[1] → F[w+1] → ... → B[M-1]
-
-    NO edge connects Chain A to Chain B.  When the warmup phase finishes
-    and B[0] has all its data-dependency requirements satisfied (activation
-    dep F[0]→B[0] ✓, cross-stage backward B[s+1][0]→B[s][0] ✓), the list
-    scheduler will naturally place B[0] on the freed device.
-
-    This separation is critical: connecting warmup→alternating would
-    force ALL warmup forwards to complete before any backward, which
-    destroys pipeline overlap — see Edge ② cross-stage backward.
-
-    Example (pp=4, M=6):
-
-      Stage 0 (w=4):
-        Chain A:  F₀ → F₁ → F₂ → F₃
-        Chain B:           B₀ → F₄ → B₁ → F₅ → B₂ → B₃ → B₄ → B₅
-
-      Stage 3 (w=1):
-        Chain A:  F₀
-        Chain B:  B₀ → F₁ → B₁ → F₂ → B₂ → F₃ → B₃ → F₄ → B₄ → F₅ → B₅
-    """
-
+    """Edge ③ (1F1B): per-device 1F1B execution order."""
     def _warmup_tasks(s: int, w: int) -> list[tuple[int, str]]:
         return [(m, "fwd") for m in range(min(w, M))]
 
     def _alternating_tasks(s: int, w: int) -> list[tuple[int, str]]:
-        """B[0]→F[w]→B[1]→F[w+1]→...→B[M-1] alternating + cooldown."""
         order: list[tuple[int, str]] = []
         b_idx = 0
         f_idx = w
@@ -295,13 +246,73 @@ def _add_device_serial_1f1b(
         return order
 
     for s in range(pp):
-        w = pp - s  # warmup count
-
-        # Chain A: warmup forwards
+        w = pp - s
         _chain_on_device(tasks, s, _warmup_tasks(s, w))
-
-        # Chain B: alternating + cooldown  (no edge from chain A!)
         _chain_on_device(tasks, s, _alternating_tasks(s, w))
+
+
+def _add_device_serial_interleaved(
+    tasks: dict[str, GridTask],
+    phys_pp: int,
+    vpp_chunks: int,
+    M: int,
+) -> None:
+    """Edge ③ (Interleaved 1F1B / VPP): Per-device multi-vstage serialization."""
+    total_vstages = phys_pp * vpp_chunks
+
+    for dev in range(phys_pp):
+        my_fwds = [v for v in range(total_vstages) if v % phys_pp == dev]
+        my_bwds = [v for v in range(total_vstages) if (total_vstages - 1 - v) % phys_pp == dev]
+        my_bwds.sort(reverse=True)
+
+        for v in my_fwds:
+            _chain_on_device(tasks, v, [(m, "fwd") for m in range(M)])
+        for v in my_bwds:
+            _chain_on_device(tasks, v, [(m, "bwd") for m in range(M)])
+
+
+def _add_device_serial_zb(
+    tasks: dict[str, GridTask],
+    pp: int,
+    M: int,
+) -> None:
+    """Edge ③ (ZeroBubble): Enforce standard 1F1B microbatch interleaving for F/DX.
+
+    Crucially, bwd_dw has NO sequential constraints on subsequent microbatches,
+    allowing the scheduler to defer it and seamlessly pack it into pipeline bubbles.
+    """
+    def _warmup_tasks(s: int, w: int) -> list[tuple[int, str]]:
+        return [(m, "fwd") for m in range(min(w, M))]
+
+    def _alternating_tasks(s: int, w: int) -> list[tuple[int, str]]:
+        order: list[tuple[int, str]] = []
+        b_idx = 0
+        f_idx = w
+        while f_idx < M:
+            if b_idx < M:
+                order.append((b_idx, "bwd_dx"))
+            order.append((f_idx, "fwd"))
+            b_idx += 1
+            f_idx += 1
+        while b_idx < M:
+            order.append((b_idx, "bwd_dx"))
+            b_idx += 1
+        return order
+
+    for s in range(pp):
+        w = pp - s
+        # Ensure microbatch order is respected for F/DX chains (Chain A & Chain B)
+        _chain_on_device(tasks, s, _warmup_tasks(s, w))
+        _chain_on_device(tasks, s, _alternating_tasks(s, w))
+
+        # Local dependencies per microbatch
+        for m in range(M):
+            bwd_dx_id = _task_id(s, m, "bwd_dx")
+            bwd_dw_id = _task_id(s, m, "bwd_dw")
+
+            # Gradient chain rule: activation gradient (dx) before weight gradient (dw)
+            if bwd_dx_id in tasks and bwd_dw_id in tasks:
+                tasks[bwd_dw_id].dependencies.append(bwd_dx_id)
 
 
 def _chain_on_device(
@@ -325,35 +336,10 @@ def _add_device_serial_dualpipe(
     pp: int,
     M: int,
 ) -> None:
-    """Edge ③ (DualPipe): per-device execution order with dual-stream skip.
-
-    Two parallel streams per device:
-      Stream A:  F₀→F₁→B₀→F₂→B₁→F₃→B₂→...  (skipping pattern)
-      Stream B:  B₀→B₁→F₀→B₂→F₁→B₃→F₂→...  (reversed, offset)
-
-    Dependencies added per device:
-      1. Forward chain: F[m] → F[m+1]  (serial microbatch order)
-      2. Backward chain: B[m] → B[m+1]  (serial microbatch order)
-      3. Dual skip: B[m] → F[m+2]       (anti-parallel hand-off after each bwd)
-
-    Forward-chain and backward-chain make the per-device ordering explicit,
-    preventing the list scheduler from constructing sub-optimal schedules
-    when stage loads are imbalanced (the chain constrains microbatches to
-    execute in natural order, giving DualPipe's anti-parallel skip a
-    predictable base to work from).
-    """
+    """Edge ③ (DualPipe): per-device execution order with dual-stream skip."""
     for s in range(pp):
-        # Forward chain: F[0] → F[1] → ... → F[M-1]
-        _chain_on_device(
-            tasks, s,
-            [(m, "fwd") for m in range(M)],
-        )
-        # Backward chain: B[0] → B[1] → ... → B[M-1]
-        _chain_on_device(
-            tasks, s,
-            [(m, "bwd") for m in range(M)],
-        )
-        # DualPipe skip: B[m] → F[m+2]  (anti-parallel stream hand-off)
+        _chain_on_device(tasks, s, [(m, "fwd") for m in range(M)])
+        _chain_on_device(tasks, s, [(m, "bwd") for m in range(M)])
         for m in range(M):
             bwd_id = _task_id(s, m, "bwd")
             if m + 2 < M:
@@ -368,20 +354,7 @@ def _add_device_serial_dualpipe_v(
     vpp: int,
     M: int,
 ) -> None:
-    """Edge ③ (DualPipeV with V>1): cross-vstage DualPipe hand-off.
-
-    Each physical device holds virtual stages from both the forward
-    pipeline (v < eff_pp/2) and the backward pipeline (v >= eff_pp/2).
-    The two pipelines run concurrently on the device — the cross-vstage
-    skip creates the anti-parallel hand-off:
-
-      B_{B-first}[m] → F_{F-first}[m+2]
-
-    No F-chain/B-chain are added; the list scheduler's stream_id constraint
-    naturally serializes tasks on the same physical device.  The cross-vstage
-    skip is the minimal edge needed to express the DualPipe bidirectional
-    interleaving when V>1.
-    """
+    """Edge ③ (DualPipeV with V>1): cross-vstage DualPipe hand-off."""
     eff_pp = pp * vpp
     pivot = eff_pp // 2
 
@@ -398,40 +371,6 @@ def _add_device_serial_dualpipe_v(
                     tasks[next_fwd_id].dependencies.append(bwd_id)
 
 
-def _add_device_serial_zb(
-    tasks: dict[str, GridTask],
-    pp: int,
-    M: int,
-) -> None:
-    """Edge ③ (ZeroBubble): split bwd into bwd_dx and bwd_dw on the grid.
-
-    Two intra-device constraints beyond the base P2P + activation edges:
-
-      1. bwd_dx[m] → F[m+1]   (same as before: next fwd waits for dx)
-      2. bwd_dx[m] → bwd_dw[m] (activation gradient must complete before
-         weight-gradient computation — gradient chain of dependence)
-
-    bwd_dw has NO dependency on F[m+1], allowing the weight-gradient
-    computation to be deferred arbitrarily and fill pipeline bubbles.
-    """
-    for s in range(pp):
-        for m in range(M):
-            bwd_dx_id = _task_id(s, m, "bwd_dx")
-            bwd_dw_id = _task_id(s, m, "bwd_dw")
-
-            # bwd_dx[m] → bwd_dw[m]: gradient chain (dx before dw)
-            if bwd_dx_id in tasks and bwd_dw_id in tasks:
-                if bwd_dx_id not in tasks[bwd_dw_id].dependencies:
-                    tasks[bwd_dw_id].dependencies.append(bwd_dx_id)
-
-            # bwd_dx[m] → F[m+1]: existing constraint
-            if m + 1 < M:
-                next_fwd_id = _task_id(s, m + 1, "fwd")
-                if bwd_dx_id in tasks and next_fwd_id in tasks:
-                    if bwd_dx_id not in tasks[next_fwd_id].dependencies:
-                        tasks[next_fwd_id].dependencies.append(bwd_dx_id)
-
-
 def _task_id(stage_id: int, mb_id: int, phase: str) -> str:
     return f"s{stage_id}_m{mb_id}_{phase}"
 
@@ -439,11 +378,7 @@ def _task_id(stage_id: int, mb_id: int, phase: str) -> str:
 # ── list scheduler ────────────────────────────────────────────────────────────
 
 def _list_schedule(tasks: dict[str, GridTask]) -> list[GridTask]:
-    """List scheduling over grid tasks.
-
-    Each device (stream) is serial.  Data dependencies across devices
-    are respected via predecessor end-time checking.
-    """
+    """List scheduling over grid tasks."""
     device_free: dict[int, float] = {}
     finish: dict[str, float] = {}
     ready: list[GridTask] = []
@@ -456,9 +391,6 @@ def _list_schedule(tasks: dict[str, GridTask]) -> list[GridTask]:
 
     scheduled: list[GridTask] = []
     while ready:
-        # Pick task with earliest possible start time (greedy).
-        # For tasks with delayed_deps, the effective predecessor finish
-        # is bumped by the per-dependency delay (cross-stage P2P gap).
         ready.sort(key=lambda t: max(
             device_free.get(t.stream_id, 0.0),
             max(
@@ -471,7 +403,6 @@ def _list_schedule(tasks: dict[str, GridTask]) -> list[GridTask]:
         ))
         task = ready.pop(0)
 
-        # Data dependency: wait for all predecessors, plus any delayed-dep gap
         pred_done = max(
             (
                 finish.get(d, 0.0) + task.delayed_deps.get(d, 0.0)
@@ -479,7 +410,6 @@ def _list_schedule(tasks: dict[str, GridTask]) -> list[GridTask]:
             ),
             default=0.0,
         )
-        # Resource constraint: wait for device to be free
         dev_free = device_free.get(task.stream_id, 0.0)
 
         task.start_us = max(pred_done, dev_free)
@@ -719,22 +649,13 @@ class PPStitcher:
         kind: PPScheduleKind,
         eff_pp: int,
     ) -> None:
-        """Apply per-device serialization edges (Edge ③).
-
-        For 1F1B/VPP (interleaved) without VPP, explicit device-serial
-        edges prevent the list scheduler from reordering microbatches.
-
-        For DualPipeV with V>1, explicit F/B chains and cross-vstage
-        DualPipe skip edges are needed to create the bidirectional
-        interleaving — P2P constraints alone cannot express the
-        anti-parallel hand-off between F-first and B-first virtual
-        stages on the same physical device.
-        """
         if kind == PPScheduleKind.ONE_F_ONE_B:
             _add_device_serial_1f1b(task_map, eff_pp, self._M)
         elif kind == PPScheduleKind.INTERLEAVED:
             if self._vpp <= 1:
                 _add_device_serial_1f1b(task_map, eff_pp, self._M)
+            else:
+                _add_device_serial_interleaved(task_map, self._pp, self._vpp, self._M)
         elif kind == PPScheduleKind.DUALPIPE:
             _add_device_serial_dualpipe(task_map, eff_pp, self._M)
         elif kind == PPScheduleKind.DUALPIPE_V:
@@ -753,16 +674,6 @@ class PPStitcher:
         kind: PPScheduleKind,
         eff_pp: int,
     ) -> PPStitchedTimeline:
-        """Compute summary metrics from scheduled tasks.
-
-        Phases for 1F1B:
-            warmup   = time until stage pp-1 starts its first bwd (mb=0)
-            cooldown = time from stage 0 finishing last fwd (mb=M-1) until end
-            steady   = step_time - warmup - cooldown
-
-        Bubble is computed from: step_time - M * per_stage_bottleneck
-        (the part that exceeds ideal serial execution).
-        """
         if not scheduled:
             return PPStitchedTimeline(pp=self._pp, M=self._M)
 
@@ -824,8 +735,6 @@ class PPStitcher:
             bubble_fraction=bubble_us / (max_end - min_start) if max_end > min_start else 0.0,
             p2p_total_gap_us=p2p_gap_us,
         )
-
-    # ── helpers ───────────────────────────────────────────────────────────
 
     def _stitch_pp1(self) -> PPStitchedTimeline:
         """Handle pp=1: single stage, no pipeline."""
