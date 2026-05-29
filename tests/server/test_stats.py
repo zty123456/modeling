@@ -72,3 +72,22 @@ def test_concurrent_records_do_not_lose_counts(stats_file):
     for t in threads:
         t.join()
     assert stats.read_totals()["totals"]["estimate"] == 8 * 50
+
+
+def test_read_totals_survives_wrong_shaped_users(stats_file):
+    stats_file.write_text('{"users": ["alice"]}', encoding="utf-8")
+    assert stats.read_totals() == {
+        "totals": {"trace": 0, "estimate": 0, "search": 0},
+        "total": 0,
+        "users": 0,
+    }
+
+
+def test_read_totals_skips_non_numeric_counts(stats_file):
+    stats_file.write_text(
+        '{"users": {"alice": {"trace": "abc", "estimate": 4}}}', encoding="utf-8"
+    )
+    result = stats.read_totals()
+    assert result["totals"] == {"trace": 0, "estimate": 4, "search": 0}
+    assert result["total"] == 4
+    assert result["users"] == 1

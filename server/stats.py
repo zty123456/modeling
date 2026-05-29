@@ -44,10 +44,16 @@ def _load(path: Path) -> dict:
 
 
 def _atomic_write(path: Path, data: dict) -> None:
+    # Assumes the caller holds _lock — the fixed temp filename is only safe
+    # under the lock.
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _normalize_user(username: str | None) -> str:
@@ -79,10 +85,16 @@ def read_totals() -> dict:
     with _lock:
         data = _load(_stats_path())
     users = data.get("users", {})
+    if not isinstance(users, dict):
+        users = {}
     totals = {kind: 0 for kind in TASK_KINDS}
     for counts in users.values():
         if not isinstance(counts, dict):
             continue
         for kind in TASK_KINDS:
-            totals[kind] += int(counts.get(kind, 0) or 0)
+            val = counts.get(kind, 0)
+            try:
+                totals[kind] += int(val)
+            except (TypeError, ValueError):
+                pass
     return {"totals": totals, "total": sum(totals.values()), "users": len(users)}
