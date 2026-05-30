@@ -275,6 +275,12 @@ def main() -> None:
         help="PP modelling mode: trace = grid-based PPStitcher (default), "
              "formula = classic PipelineComposer.",
     )
+    parser.add_argument(
+        "--tp-coc", action="store_true", default=False,
+        help="Enable CoC (Communication-over-Computation) overlap for TP "
+             "all_reduce.  Comm starts after 1/K of the predecessor compute "
+             "instead of waiting for it to finish (K=4).",
+    )
 
     args = parser.parse_args()
 
@@ -685,6 +691,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         pp_schedule=args.pp_schedule,
         vpp_chunks=args.vpp_chunks,
         pp_mode=args.pp_mode,
+        tp_coc=args.tp_coc,
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,

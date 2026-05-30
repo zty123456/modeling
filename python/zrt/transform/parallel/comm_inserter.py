@@ -109,6 +109,9 @@ class CommInserterPass(GraphPass):
         if tp <= 1:
             return
 
+        coc_enabled = ctx.training.tp_coc if ctx.training else False
+        coc_k = max(2, ctx.training.tp_coc_tile_k if ctx.training else 4)
+
         tp_nodes = [
             n for n in list(g.topo_sort())
             if n.annotations.get("tp_split", {}).get("comm_after") == "all_reduce"
@@ -119,6 +122,10 @@ class CommInserterPass(GraphPass):
                 continue
             comm_node = _make_comm_node(comm_id, "all_reduce", node, tp)
             comm_node.annotations["inserted_by"] = "tp_pass"
+            if coc_enabled:
+                comm_node.attrs["coc_tile_k"] = coc_k
+                comm_node.annotations["overlap_target"] = f"coc:{node.id}"
+                comm_node.annotations["overlap_strategy"] = "tp"
             _rewire(g, node.id, comm_node)
 
     def _insert_ep_comm(self, g: "OpGraph", ctx: "TransformContext") -> None:

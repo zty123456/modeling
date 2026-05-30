@@ -208,7 +208,7 @@ if __name__ == "__main__":
         num_layers_full=61,
         output_dir="output/deepseek_v4/interleaved",
         pp_schedule="interleaved",
-        vpp_chunks=1
+        vpp_chunks=2
     )
     print("interleaved")
     print(report.summary())
@@ -240,3 +240,18 @@ if __name__ == "__main__":
     )
     print("dualpipeV")
     print(report.summary())
+
+    report = estimate_training_from_graphs(
+        forward_graph=result.graphs["train_forward"],
+        backward_graph=result.graphs["train_backward"],
+        hw_spec=hw,
+        tp=8, pp=4, dp=2,
+        total_params=671e9,
+        num_layers_full=61,
+        output_dir="output/deepseek_v4/zerobubble",
+        pp_schedule="zb",
+        vpp_chunks=1
+    )
+    print("zerobubble")
+    print(report.summary())
+

@@ -117,3 +117,21 @@ def test_estimate_job_returns_html_and_excel_artifacts(tmp_path):
     assert (tmp_path / result["excel_filename"]).exists()
     assert "TP*CP*PP*DP" in result["data"]["config_summary"]["parallelism"]
     assert "TP*CP*PP*EP*DP" not in result["data"]["config_summary"]["parallelism"]
+
+
+def test_launcher_collects_username_and_sends_it_with_submissions():
+    html = Path("server/launcher.html").read_text(encoding="utf-8")
+
+    assert "const USER_KEY = 'zrt_username';" in html
+    assert "function currentUsername()" in html
+    assert "body = { ...body, username: currentUsername() };" in html
+    assert "if (!localStorage.getItem(USER_KEY)) openUserModal();" in html
+
+
+def test_launcher_has_stats_popover_hitting_stats_endpoint():
+    html = Path("server/launcher.html").read_text(encoding="utf-8")
+
+    assert 'id="stats-btn"' in html
+    assert "async function openStats()" in html
+    assert "fetch(api()+'/stats')" in html
+    assert 'id="stats-overlay"' in html

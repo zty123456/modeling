@@ -130,7 +130,7 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
 
     # ── Stage 3: Optim ────────────────────────────────────────────────────────
     pipe.add("optim", QuantizationPass(),
-             condition=lambda c: c.quant is not None)
+             condition=lambda c: c.quant is not None or c.quant_profile is not None)
     pipe.add("optim", EPLBPass(),
              condition=lambda c: "eplb" in c.optim_flags)
     pipe.add("optim", SharedExpertPass(),

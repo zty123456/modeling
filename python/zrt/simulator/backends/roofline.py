@@ -166,16 +166,19 @@ def _primary_dtype(node: "OpNode") -> DType:
 
     For compute nodes, activation dtype (inputs[0]) drives tensor-core selection.
     Falls back to output dtype for non-compute or no-input nodes.
-    Also respects quant_act annotation for hypothetical-quant analysis.
+    Respects quant annotations from QuantizationPass.
     """
     if node.category != "compute" or not node.inputs:
         if node.outputs:
             return node.outputs[0].dtype
         return DType.BF16
-    # Annotation path: QuantizationPass wrote quant_act on this node
+    # Priority 1: structured Dtype annotation
+    quant_compute = node.annotations.get("quant.compute")
+    if quant_compute is not None and hasattr(quant_compute, "bytes"):
+        return DType(quant_compute.value)
+    # Priority 2: legacy string annotation
     quant_act = node.annotations.get("quant_act")
     if quant_act and quant_act not in ("bf16", "fp16", "fp32"):
-        # Normalize fp8 alias to fp8_e4m3 (default FP8 format for training)
         normalized = "fp8_e4m3" if quant_act == "fp8" else quant_act
         try:
             return DType(normalized)
@@ -199,15 +202,27 @@ _QUANT_BYTES: dict[str, float] = {
 
 
 def _weight_itemsize(node: "OpNode") -> float:
-    """Return bytes-per-element for the weight tensor, respecting quant_weight annotation."""
-    qw = node.annotations.get("quant_weight", "") if node.annotations else ""
-    return _QUANT_BYTES.get(qw.lower(), 2.0)
+    """Return bytes-per-element for the weight tensor, respecting quant annotations."""
+    ann = node.annotations or {}
+    # Priority 1: structured Dtype annotation (quant.weight)
+    qw = ann.get("quant.weight")
+    if qw is not None and hasattr(qw, "bytes"):
+        return qw.bytes
+    # Priority 2: legacy string annotation (quant_weight)
+    qw_str = ann.get("quant_weight", "")
+    return _QUANT_BYTES.get(qw_str.lower(), 2.0)
 
 
 def _kv_itemsize(node: "OpNode") -> float:
-    """Return bytes-per-element for KV cache tensors, respecting quant_kv annotation."""
-    qkv = node.annotations.get("quant_kv", "") if node.annotations else ""
-    return _QUANT_BYTES.get(qkv.lower(), 2.0)
+    """Return bytes-per-element for KV cache tensors, respecting quant annotations."""
+    ann = node.annotations or {}
+    # Priority 1: structured Dtype annotation (quant.kv_cache)
+    qkv = ann.get("quant.kv_cache")
+    if qkv is not None and hasattr(qkv, "bytes"):
+        return qkv.bytes
+    # Priority 2: legacy string annotation (quant_kv)
+    qkv_str = ann.get("quant_kv", "")
+    return _QUANT_BYTES.get(qkv_str.lower(), 2.0)
 
 
 # ── per-op formula functions ──────────────────────────────────────────────────

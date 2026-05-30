@@ -196,23 +196,23 @@ def _parse_model(d: dict) -> ModelSpec:
         hc_mult=d.get("hc_mult", 1),
         hc_sinkhorn_iters=d.get("hc_sinkhorn_iters", 20),
         # dtypes
-        param_dtype=_parse_dtype(d.get("param_dtype", "bf16")),
-        grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
-        master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
-        act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        param_dtype=Dtype.parse(d.get("param_dtype", "bf16")),
+        grad_dtype=Dtype.parse(d.get("grad_dtype", "fp32")),
+        master_dtype=Dtype.parse(d.get("master_dtype", "fp32")),
+        act_dtype=Dtype.parse(d.get("act_dtype", "bf16")),
         # NEW per-component dtypes (Task 3 added the ModelSpec fields)
-        attn_compute_dtype=_parse_dtype(d.get("attn_compute_dtype", "bf16")),
-        shared_expert_compute_dtype=_parse_dtype(d.get("shared_expert_compute_dtype", "bf16")),
-        routed_expert_compute_dtype=_parse_dtype(d.get("routed_expert_compute_dtype", "bf16")),
-        routed_expert_weight_dtype=_parse_dtype(d["routed_expert_weight_dtype"]) if "routed_expert_weight_dtype" in d else None,
-        attn_weight_dtype=_parse_dtype(d["attn_weight_dtype"]) if "attn_weight_dtype" in d else None,
-        shared_expert_weight_dtype=_parse_dtype(d["shared_expert_weight_dtype"]) if "shared_expert_weight_dtype" in d else None,
-        attn_act_dtype=_parse_dtype(d["attn_act_dtype"]) if "attn_act_dtype" in d else None,
-        moe_act_dtype=_parse_dtype(d["moe_act_dtype"]) if "moe_act_dtype" in d else None,
-        residual_dtype=_parse_dtype(d["residual_dtype"]) if "residual_dtype" in d else None,
-        routed_expert_grad_dtype=_parse_dtype(d.get("routed_expert_grad_dtype", "fp32")),
-        attn_grad_dtype=_parse_dtype(d["attn_grad_dtype"]) if "attn_grad_dtype" in d else None,
-        shared_expert_grad_dtype=_parse_dtype(d["shared_expert_grad_dtype"]) if "shared_expert_grad_dtype" in d else None,
+        attn_compute_dtype=Dtype.parse(d.get("attn_compute_dtype", "bf16")),
+        shared_expert_compute_dtype=Dtype.parse(d.get("shared_expert_compute_dtype", "bf16")),
+        routed_expert_compute_dtype=Dtype.parse(d.get("routed_expert_compute_dtype", "bf16")),
+        routed_expert_weight_dtype=Dtype.parse(d["routed_expert_weight_dtype"]) if "routed_expert_weight_dtype" in d else None,
+        attn_weight_dtype=Dtype.parse(d["attn_weight_dtype"]) if "attn_weight_dtype" in d else None,
+        shared_expert_weight_dtype=Dtype.parse(d["shared_expert_weight_dtype"]) if "shared_expert_weight_dtype" in d else None,
+        attn_act_dtype=Dtype.parse(d["attn_act_dtype"]) if "attn_act_dtype" in d else None,
+        moe_act_dtype=Dtype.parse(d["moe_act_dtype"]) if "moe_act_dtype" in d else None,
+        residual_dtype=Dtype.parse(d["residual_dtype"]) if "residual_dtype" in d else None,
+        routed_expert_grad_dtype=Dtype.parse(d.get("routed_expert_grad_dtype", "fp32")),
+        attn_grad_dtype=Dtype.parse(d["attn_grad_dtype"]) if "attn_grad_dtype" in d else None,
+        shared_expert_grad_dtype=Dtype.parse(d["shared_expert_grad_dtype"]) if "shared_expert_grad_dtype" in d else None,
         # normalization
         norm_kind=d.get("norm_kind", "rmsnorm"),
         model_type=d.get("model_type", "default"),
@@ -442,17 +442,3 @@ def _expand_quant_preset(d: dict) -> dict:
     for key, val in _QUANT_PRESETS[preset_name].items():
         out.setdefault(key, val)
     return out
-
-
-def _parse_dtype(s: str) -> Dtype:
-    s = s.lower().strip()
-    mapping = {
-        "fp32": Dtype.FP32, "float32": Dtype.FP32,
-        "bf16": Dtype.BF16, "bfloat16": Dtype.BF16,
-        "fp16": Dtype.FP16, "float16": Dtype.FP16,
-        "fp8": Dtype.FP8_E4M3, "float8": Dtype.FP8_E4M3,
-        "fp8_e4m3": Dtype.FP8_E4M3,
-        "fp8_e5m2": Dtype.FP8_E5M2,
-        "fp4": Dtype.FP4, "mxfp4": Dtype.FP4, "nvfp4": Dtype.FP4,
-    }
-    return mapping.get(s, Dtype.BF16)

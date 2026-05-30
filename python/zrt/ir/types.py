@@ -1,46 +1,14 @@
-"""IR primitive types: DType enum and TensorMeta."""
+"""IR primitive types: DType (unified with spec Dtype) and TensorMeta."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from enum import Enum
 from typing import Sequence
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DType
-# ─────────────────────────────────────────────────────────────────────────────
-
-class DType(str, Enum):
-    """Unified dtype enum, platform-agnostic."""
-    FP32     = "fp32"
-    FP16     = "fp16"
-    BF16     = "bf16"
-    FP8_E4M3 = "fp8_e4m3"
-    FP8_E5M2 = "fp8_e5m2"
-    INT8     = "int8"
-    INT4     = "int4"
-    INT32    = "int32"
-    INT64    = "int64"
-    UINT8    = "uint8"
-    BOOL     = "bool"
-    UNKNOWN  = "unknown"
-
-    @property
-    def itemsize(self) -> float:
-        """Bytes per element (INT4 returns 0.5)."""
-        _SIZES: dict[str, float] = {
-            "fp32": 4.0, "fp16": 2.0, "bf16": 2.0,
-            "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
-            "int8": 1.0, "int4": 0.5,
-            "int32": 4.0, "int64": 8.0,
-            "uint8": 1.0, "bool": 1.0, "unknown": 2.0,
-        }
-        return _SIZES.get(self.value, 2.0)
-
-    @property
-    def bits(self) -> float:
-        return self.itemsize * 8
+# DType is now a re-export of the unified spec Dtype enum.
+# All members (FP32, BF16, FP8_*, FP4, INT*, BOOL, UNKNOWN) and
+# properties (bytes, itemsize, bits) live in spec/dtype.py.
+from python.zrt.training.spec.dtype import Dtype as DType
 
 
 # ── torch dtype string → DType ────────────────────────────────────────────────

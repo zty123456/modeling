@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from python.zrt.ir.param_count import count_params
+from python.zrt.ir.param_count import count_params, count_params_by_component
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.training.recompute import is_external_recompute_node
 
@@ -193,6 +193,7 @@ class TrainingMemoryPass(GraphPass):
         # Use actual model dtype from metadata (set by FlopsPass/graph capture),
         # fallback to BF16=2 bytes when unavailable.
         param_dtype = g.metadata.get("param_dtype_bytes", 2)
+        quant_profile = getattr(ctx, 'quant_profile', None)
 
         # ── Layer scaling for partial-trace graphs ─────────────────────────────
         # When only a subset of layers is traced, count_params(g) returns the
@@ -235,6 +236,33 @@ class TrainingMemoryPass(GraphPass):
 
         weights_bytes = (total_params * param_dtype) / weight_shard
         grads_bytes = (total_params * param_dtype) / grad_shard
+
+        # ── Per-component dtype sizing when quant_profile available ──────────
+        if quant_profile is not None:
+            from zrt.training.spec.dtype import Dtype
+            comp_params = count_params_by_component(g)
+            if layer_scale != 1.0:
+                comp_params.routed_expert = int(comp_params.routed_expert * layer_scale)
+                comp_params.shared_expert = int(comp_params.shared_expert * layer_scale)
+                comp_params.other = int(comp_params.other * layer_scale)
+                # non_layer (embedding, lm_head, final_norm) captured at full size
+
+            # Weights use stored_bytes (includes FP4 MXFP block overhead for
+            # on-device storage).  Grads use raw .bytes (grads are always
+            # full-precision in memory — no block compression overhead).
+            weights_bytes = (
+                comp_params.routed_expert * quant_profile.routed_expert_weight_dtype.stored_bytes
+                + comp_params.shared_expert * quant_profile.shared_expert_weight_dtype.stored_bytes
+                + comp_params.other * quant_profile.param_dtype.stored_bytes
+                + comp_params.non_layer * quant_profile.param_dtype.stored_bytes
+            ) / weight_shard
+
+            grads_bytes = (
+                comp_params.routed_expert * quant_profile.routed_expert_grad_dtype.bytes
+                + comp_params.shared_expert * quant_profile.shared_expert_grad_dtype.bytes
+                + comp_params.other * quant_profile.grad_dtype.bytes
+                + comp_params.non_layer * quant_profile.grad_dtype.bytes
+            ) / grad_shard
 
         # ── Optimizer state memory ───────────────────────────────────────────────
         # Try to use OptimizerPass annotation first (graph-based modeling)
@@ -545,13 +573,17 @@ class TrainingPipelinePass(GraphPass):
         from python.zrt.executor.pp_stitcher import PPStitcher
         from python.zrt.training.compose.schedules import _dp_hidden, StepResult
 
+        p2p_fwd_us, p2p_bwd_us = _extract_p2p_latency_per_edge(g)
+
         stitcher = PPStitcher(
             stage_fwd_us=stage_fwd,
             stage_bwd_us=stage_bwd,
             stage_bwd_dw_us=stage_bwd_dw,
             pp=pp,
             M=M,
-            p2p_latency_us=_extract_p2p_latency_us(g),
+            p2p_latency_us=0.0,
+            p2p_fwd_us=p2p_fwd_us,
+            p2p_bwd_us=p2p_bwd_us,
             schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
         )
@@ -971,12 +1003,15 @@ class TrainingPipelinePass(GraphPass):
                 formula_total_by_tag[node_tag] += comm_lat
                 formula_hidden_by_tag[node_tag] += formula_hidden
 
-        # Merge: per-strategy overlap = max(trace_hidden, formula_hidden)
+        # Merge: per-strategy overlap = max(trace_hidden, formula_hidden).
+        # Normalise formula totals to per-stage (trace totals are per-stage
+        # bottleneck, formula totals are whole-graph aggregate).
+        formula_div = pp if pp > 1 else 1
         for tag in ("tp", "ep", "pp", "cp"):
             trace_total = getattr(per_strat, f"{tag}_total_us", 0.0)
             trace_hidden = getattr(per_strat, f"{tag}_hidden_us", 0.0)
-            f_total = formula_total_by_tag.get(tag, 0.0)
-            f_hidden = formula_hidden_by_tag.get(tag, 0.0)
+            f_total = formula_total_by_tag.get(tag, 0.0) / formula_div
+            f_hidden = formula_hidden_by_tag.get(tag, 0.0) / formula_div
             merged_total = max(trace_total, f_total)
             merged_hidden = max(trace_hidden, f_hidden)
             setattr(per_strat, f"{tag}_total_us", merged_total)
@@ -1003,9 +1038,20 @@ class TrainingPipelinePass(GraphPass):
         ) * M
         hidden_us = max(0.0, total_comm_us - total_exposed_us)
 
-        if hidden_us > 0:
-            step_time_us -= hidden_us
-            step_time_ms = step_time_us / 1000.0
+        # In trace mode PPStitcher already produces the correct wall-clock
+        # time — DAGScheduler multi-stream scheduling absorbed intra-stage
+        # compute↔comm overlap into stage_fwd / stage_bwd, and PPStitcher
+        # delayed_deps correctly model cross-stage P2P gaps.  The trace
+        # sweep-line hidden_us is informational (for the report) and must
+        # NOT be subtracted from step_time.
+        #
+        # In formula mode the bottleneck-based composers do not model
+        # per-stream parallelism, so formula-based hidden still needs to
+        # be subtracted.
+        if pp_mode != "trace":
+            if hidden_us > 0:
+                step_time_us -= hidden_us
+                step_time_ms = step_time_us / 1000.0
 
         exposed_comm_ms = total_exposed_us / 1000.0
         hidden_comm_ms = hidden_us / 1000.0
@@ -1647,10 +1693,49 @@ class TrainingPipelinePass(GraphPass):
 
 # ── Exposed comm-time helper ────────────────────────────────────────────────────
 
+def _extract_p2p_latency_per_edge(g) -> tuple[dict[tuple[int, int], float], dict[tuple[int, int], float]]:
+    """Extract per-edge P2P latency from send_recv nodes in the graph.
+
+    Groups comm.send_recv nodes by (src_stage, dst_stage, phase), taking
+    the maximum latency per group (bottleneck edge).
+
+    Returns
+    -------
+    fwd_us : dict[tuple[int,int], float]
+        Forward P2P latency keyed by (src_stage, dst_stage).
+    bwd_us : dict[tuple[int,int], float]
+        Backward P2P latency keyed by (src_stage, dst_stage).
+    """
+    fwd_us: dict[tuple[int, int], float] = {}
+    bwd_us: dict[tuple[int, int], float] = {}
+    for node in g.nodes.values():
+        if node.op_type != "comm.send_recv":
+            continue
+        src = node.attrs.get("src_stage", -1)
+        dst = node.attrs.get("dst_stage", -1)
+        if src < 0 or dst < 0:
+            continue
+        lat = node.annotations.get("latency_us", 0.0)
+        phase = node.annotations.get("phase", "")
+        key = (src, dst)
+        if phase == "fwd":
+            fwd_us[key] = max(fwd_us.get(key, 0.0), lat)
+        elif "bwd" in phase:
+            bwd_us[key] = max(bwd_us.get(key, 0.0), lat)
+        else:
+            logger.warning(
+                "comm.send_recv node %s has unexpected phase=%r, skipping P2P extraction",
+                node.id, phase,
+            )
+    return fwd_us, bwd_us
+
+
 def _extract_p2p_latency_us(g) -> float:
     """Extract maximum P2P communication latency from send_recv nodes in the graph.
 
     Returns 0.0 if no P2P nodes are found.
+
+    Deprecated: prefer ``_extract_p2p_latency_per_edge`` for per-edge resolution.
     """
     max_lat = 0.0
     for node in g.nodes.values():
@@ -1683,8 +1768,13 @@ def compute_exposed_comm_time(
     if overlap_type == "mc2":
         return 0.0
     elif overlap_type == "coc":
-        overlap_window = target_latency_us * (coc_tile_k - 1) / coc_tile_k
-        return max(0.0, comm_latency_us - overlap_window)
+        gemm_tile = target_latency_us / coc_tile_k if coc_tile_k > 0 else 0.0
+        comm_tile = comm_latency_us / coc_tile_k if coc_tile_k > 0 else 0.0
+        if gemm_tile >= comm_tile:
+            exposed = comm_tile
+        else:
+            exposed = comm_latency_us - target_latency_us * (coc_tile_k - 1) / coc_tile_k
+        return max(0.0, exposed)
     elif overlap_type == "ring_cp":
         fa_tile_latency = target_latency_us / cp_rounds if cp_rounds > 1 else target_latency_us
         p2p_round_latency = comm_latency_us / cp_rounds if cp_rounds > 1 else comm_latency_us

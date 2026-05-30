@@ -322,6 +322,7 @@ class HardwareSpec:
             _DType.INT4:     self.compute.int4_tops,
             _DType.FP8_E4M3: self.compute.fp8_tops,
             _DType.FP8_E5M2: self.compute.fp8_tops,
+            _DType.FP4:      self.compute.fp4_tops,
         }
         tera_ops = _map.get(dtype, 0.0)
         return tera_ops * 1e12   # → ops/s

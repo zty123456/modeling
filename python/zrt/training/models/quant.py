@@ -43,69 +43,6 @@ class OpDtypeBundle:
     grad_act:    Dtype
 
 
-def _attention_bundle(model: ModelSpec) -> OpDtypeBundle:
-    # Bwd activation/grad bytes default to in_act — matches v1's implicit
-    # assumption (op_cost used ``inputs[0].dtype`` for all six byte slots).
-    # The FP32 master grad write traffic is amortized into optimizer time,
-    # not counted per-op here. ``attn_grad_dtype`` controls the stored grad
-    # footprint in ``memory_breakdown``, NOT op-level dW bytes.
-    a = model.effective_attn_act_dtype()
-    return OpDtypeBundle(
-        in_act=a,
-        weight=model.attn_weight_dtype,
-        out_act=a,
-        compute=model.attn_compute_dtype,
-        grad_in=a,
-        grad_weight=a,
-        grad_act=a,
-    )
-
-
-def _routed_expert_bundle(model: ModelSpec) -> OpDtypeBundle:
-    a = model.effective_moe_act_dtype()
-    return OpDtypeBundle(
-        in_act=a,
-        weight=model.routed_expert_weight_dtype,
-        out_act=a,
-        compute=model.routed_expert_compute_dtype,
-        # Bwd activations (dC, dA) flow at the MoE region's activation
-        # dtype — under mixed FP8 this is FP8, halving bwd activation
-        # bytes. dW write also tracks in_act (FP32 master accumulator is
-        # modeled separately by ``memory_breakdown``).
-        grad_in=a,
-        grad_weight=a,
-        grad_act=a,
-    )
-
-
-def _shared_expert_bundle(model: ModelSpec) -> OpDtypeBundle:
-    a = model.effective_moe_act_dtype()
-    return OpDtypeBundle(
-        in_act=a,
-        weight=model.shared_expert_weight_dtype,
-        out_act=a,
-        compute=model.shared_expert_compute_dtype,
-        grad_in=a,
-        grad_weight=a,
-        grad_act=a,
-    )
-
-
-def _embedding_norm_bundle(model: ModelSpec) -> OpDtypeBundle:
-    # Embedding / norm are forced to BF16 — matches the hard-coding in
-    # the v1 ``_resolve_compute_dtype`` (stage.py:149-150). They have
-    # negligible FLOPs and quantizing them is numerically unstable.
-    return OpDtypeBundle(
-        in_act=Dtype.BF16,
-        weight=Dtype.BF16,
-        out_act=Dtype.BF16,
-        compute=Dtype.BF16,
-        grad_in=Dtype.BF16,
-        grad_weight=Dtype.BF16,
-        grad_act=Dtype.BF16,
-    )
-
-
 def _cast_bundle(op: Op, model: ModelSpec) -> OpDtypeBundle:
     """Cast op's dtypes live entirely in ``op.meta``.
 
@@ -126,39 +63,19 @@ def _cast_bundle(op: Op, model: ModelSpec) -> OpDtypeBundle:
     )
 
 
-def _default_bundle(model: ModelSpec) -> OpDtypeBundle:
-    a = model.act_dtype
-    return OpDtypeBundle(
-        in_act=a,
-        weight=model.param_dtype,
-        out_act=a,
-        compute=a,
-        grad_in=a,
-        grad_weight=a,
-        grad_act=a,
-    )
-
-
 def resolve_op_dtypes(op: Op, model: ModelSpec) -> OpDtypeBundle:
     """Return the dtype bundle for one op.
 
-    Dispatches by ``op.component`` — the tag that ``build_graph`` assigns
-    to every op in builders.py. Unknown / unset components fall back to the
-    model's global ``act_dtype`` / ``param_dtype`` / ``grad_dtype``.
+    Spec-specific ops (``kind == 'cast'``) are handled locally; all other
+    component buckets delegate to the shared ``dispatch()`` in
+    ``quant_dispatch.py``.
     """
-    comp = getattr(op, "component", None)
-
     if op.kind == "cast":
         return _cast_bundle(op, model)
-    if comp == "attention":
-        return _attention_bundle(model)
-    if comp == "routed_expert":
-        return _routed_expert_bundle(model)
-    if comp == "shared_expert":
-        return _shared_expert_bundle(model)
-    if comp in ("embedding", "norm"):
-        return _embedding_norm_bundle(model)
-    return _default_bundle(model)
+
+    from zrt.training.models.quant_dispatch import dispatch
+    comp = getattr(op, "component", None) or "default"
+    return dispatch(comp, model)
 
 
 def expected_input_dtype(op: Op, ti: int, model: ModelSpec) -> Dtype:

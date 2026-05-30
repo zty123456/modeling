@@ -20,9 +20,9 @@ def _system() -> SystemSpec:
     return SystemSpec(
         gpu=GPU(
             name="test-gpu",
-            flops_bf16=100,
-            flops_fp8=400,
-            flops_fp4=800,
+            flops_bf16=1,
+            flops_fp8=4,
+            flops_fp4=8,
             hbm_gb=80,
             hbm_bw_gbps=1_000_000,
         ),
@@ -53,14 +53,14 @@ def _model() -> ModelSpec:
 
 
 def _routed_op() -> Op:
-    x = Tensor("x", (64, 128), (64, 128), Dtype.FP8_E4M3, True)
-    y = Tensor("y", (64, 128), (64, 128), Dtype.FP8_E4M3, True)
+    x = Tensor("x", (1024, 1024), (1024, 1024), Dtype.FP8_E4M3, True)
+    y = Tensor("y", (1024, 1024), (1024, 1024), Dtype.FP8_E4M3, True)
     return Op(
         name="L0.routed_expert_ffn",
         kind="matmul",
         inputs=[x],
         outputs=[y],
-        meta={"m": 64, "n": 128, "k": 256, "fwd_multiplier": 6},
+        meta={"m": 1024, "n": 1024, "k": 1024, "fwd_multiplier": 6},
         layer_id=0,
         layer_kind=LayerKind.MOE,
         component="routed_expert",
@@ -76,6 +76,16 @@ def _ops_rows(path):
         for row in ws.iter_rows(min_row=2, values_only=True)
         if row and row[1]
     ]
+
+
+def _summary_rows(path):
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = wb["Summary"]
+    return {
+        row[0]: row
+        for row in ws.iter_rows(values_only=True)
+        if row and row[0]
+    }
 
 
 def test_excel_ops_latency_uses_routed_expert_compute_dtype(tmp_path):
@@ -112,3 +122,39 @@ def test_excel_ops_latency_uses_routed_expert_compute_dtype(tmp_path):
 
     assert actual_us == pytest.approx(expected_us, abs=0.01)
     assert actual_us != pytest.approx(bf16_us, rel=1e-3)
+
+
+def test_excel_operator_time_share_uses_routed_expert_compute_dtype(tmp_path):
+    model = _model()
+    system = _system()
+    strategy = Strategy()
+    op = _routed_op()
+    graph = Graph(ops=[op], layer_index={0: (0, 1)})
+    cost = op_cost(op, model, system)
+
+    path = tmp_path / "report.xlsx"
+    export_estimate_excel(
+        report=TrainingReport(step_time_ms=100.0, compute_time_ms=0.0),
+        graph=graph,
+        model=model,
+        system=system,
+        strategy=strategy,
+        op_costs={op.name: cost},
+        output_path=path,
+    )
+
+    summary = _summary_rows(path)
+    actual_ms = float(summary["  MoE/FFN matmul family"][1])
+    expected_ms = (
+        _cost_phase_time(cost, "fwd", system, system.gpu.name, 0.0, Dtype.FP8_E4M3)
+        + _cost_phase_time(cost, "dx", system, system.gpu.name, 0.0, Dtype.FP8_E4M3)
+        + _cost_phase_time(cost, "dw", system, system.gpu.name, 0.0, Dtype.FP8_E4M3)
+    ) * 1000
+    bf16_ms = (
+        _cost_phase_time(cost, "fwd", system, system.gpu.name, 0.0, Dtype.BF16)
+        + _cost_phase_time(cost, "dx", system, system.gpu.name, 0.0, Dtype.BF16)
+        + _cost_phase_time(cost, "dw", system, system.gpu.name, 0.0, Dtype.BF16)
+    ) * 1000
+
+    assert actual_ms == pytest.approx(expected_ms, abs=0.01)
+    assert actual_ms != pytest.approx(bf16_ms, rel=1e-3)

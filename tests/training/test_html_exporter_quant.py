@@ -109,7 +109,12 @@ def test_html_export_includes_operator_time_share(tmp_path):
     html = out.read_text(encoding="utf-8")
     assert "Operator Time Share" in html
     assert "Matmul family total" in html
-    assert "FlashAttention" in html
+    assert "Attention matmul family" in html
+    assert "MoE/FFN matmul family" in html
+    assert "LM head matmul" in html
+    assert "Sparse FA core (DSA)" in html
+    assert "Lightning Indexer" in html
+    assert "DSA attention compute" in html
     assert "MLA attention block" in html
     assert "useful compute" in html
     assert "pct_of_useful_compute" in html

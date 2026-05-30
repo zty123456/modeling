@@ -38,6 +38,9 @@ class ScheduledOp:
     category:    str    # "compute" | "communication" | "memory"
     phase:       str = ""  # "fwd" | "bwd" | ""
     parallelism_tag: str = ""  # "tp" | "ep" | "pp" | "cp" | ""
+    overlap_type: str = ""    # "coc" | "mc2" | "ring_cp" | "none"
+    coc_tile_k:   int = 0
+    overlap_target: str = ""  # node_id of the compute predecessor for CoC
 
     def __repr__(self) -> str:
         return (
@@ -183,6 +186,9 @@ class DAGScheduler:
                 category    = node.category,
                 phase       = node.annotations.get("phase", ""),
                 parallelism_tag = self._parallelism_tag(node),
+                overlap_type = node.annotations.get("overlap_type", "none"),
+                coc_tile_k   = int(node.attrs.get("coc_tile_k", 0)),
+                overlap_target = node.annotations.get("overlap_target", ""),
             ))
 
         return Timeline(

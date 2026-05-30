@@ -101,6 +101,10 @@ class TraceRequest(BaseModel):
         None,
         description="Total layers in the full model (defaults to --layers if not set).",
     )
+    username: Optional[str] = Field(
+        None,
+        description="提交者用户名（前端 localStorage 带入，用于使用统计）。",
+    )
 
 
 class EstimateRequest(BaseModel):
@@ -119,6 +123,10 @@ class EstimateRequest(BaseModel):
         None,
         description="Directory for the generated HTML report. Defaults to output/estimates/.",
     )
+    username: Optional[str] = Field(
+        None,
+        description="提交者用户名（前端 localStorage 带入，用于使用统计）。",
+    )
 
 
 class SearchRequest(BaseModel):
@@ -135,4 +143,12 @@ class SearchRequest(BaseModel):
     output: Optional[str] = Field(
         None,
         description="Write Pareto-frontier JSON to this file path.",
+    )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Directory for per-config detail HTML files. Defaults to output/estimate/.",
+    )
+    username: Optional[str] = Field(
+        None,
+        description="提交者用户名（前端 localStorage 带入，用于使用统计）。",
     )

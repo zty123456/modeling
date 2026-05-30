@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import html as html_lib
 import json
+import math
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -102,7 +103,147 @@ def _dw_flops(cost) -> float:
     return cost.dw_cube_flops + cost.dw_vector_flops
 
 
-def _op_formula(op, cost):
+def _matmul_display_dims(op) -> tuple[int, int, int]:
+    """Return the dimensions used by the matmul cost path.
+
+    Formula display must follow ``models.flops._matmul_cost`` exactly:
+    most matmuls use local tensor shapes after CP/TP sharding, while fused
+    grouped matmuls keep authoritative dimensions in metadata.
+    """
+    meta = getattr(op, "meta", {}) or {}
+    meta_k = meta.get("k", 0)
+    inputs = getattr(op, "inputs", None) or []
+    outputs = getattr(op, "outputs", None) or []
+    use_meta = (
+        meta.get("fused_weight_dims", False)
+        or not inputs
+        or not outputs
+        or (meta_k > 0 and inputs[0].shape_logical[-1] != meta_k)
+    )
+
+    if use_meta:
+        return (
+            meta.get("m", 0),
+            meta.get("n_local", meta.get("n", 0)),
+            meta.get("k_local", meta.get("k", 0)),
+        )
+
+    return (
+        inputs[0].shape_local[0],
+        outputs[0].shape_local[-1],
+        inputs[0].shape_local[-1],
+    )
+
+
+def _matmul_bytes_formula(op, cost, model, mm: int, nn: int, kk: int) -> tuple[str, str]:
+    if model is None:
+        bpe = _bpe_from_op(op)
+        fwd_str = (
+            f"(m×k+k×n+m×n)×bpe = "
+            f"({mm}×{kk}+{kk}×{nn}+{mm}×{nn})×{bpe} = {_fmt_e(cost.fwd_bytes)}"
+        )
+        bwd_str = (
+            f"dx+dw = 2×(m×k+k×n+m×n)×bpe = "
+            f"2×({mm}×{kk}+{kk}×{nn}+{mm}×{nn})×{bpe} = "
+            f"{_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+        )
+        return fwd_str, bwd_str
+
+    from zrt.training.models.quant import resolve_op_dtypes
+
+    d = resolve_op_dtypes(op, model)
+    A_b = d.in_act.bytes
+    W_b = d.weight.stored_bytes
+    C_b = d.out_act.bytes
+    dC_b = d.grad_in.bytes
+    dA_b = d.grad_act.bytes
+    dW_b = d.grad_weight.stored_bytes
+    fwd_str = (
+        f"m×k×A_b + k×n×W_b + m×n×C_b "
+        f"(A_b={A_b}, W_b={W_b}, C_b={C_b}) = "
+        f"{mm}×{kk}×{A_b} + {kk}×{nn}×{W_b} + {mm}×{nn}×{C_b} "
+        f"= {_fmt_e(cost.fwd_bytes)}"
+    )
+    bwd_str = (
+        f"dx+dw = "
+        f"(m×n×dC_b + k×n×W_b + m×k×dA_b) + "
+        f"(m×n×dC_b + m×k×A_b + k×n×dW_b) "
+        f"(dC_b={dC_b}, W_b={W_b}, dA_b={dA_b}, A_b={A_b}, dW_b={dW_b}) = "
+        f"{_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+    )
+    return fwd_str, bwd_str
+
+
+def _attention_bytes_formula(op, cost, model, system) -> tuple[str, str]:
+    m = getattr(op, "meta", {}) or {}
+    b = m.get("b", 1)
+    s = m.get("s", 0)
+    h = m.get("heads", 0)
+    d = m.get("head_dim", 0)
+    topk = m.get("sparse_topk", 0)
+    cr = m.get("compress_ratio", 0)
+    swa = m.get("swa_window", 0)
+    causal = m.get("causal", True)
+
+    if topk > 0:
+        kv_len = topk + swa
+    elif cr > 0:
+        kv_len = max(1, s // cr) + swa
+    elif swa > 0:
+        kv_len = swa
+    else:
+        kv_len = s
+
+    bpe = _bpe_from_op(op)
+    qkv_b = o_b = grad_b = bpe
+    if model is not None:
+        from zrt.training.models.quant import resolve_op_dtypes
+
+        bundle = resolve_op_dtypes(op, model)
+        qkv_b = bundle.in_act.bytes
+        o_b = bundle.out_act.bytes
+        grad_b = bundle.grad_in.bytes
+
+    sram_bytes = 0
+    if system is not None and getattr(getattr(system, "gpu", None), "sram_kb_per_sm", 0) > 0:
+        sram_bytes = int(system.gpu.sram_kb_per_sm * 1024)
+
+    if sram_bytes <= 0:
+        fwd_str = (
+            f"(Q + 2×KV)×qkv_b + O×o_b "
+            f"(qkv_b={qkv_b}, o_b={o_b}) = {_fmt_e(cost.fwd_bytes)}"
+        )
+        bwd_str = (
+            f"(2×Q + 4×KV)×grad_b "
+            f"(grad_b={grad_b}) = {_fmt_e(cost.dx_bytes)}"
+        )
+        return fwd_str, bwd_str
+
+    from zrt.training.models.flops import _fa_tile_shape
+
+    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Tr = math.ceil(s / Br)
+    Tc = math.ceil(kv_len / Bc)
+    tc_eff = Tc if topk > 0 else ((Tc + 1) / 2 if causal else Tc)
+    q_elems = b * h * s * d
+    o_elems = b * h * s * d
+    kv_elems = b * h * Tr * tc_eff * Bc * d
+    fwd_str = (
+        f"(Q + 2×KV_tiles)×qkv_b + O×o_b "
+        f"(Br={Br}, Bc={Bc}, Tr={Tr}, Tc_eff={tc_eff}, "
+        f"qkv_b={qkv_b}, o_b={o_b}) = "
+        f"({q_elems} + 2×{kv_elems})×{qkv_b} + {o_elems}×{o_b} "
+        f"= {_fmt_e(cost.fwd_bytes)}"
+    )
+    bwd_str = (
+        f"(2×Q + 4×KV_tiles)×grad_b "
+        f"(Br={Br}, Bc={Bc}, Tr={Tr}, Tc_eff={tc_eff}, grad_b={grad_b}) = "
+        f"(2×{q_elems} + 4×{kv_elems})×{grad_b} = {_fmt_e(cost.dx_bytes)}"
+    )
+    return fwd_str, bwd_str
+
+
+def _op_formula(op, cost, model=None, system=None):
     """Return formula strings for one op.
 
     Returns:
@@ -119,14 +260,9 @@ def _op_formula(op, cost):
     wf = _dw_flops(cost)
 
     if op.kind == "matmul" or op.kind == "lm_head":
-        mm = m.get("m", 0)
-        nn = m.get("n_local", m.get("n", 0))
-        kk = m.get("k_local", m.get("k", 0))
+        mm, nn, kk = _matmul_display_dims(op)
         mult = m.get("fwd_multiplier", 1.0)
-        bpe = _bpe_from_op(op)
-
         fwd_val = ff
-        bytes_val = cost.fwd_bytes
 
         if mult != 1.0:
             fwd_str = (
@@ -140,11 +276,8 @@ def _op_formula(op, cost):
             )
 
         bwd_str = f"dx+dw = 2×fwd = {_fmt_e(df + wf)}"
-        bytes_str = (
-            f"(m×k+k×n+m×n)×bpe = "
-            f"({mm}×{kk}+{kk}×{nn}+{mm}×{nn})×{bpe} = {_fmt_e(bytes_val)}"
-        )
-        return fwd_str, bwd_str, bytes_str, bytes_str
+        bytes_str, bwd_bytes_str = _matmul_bytes_formula(op, cost, model, mm, nn, kk)
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
         b = m.get("b", 1)
@@ -187,15 +320,7 @@ def _op_formula(op, cost):
             else (max(1, s // cr) + swa if cr > 0 else (swa if swa > 0 else s))
         )
 
-        bytes_str = (
-            f"(2×b×h×s×d + 2×b×h×kv_len×d)×bpe = "
-            f"(2×{b}×{h}×{s}×{d} + 2×{b}×{h}×{kv_len}×{d})×bpe "
-            f"= {_fmt_e(cost.fwd_bytes)}"
-        )
-        bwd_bytes_str = (
-            f"(3×b×h×s×d + 4×b×h×kv_len×d)×bpe "
-            f"= {_fmt_e(cost.dx_bytes)}"
-        )
+        bytes_str, bwd_bytes_str = _attention_bytes_formula(op, cost, model, system)
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind in ("rmsnorm", "ln"):
@@ -262,7 +387,7 @@ def _op_formula(op, cost):
             f"4×(s/m)×coff×m×d = "
             f"4×({s}//{mm_})×{co}×{mm_}×{dd} = {_fmt_e(ff)}"
         )
-        bwd_str = f"= fwd = {_fmt_e(df)}"
+        bwd_str = f"bwd = fwd = {_fmt_e(df)}"
         bytes_str = f"bytes = {_fmt_e(cost.fwd_bytes)}"
         bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
@@ -273,14 +398,14 @@ def _op_formula(op, cost):
         fwd_str = "0, gather-style embedding lookup has no modeled FLOPs"
         bwd_str = "0, scatter-style embedding gradient has no modeled FLOPs"
         bytes_str = f"s×h×bpe = {s}×{h}×bpe = {_fmt_e(cost.fwd_bytes)}"
-        bwd_bytes_str = f"same as fwd = {_fmt_e(cost.dx_bytes)}"
+        bwd_bytes_str = f"dx+dw bytes = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind in ("mhc_pre", "mhc_post", "mhc_head"):
         fwd_str = f"mHC fused op fwd = {_fmt_e(ff)}"
         bwd_str = f"2.5×fwd = {_fmt_e(df + wf)}"
-        bytes_str = f"= {_fmt_e(cost.fwd_bytes)}"
-        bwd_bytes_str = f"= {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+        bytes_str = f"fwd_bytes = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx+dw bytes = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
         return fwd_str, bwd_str, bytes_str, bwd_bytes_str
 
     if op.kind == "hash_route":
@@ -294,11 +419,11 @@ def _op_formula(op, cost):
     )
 
 
-def _op_detail(op, cost):
+def _op_detail(op, cost, model=None, system=None):
     """Return a dict with full op info for HTML."""
     inputs_info = _tensor_list_info(op.inputs, "input")
     outputs_info = _tensor_list_info(op.outputs, "output")
-    fwd_formula, bwd_formula, fwd_bytes_formula, bwd_bytes_formula = _op_formula(op, cost)
+    fwd_formula, bwd_formula, fwd_bytes_formula, bwd_bytes_formula = _op_formula(op, cost, model, system)
 
     return {
         "inputs": inputs_info,
@@ -407,18 +532,23 @@ def _classify_ops_in_layer(ops: list["Op"], layer_kind: str) -> list[dict]:
     ]
 
 
-def _op_to_dict(op: "Op", cost: "OpCost", system) -> dict:
+def _op_to_dict(op: "Op", cost: "OpCost", system, model=None) -> dict:
     """Convert an op + cost to a dict for the HTML template."""
-    from zrt.training.compose.stage import _cost_phase_time, has_heterogeneous_compute
+    from zrt.training.compose.stage import (
+        _cost_phase_time,
+        _resolve_compute_dtype,
+        has_heterogeneous_compute,
+    )
 
     gpu_name = system.gpu.name
     overlap = system.gpu.overlap_ratio.get(op.kind, 0.0) if has_heterogeneous_compute(system) else 0.0
+    op_dtype = _resolve_compute_dtype(op, model) if model is not None else Dtype.BF16
 
-    fwd_t = _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
-    dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap)
-    dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap)
+    fwd_t = _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
+    dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap, op_dtype)
+    dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap, op_dtype)
 
-    detail = _op_detail(op, cost)
+    detail = _op_detail(op, cost, model, system)
 
     component = str(getattr(op, "component", "") or "")
 
@@ -660,6 +790,7 @@ def _build_summary(
             model=model,
             report=report,
             op_dicts=op_dicts,
+            strategy=strategy,
         ),
         "comm_breakdown": {
             "tp_exposed_ms": getattr(report, "tp_exposed_ms", 0.0),
@@ -916,7 +1047,7 @@ def _build_layer_tree(
             if cost is None:
                 cost = op_cost(op, model, system)
 
-            od = _op_to_dict(op, cost, system)
+            od = _op_to_dict(op, cost, system, model)
             od["component_group"] = _component_of_op(op)
 
             tree["global_ops"].append(od)
@@ -957,7 +1088,7 @@ def _build_layer_tree(
                 if cost is None:
                     cost = op_cost(op, model, system)
 
-                od = _op_to_dict(op, cost, system)
+                od = _op_to_dict(op, cost, system, model)
                 od["component_group"] = _component_of_op(op)
 
                 blk_data["ops"].append(od)
@@ -995,7 +1126,7 @@ def _build_layer_tree(
                 if cost is None:
                     cost = op_cost(op, model, system)
 
-                od = _op_to_dict(op, cost, system)
+                od = _op_to_dict(op, cost, system, model)
                 od["component_group"] = _component_of_op(op)
 
                 blk_data["ops"].append(od)

@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .schemas import EstimateRequest, JobResponse, JobStatus, SearchRequest, TraceRequest
+from . import stats
 
 # Ensure 'python/' is on sys.path so that zrt.* imports inside the training
 # module (which uses 'from zrt.*') resolve correctly.
@@ -74,6 +75,10 @@ def serve_launcher():
 # ── In-memory job store ───────────────────────────────────────────────────────
 # Each entry: {id, status, result, error, created_at, finished_at}
 _jobs: dict[str, dict[str, Any]] = {}
+# Per-search live state (model/system/strategies) for lazy detail rendering.
+# Kept out of _jobs because Strategy objects aren't JSON-serializable and
+# would break /jobs listing.
+_search_states: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
 
 
@@ -205,6 +210,12 @@ def get_model_raw(key: str):
     return {"content": cfg.read_text(encoding="utf-8")}
 
 
+@app.get("/stats", tags=["utility"], summary="Aggregate task submission counts")
+def get_stats():
+    """Totals per task kind across all users (per-user detail lives in stats.json)."""
+    return stats.read_totals()
+
+
 # ── Job polling ───────────────────────────────────────────────────────────────
 
 @app.get("/jobs", tags=["jobs"], summary="List all submitted jobs")
@@ -245,10 +256,16 @@ def _resolve_job_artifact(job_id: str, filename: str) -> Path:
     if job is None:
         raise HTTPException(404, detail=f"Job '{job_id}' not found")
     result = job.get("result") or {}
-    candidates = {
+    candidates: dict[str | None, str | None] = {
         result.get("html_filename"): result.get("html_path"),
         result.get("excel_filename"): result.get("excel_path"),
     }
+    # Search jobs publish a per-config detail HTML for each Pareto entry; the
+    # top-1 best is rendered eagerly, others on first click via /search/{id}/render/{idx}.
+    for entry in (result.get("pareto_frontier") or []):
+        fn = entry.get("html_filename")
+        if fn:
+            candidates[fn] = entry.get("html_path")
     path = candidates.get(filename)
     if not path:
         raise HTTPException(404, detail=f"Artifact '{filename}' not found")
@@ -274,6 +291,10 @@ def _resolve_job_artifact(job_id: str, filename: str) -> Path:
 )
 def submit_trace(req: TraceRequest, bg: BackgroundTasks):
     job_id = _new_job()
+    try:
+        stats.record_submission(req.username, "trace")
+    except Exception:
+        pass
     bg.add_task(_trace_worker, job_id, req)
     return _snapshot(job_id)
 
@@ -412,6 +433,10 @@ def submit_estimate(req: EstimateRequest, bg: BackgroundTasks):
     if not req.config_path and not req.config_content:
         raise HTTPException(422, detail="Provide either config_path or config_content")
     job_id = _new_job()
+    try:
+        stats.record_submission(req.username, "estimate")
+    except Exception:
+        pass
     bg.add_task(_estimate_worker, job_id, req)
     return _snapshot(job_id)
 
@@ -577,6 +602,10 @@ def submit_search(req: SearchRequest, bg: BackgroundTasks):
     if not req.config_path and not req.config_content:
         raise HTTPException(422, detail="Provide either config_path or config_content")
     job_id = _new_job()
+    try:
+        stats.record_submission(req.username, "search")
+    except Exception:
+        pass
     bg.add_task(_search_worker, job_id, req)
     return _snapshot(job_id)
 
@@ -584,7 +613,7 @@ def submit_search(req: SearchRequest, bg: BackgroundTasks):
 def _search_worker(job_id: str, req: SearchRequest) -> None:
     _update_job(job_id, status=JobStatus.RUNNING)
     try:
-        result = _do_search(req)
+        result = _do_search(req, job_id)
         _update_job(
             job_id,
             status=JobStatus.DONE,
@@ -600,9 +629,8 @@ def _search_worker(job_id: str, req: SearchRequest) -> None:
         )
 
 
-def _do_search(req: SearchRequest) -> dict:
+def _do_search(req: SearchRequest, job_id: str) -> dict:
     from python.zrt.training.io.config_loader import load_specs
-    from python.zrt.training.search.estimator import grid_search, pareto_frontier
     from python.zrt.training.search.space import SearchSpace
     from python.zrt.training.search.report import report_to_dict
 
@@ -613,23 +641,226 @@ def _do_search(req: SearchRequest) -> dict:
             micro_batch=strategy.micro_batch,
             global_batch=strategy.global_batch,
         )
-        all_reports = grid_search(model, system, space)
-        frontier = pareto_frontier(all_reports)
-        pareto_data = [report_to_dict(r) for r in frontier]
+        # Pair each surviving (strategy, report) so we can render any Pareto
+        # entry later. The stock grid_search() drops the originating strategy.
+        all_pairs = _grid_search_with_strategies(model, system, space)
+        frontier_pairs = _pareto_frontier_with_strategies(all_pairs)
 
-        if req.output and frontier:
+        _slug = Path(req.config_path).stem if req.config_path else "search"
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path(req.output_dir) if req.output_dir else _estimates_dir
+        base_name = f"{_slug}_search_{_ts}"
+
+        pareto_data: list[dict] = []
+        for idx, (strat, report) in enumerate(frontier_pairs):
+            d = report_to_dict(report)
+            d["idx"] = idx
+            d["strategy_params"] = _strategy_to_params(strat)
+            if idx == 0:
+                # Render the best config synchronously so the user can click
+                # straight through. Others render on first click.
+                try:
+                    html_path = _render_strategy_detail(
+                        model=model, system=system, strategy=strat,
+                        slug=f"{base_name}_top1",
+                        output_dir=out_dir,
+                    )
+                    d["html_filename"] = html_path.name
+                    d["html_path"] = str(html_path)
+                    d["html_url"] = f"/jobs/{job_id}/artifacts/{html_path.name}"
+                except Exception as exc:
+                    d["render_error"] = str(exc)
+            pareto_data.append(d)
+
+        if req.output and pareto_data:
             out = Path(req.output)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(pareto_data, indent=2))
 
+        # Stash search state in a dedicated dict for lazy detail rendering.
+        with _lock:
+            _search_states[job_id] = {
+                "model": model,
+                "system": system,
+                "frontier_strategies": [p[0] for p in frontier_pairs],
+                "output_dir": out_dir,
+                "base_name": base_name,
+            }
+
         return {
-            "total_configs": len(all_reports),
-            "pareto_count": len(frontier),
+            "total_configs": len(all_pairs),
+            "pareto_count": len(frontier_pairs),
             "pareto_frontier": pareto_data,
         }
     finally:
         if tmp:
             Path(tmp).unlink(missing_ok=True)
+
+
+# ── /search helpers ───────────────────────────────────────────────────────────
+
+def _grid_search_with_strategies(model: Any, system: Any, space: Any) -> list[tuple[Any, Any]]:
+    """grid_search variant that keeps each report paired with its strategy.
+
+    Mirrors search.estimator.grid_search but returns (strategy, report) tuples
+    so the launcher can re-render any frontier entry later.
+    """
+    from python.zrt.training.search.estimator import estimate
+
+    pairs: list[tuple[Any, Any]] = []
+    for strat in space.strategies(system.world_size):
+        try:
+            strat.validate(model, system)
+        except ValueError:
+            continue
+        try:
+            report = estimate(model, system, strat)
+            if report.memory is not None:
+                peak_gb = report.memory.peak_overall / 1e9
+                if peak_gb > space.max_memory_gb:
+                    continue
+            pairs.append((strat, report))
+        except Exception:
+            continue
+    pairs.sort(key=lambda p: p[1].step_time_ms)
+    return pairs
+
+
+def _pareto_frontier_with_strategies(pairs: list[tuple[Any, Any]]) -> list[tuple[Any, Any]]:
+    if not pairs:
+        return []
+    sorted_pairs = sorted(
+        pairs,
+        key=lambda p: (
+            p[1].step_time_ms,
+            p[1].memory.total / 1e9 if p[1].memory else float("inf"),
+        ),
+    )
+    out: list[tuple[Any, Any]] = []
+    min_mem = float("inf")
+    for strat, rep in sorted_pairs:
+        mem_gb = rep.memory.total / 1e9 if rep.memory else None
+        if not out:
+            out.append((strat, rep))
+            min_mem = mem_gb if mem_gb is not None else float("inf")
+        elif mem_gb is not None and mem_gb < min_mem:
+            out.append((strat, rep))
+            min_mem = mem_gb
+    return out
+
+
+def _strategy_to_params(strat: Any) -> dict:
+    """Surface the few fields the UI shows alongside the strategy string."""
+    def _enum_name(v: Any) -> Any:
+        return getattr(v, "name", v) if v is not None else None
+    return {
+        "tp": strat.tp,
+        "cp": strat.cp,
+        "pp": strat.pp,
+        "ep": strat.ep,
+        "dp": strat.dp,
+        "zero_stage": strat.zero_stage,
+        "vpp_chunks": getattr(strat, "vpp_chunks", 1),
+        "pp_schedule": _enum_name(getattr(strat, "pp_schedule", None)),
+        "optimizer": _enum_name(getattr(strat, "optimizer", None)),
+        "recompute": (
+            "selective" if getattr(strat.recompute, "per_layer", None) and
+            any("attn" in v for v in strat.recompute.per_layer.values())
+            else "full" if getattr(strat.recompute, "per_layer", None) and
+            any("full" in v for v in strat.recompute.per_layer.values())
+            else "none"
+        ),
+    }
+
+
+def _render_strategy_detail(*, model: Any, system: Any, strategy: Any,
+                            slug: str, output_dir: Path) -> Path:
+    """Reuse the /estimate HTML exporter to render a single (model, system, strategy)
+    triple. Returns the path to the produced HTML file."""
+    from python.zrt.training.ir.builders import build_graph
+    from python.zrt.training.models.flops import op_cost
+    from python.zrt.training.search.estimator import estimate
+    from python.zrt.training.io.html_exporter import export_estimate_html
+
+    graph = build_graph(model, strategy)
+    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+    report = estimate(model, system, strategy, graph=graph)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    html_path = export_estimate_html(
+        report=report,
+        graph=graph,
+        model=model,
+        system=system,
+        strategy=strategy,
+        op_costs=op_costs,
+        output_path=output_dir / f"{slug}.html",
+    )
+    return Path(html_path)
+
+
+@app.post(
+    "/search/{job_id}/render/{idx}",
+    tags=["jobs"],
+    summary="Render a Pareto-frontier entry's detail HTML on demand",
+    description=(
+        "Generates the same HTML page as /estimate for the idx-th Pareto entry of "
+        "a completed /search job. Idempotent: returns the cached URL if already rendered. "
+        "Top-1 (idx=0) is auto-rendered at search completion, so this is normally "
+        "used for the rest of the frontier."
+    ),
+)
+def render_search_entry(job_id: str, idx: int):
+    with _lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, detail=f"Job '{job_id}' not found")
+    if job.get("status") != JobStatus.DONE:
+        raise HTTPException(409, detail=f"Job is {job.get('status')}, not done")
+    result = job.get("result") or {}
+    frontier = result.get("pareto_frontier") or []
+    if not (0 <= idx < len(frontier)):
+        raise HTTPException(404, detail=f"idx {idx} out of range (0..{len(frontier)-1})")
+    entry = frontier[idx]
+    if entry.get("html_url"):
+        return {
+            "html_filename": entry["html_filename"],
+            "html_url": entry["html_url"],
+            "cached": True,
+        }
+
+    with _lock:
+        state = _search_states.get(job_id)
+    if not state:
+        raise HTTPException(410, detail="Search state expired (server restarted?). Re-run /search.")
+
+    strategies = state["frontier_strategies"]
+    if idx >= len(strategies):
+        raise HTTPException(404, detail=f"idx {idx} has no stored strategy")
+    try:
+        html_path = _render_strategy_detail(
+            model=state["model"],
+            system=state["system"],
+            strategy=strategies[idx],
+            slug=f"{state['base_name']}_idx{idx:03d}",
+            output_dir=state["output_dir"],
+        )
+    except Exception as exc:
+        raise HTTPException(500, detail=f"Render failed: {exc}")
+
+    html_filename = html_path.name
+    html_url = f"/jobs/{job_id}/artifacts/{html_filename}"
+    with _lock:
+        # Re-read inside the lock in case the job was updated concurrently.
+        current_result = _jobs[job_id].get("result") or {}
+        current_frontier = current_result.get("pareto_frontier") or []
+        if 0 <= idx < len(current_frontier):
+            current_frontier[idx]["html_filename"] = html_filename
+            current_frontier[idx]["html_path"] = str(html_path)
+            current_frontier[idx]["html_url"] = html_url
+            current_result["pareto_frontier"] = current_frontier
+            _jobs[job_id]["result"] = current_result
+    return {"html_filename": html_filename, "html_url": html_url, "cached": False}
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────

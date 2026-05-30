@@ -48,6 +48,8 @@ jobs:
       # - 切分支前 git clean -fdx 清除 __pycache__/.coverage/.pytest_cache 残留。
       - name: Measure base branch coverage
         run: |
+          # Record PR commit SHA before switching branches (fork PRs lack the branch locally)
+          echo "PR_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           git clean -fdx
           git checkout ${{ github.base_ref }}
           pytest tests/ -m "not network" \
@@ -72,7 +74,7 @@ jobs:
       - name: Measure PR branch coverage
         run: |
           git clean -fdx
-          git checkout ${{ github.head_ref }}
+          git checkout "$PR_SHA"
           pytest tests/ -m "not network" \
             --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/pr.txt
           python - <<'EOF'

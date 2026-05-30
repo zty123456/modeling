@@ -40,6 +40,10 @@ class DataParallelPass(GraphPass):
         dp = ctx.parallel.dp
         zero_stage = ctx.training.zero_stage if ctx.training else 0
 
+        # ZeRO-3 handled by ZeroFSDPPass (per-layer FSDP communication)
+        if zero_stage >= 3:
+            return g
+
         # Check if we should process this graph (backward-phase only)
         graph_phase = g.metadata.get("phase", "")
         if graph_phase and graph_phase not in ("train_backward", "backward"):

@@ -95,6 +95,24 @@ class FlopsPass(GraphPass):
             node.annotations["read_bytes"]  = int(read_b)
             node.annotations["write_bytes"] = int(write_b)
 
+            # FP32 promotion penalty for LN/softmax when input is quantized.
+            # Real hardware re-reads the input in FP32 for the reduction.
+            # LN/RMSNorm: +1x input bytes; softmax: +2x (max + sum-of-exp).
+            #
+            # Note: currently unreachable under shipped presets because attn and
+            # norm components resolve to BF16 in_act. Fires when a future preset
+            # sets attn_act_dtype or a norm-specific dtype to FP8/FP4.
+            profile = getattr(ctx, 'quant_profile', None)
+            if profile is not None and profile.ln_softmax_promote_fp32:
+                in_act = node.annotations.get("quant.in_act")
+                if in_act is not None and _is_quantized_dtype(in_act):
+                    from zrt.training.models.promotion import ln_softmax_input_byte_multiplier
+                    penalty_mult = ln_softmax_input_byte_multiplier(node.op_type)
+                    if penalty_mult > 0 and read_b > 0:
+                        promotion_bytes = int(read_b * penalty_mult)
+                        node.annotations["read_bytes"] = int(read_b) + promotion_bytes
+                        node.annotations["ln_softmax_promotion_bytes"] = promotion_bytes
+
             if is_train:
                 phase = node.annotations.get("phase", "fwd")
                 is_bwd = phase in {"bwd", "backward", "train_backward"}
@@ -145,6 +163,12 @@ def _is_attention_op(op_type: str) -> bool:
     return "attention" in op_type.lower() or "attn" in op_type.lower()
 
 
+def _is_quantized_dtype(dtype) -> bool:
+    """True when dtype is FP8 or FP4 (triggers FP32 promotion penalty)."""
+    from zrt.training.spec.dtype import Dtype
+    return dtype in (Dtype.FP8_E4M3, Dtype.FP8_E5M2, Dtype.FP4)
+
+
 def _attn_compression_ratio(node, graph) -> float:
     value = node.annotations.get("attn_compression_ratio")
     if value is None:
@@ -165,24 +189,23 @@ def _attn_compression_ratio(node, graph) -> float:
 def _effective_compute_dtype(node: "OpNode") -> "DType":
     """Return the compute dtype for throughput lookup.
 
-    For compute nodes, activation dtype (inputs[0]) drives tensor-core selection.
-    Falls back to output dtype for non-compute or no-input nodes.
-    Also respects quant_act annotation for hypothetical-quant analysis.
+    Priority:
+      1. ``quant.compute`` annotation (Dtype enum from GraphQuantProfile)
+      2. Captured tensor dtype (inputs[0])
     """
     from python.zrt.ir.types import DType
 
-    if node.category != "compute" or not node.inputs:
+    # Priority 1: structured per-operand compute dtype.
+    # Use duck typing (hasattr) rather than isinstance because the spec
+    # Dtype and IR DType may resolve to different class objects when
+    # imported via python.zrt vs zrt paths.
+    quant_compute = node.annotations.get("quant.compute")
+    if quant_compute is not None and hasattr(quant_compute, "bytes"):
+        return DType(quant_compute.value)
+
+    # Priority 2: captured tensor dtype
+    if not node.inputs:
         return node.outputs[0].dtype if node.outputs else DType.BF16
-    # Annotation path: QuantizationPass wrote quant_act on this node
-    quant_act = node.annotations.get("quant_act")
-    if quant_act and quant_act not in ("bf16", "fp16", "fp32"):
-        # Normalize fp8 alias to fp8_e4m3 (default FP8 format for training)
-        normalized = "fp8_e4m3" if quant_act == "fp8" else quant_act
-        try:
-            return DType(normalized)
-        except ValueError:
-            pass
-    # Captured dtype path: use activation tensor (inputs[0]) dtype
     return node.inputs[0].dtype
 
 

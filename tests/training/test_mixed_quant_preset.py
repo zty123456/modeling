@@ -1,25 +1,25 @@
-"""Tests for YAML quant_preset expansion + extended _parse_dtype."""
+"""Tests for YAML quant_preset expansion + Dtype.parse()."""
 import pytest
 
-from zrt.training.io.config_loader import _expand_quant_preset, _parse_dtype, _resolve_model
+from zrt.training.io.config_loader import _expand_quant_preset, _resolve_model
 from zrt.training.spec.dtype import Dtype
 
 
 def test_parse_dtype_accepts_fp8_e4m3():
-    assert _parse_dtype("fp8_e4m3") is Dtype.FP8_E4M3
+    assert Dtype.parse("fp8_e4m3") is Dtype.FP8_E4M3
 
 
 def test_parse_dtype_accepts_fp8_e5m2():
-    assert _parse_dtype("fp8_e5m2") is Dtype.FP8_E5M2
+    assert Dtype.parse("fp8_e5m2") is Dtype.FP8_E5M2
 
 
 def test_parse_dtype_accepts_fp4():
-    assert _parse_dtype("fp4") is Dtype.FP4
+    assert Dtype.parse("fp4") is Dtype.FP4
 
 
 def test_parse_dtype_fp8_alias_still_works():
     """Legacy YAML using 'fp8' → FP8_E4M3 (alias)."""
-    assert _parse_dtype("fp8") is Dtype.FP8_E4M3
+    assert Dtype.parse("fp8") is Dtype.FP8_E4M3
 
 
 def test_expand_preset_deepseek_v4_fp8_fp4():
