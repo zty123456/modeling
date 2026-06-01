@@ -225,6 +225,14 @@ def _kv_itemsize(node: "OpNode") -> float:
     return _QUANT_BYTES.get(qkv_str.lower(), 2.0)
 
 
+def _kv_heads(node: "OpNode", q_heads: int, k_tensor=None) -> int:
+    """Return KV heads for MHA/GQA/MQA-aware cache byte accounting."""
+    if k_tensor is not None and len(k_tensor.shape) >= 2:
+        return max(1, int(k_tensor.shape[1]))
+    ann = node.annotations or {}
+    return max(1, int(ann.get("kv_heads", q_heads)))
+
+
 # ── per-op formula functions ──────────────────────────────────────────────────
 # Each returns (flops: float, read_bytes: float, write_bytes: float)
 
@@ -412,13 +420,14 @@ def _scaled_dot_product_attention(node: "OpNode") -> FMR:
     # Assume (N, H, Sq, D) layout
     N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
     Sk = k.shape[2]
+    H_kv = _kv_heads(node, H, k)
     it = q.dtype.itemsize       # activation dtype for Q
     kv_it = _kv_itemsize(node)  # KV cache dtype for K,V
     # QK matmul: 2*N*H*Sq*Sk*D,  AV matmul: 2*N*H*Sq*Sk*D
     flops = 4.0 * N * H * Sq * Sk * D
     # Softmax ops ~ 4*N*H*Sq*Sk (sub-dominant, included for completeness)
     flops += 4.0 * N * H * Sq * Sk
-    read  = N*H*Sq*D * it + 2 * N*H*Sk*D * kv_it   # Q uses it, K+V use kv_it
+    read  = N*H*Sq*D * it + 2 * N*H_kv*Sk*D * kv_it  # Q uses H, K+V use H_kv
     write = (N*H*Sq*D) * it                           # output
     return flops, read, write
 
@@ -461,6 +470,8 @@ def _paged_attention(node: "OpNode") -> FMR:
     # KV cache length 需从 block_tables 或 node.annotations 估算
     # 若无信息，假设 Sk = Sq * 4 (典型解码场景)
     Sk = node.annotations.get("kv_cache_len", Sq * 4) if node.annotations else Sq * 4
+    k_cache = node.inputs[1] if len(node.inputs) > 1 else None
+    H_kv = _kv_heads(node, H, k_cache)
 
     # FLOPs 与 FlashAttention 相同
     flops = 4.0 * N * H * Sq * Sk * D
@@ -468,7 +479,7 @@ def _paged_attention(node: "OpNode") -> FMR:
 
     # 内存带宽：Q + K + V + block_tables 索引
     q_bytes = N * H * Sq * D * it
-    kv_bytes = 2 * N * H * Sk * D * kv_it  # K + V with KV dtype
+    kv_bytes = 2 * N * H_kv * Sk * D * kv_it  # K + V with KV heads and dtype
     block_table_bytes = N * Sk * 8  # int64 indices, 每个 KV block 一个索引
     read = q_bytes + kv_bytes + block_table_bytes
     write = N * H * Sq * D * it
@@ -504,6 +515,7 @@ def _sparse_flash_attention(node: "OpNode") -> FMR:
 
     N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
     Sk = k.shape[2]
+    H_kv = _kv_heads(node, H, k)
     it = q.dtype.itemsize
 
     # 获取稀疏比例，优先级：annotations > attrs > 默认值
@@ -530,7 +542,7 @@ def _sparse_flash_attention(node: "OpNode") -> FMR:
 
     # 内存带宽：Q 全部访问，KV 只访问稀疏位置
     q_bytes = N * H * Sq * D * it
-    kv_bytes = N * H * int(Sk * sparsity_ratio) * D * it * 2  # K + V (稀疏部分)
+    kv_bytes = N * H_kv * int(Sk * sparsity_ratio) * D * it * 2
     read = q_bytes + kv_bytes
     write = N * H * Sq * D * it
 
@@ -1481,10 +1493,11 @@ def _fs_sdpa(node: "OpNode") -> dict:
     if len(q.shape) < 4: return _fs_default(node)
     N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
     Sk, bw = (k.shape[2] if len(k.shape) >= 3 else Sq), _bw(node)
+    H_kv, kv_bw = _kv_heads(node, H, k), _kv_itemsize(node)
     return _mk("4·N·H·Sq·Sk·D+4·N·H·Sq·Sk",
                f"4·{N}·{H}·{Sq}·{Sk}·{D}+4·{N}·{H}·{Sq}·{Sk}",
-               "(Q+K+V)·b",
-               f"({N}·{H}·{Sq}·{D}+{N}·{H}·{Sk}·{D}+{N}·{H}·{Sk}·{D})·{bw}",
+               "Q·b+(K+V)·b_kv",
+               f"{N}·{H}·{Sq}·{D}·{bw}+2·{N}·{H_kv}·{Sk}·{D}·{kv_bw}",
                "N·H·Sq·D·b", f"{N}·{H}·{Sq}·{D}·{bw}")
 
 
@@ -1500,13 +1513,15 @@ def _fs_paged_attention(node: "OpNode") -> dict:
     else:
         return _fs_default(node)
     Sk = node.annotations.get("kv_cache_len", Sq * 4) if node.annotations else Sq * 4
-    bw = _bw(node)
+    k_cache = node.inputs[1] if len(node.inputs) > 1 else None
+    H_kv = _kv_heads(node, H, k_cache)
+    bw, kv_bw = _bw(node), _kv_itemsize(node)
     q_bytes = N * H * Sq * D * bw
-    kv_bytes = N * H * Sk * D * bw * 2
+    kv_bytes = N * H_kv * Sk * D * kv_bw * 2
     block_bytes = N * Sk * 8
     return _mk("4·N·H·Sq·Sk·D+5·N·H·Sq·Sk",
                f"4·{N}·{H}·{Sq}·{Sk}·{D}+5·{N}·{H}·{Sq}·{Sk}",
-               "(Q+K+V+block_tables)·b",
+               "Q·b+(K+V)·b_kv+block_tables·8",
                f"{q_bytes+kv_bytes+block_bytes}",
                "N·H·Sq·D·b", f"{N}·{H}·{Sq}·{D}·{bw}")
 
@@ -1517,6 +1532,7 @@ def _fs_sparse_flash_attention(node: "OpNode") -> dict:
     if len(q.shape) < 4: return _fs_default(node)
     N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
     Sk, bw = (k.shape[2] if len(k.shape) >= 3 else Sq), _bw(node)
+    H_kv = _kv_heads(node, H, k)
 
     # 获取稀疏比例
     sparsity_ratio = 1.0
@@ -1535,7 +1551,7 @@ def _fs_sparse_flash_attention(node: "OpNode") -> dict:
 
     # 内存带宽
     q_bytes = N * H * Sq * D * bw
-    kv_bytes = N * H * sparse_Sk * D * bw * 2
+    kv_bytes = N * H_kv * sparse_Sk * D * bw * 2
 
     return _mk(f"(4·N·H·Sq·Sk·D+5·N·H·Sq·Sk)·ratio",
                f"{actual_flops} (ratio={sparsity_ratio:.3f})",

@@ -385,9 +385,26 @@
     border-radius: 2px; transition: background .12s, color .12s;
   }
   .detail-btn:hover { background: var(--teal); color: #0d0d0d; }
+  .detail-btn.on-detail { background: var(--teal); color: #fff; border-color: var(--teal); }
   .detail-btn[disabled] { opacity: .55; cursor: progress; }
   .detail-btn.pending { color: var(--amber); border-color: var(--amber-dim); }
   .detail-btn.failed  { color: var(--coral); border-color: var(--coral); }
+
+  /* multi-select chips for the search form */
+  .chip-group { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip {
+    border: 1px solid var(--border); background: transparent; color: var(--text-muted);
+    font-family: inherit; font-size: 10px; padding: 3px 9px; border-radius: 3px;
+    cursor: pointer; user-select: none; transition: background .12s, color .12s, border-color .12s;
+  }
+  .chip:hover { color: var(--text); border-color: var(--teal-dim); }
+  .chip.on    { background: rgba(0,184,144,.10); color: var(--teal); border-color: var(--teal); }
+  .chip-row-lbl {
+    font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .6px;
+    padding-top: 3px; min-width: 70px;
+  }
+  .chip-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
+  .chip-row .chip-group { flex: 1; }
 
   /* warn list */
   .warn-list { list-style: none; }
@@ -399,8 +416,8 @@
     overflow: hidden; height: 0; position: relative;
     transition: height 0.3s cubic-bezier(.4,0,.2,1);
   }
-  .report-wrap.open { height: 680px; border-top: 1px solid var(--border); }
-  .report-frame { width: 100%; height: 680px; border: none; display: block; background: #fff; opacity: 0; transition: opacity .18s ease; }
+  .report-wrap.open { height: calc(100vh - 180px); min-height: 600px; border-top: 1px solid var(--border); }
+  .report-frame { width: 100%; height: 100%; border: none; display: block; background: #fff; opacity: 0; transition: opacity .18s ease; }
   .report-frame.ready { opacity: 1; }
   .report-loader {
     position: absolute; inset: 0; z-index: 2;
@@ -732,12 +749,67 @@
         <div class="panel-hdr">
           grid search — strategy space
           <div class="src-toggle">
-            <button class="src-btn on" id="src-srch-yaml" onclick="setSrc('search','yaml')">inline yaml</button>
-            <button class="src-btn"    id="src-srch-path" onclick="setSrc('search','path')">file path</button>
+            <button class="src-btn on" id="src-srch-form" onclick="setSrc('search','form')">form</button>
+            <button class="src-btn"    id="src-srch-yaml" onclick="setSrc('search','yaml')">yaml</button>
+            <button class="src-btn"    id="src-srch-path" onclick="setSrc('search','path')">file</button>
           </div>
         </div>
         <div class="panel-body">
-          <div id="srch-yaml-sec">
+
+          <!-- ── FORM MODE ── -->
+          <div id="srch-form-sec">
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin-bottom:8px">Model & System</div>
+            <div class="form-grid">
+              <div class="form-group full-col">
+                <label class="form-label">model</label>
+                <select class="form-select" id="srch-model-sel"><option value="">loading…</option></select>
+              </div>
+              <div class="form-group full-col">
+                <label class="form-label">hardware</label>
+                <select class="form-select" id="srch-hw-sel"><option value="">loading…</option></select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">nodes</label>
+                <input class="form-input" id="srch-nodes" type="number" value="16" min="1">
+              </div>
+              <div class="form-group">
+                <label class="form-label">GPUs / node</label>
+                <select class="form-select" id="srch-gpus">
+                  <option value="8" selected>8</option>
+                  <option value="4">4</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin:12px 0 8px">Batch & Memory</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label class="form-label">micro batch</label>
+                <input class="form-input" id="srch-mb" type="number" value="1" min="1">
+              </div>
+              <div class="form-group">
+                <label class="form-label">global batch</label>
+                <input class="form-input" id="srch-gb" type="number" value="2048" min="1">
+              </div>
+              <div class="form-group full-col">
+                <label class="form-label">max memory per GPU (GB)</label>
+                <input class="form-input" id="srch-maxmem" type="number" value="80" min="1" step="1">
+              </div>
+            </div>
+
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin:12px 0 6px">Search Space — toggle values to include</div>
+            <div id="srch-chips-host"></div>
+
+            <div class="form-grid" style="margin-top:10px">
+              <div class="form-group full-col">
+                <label class="form-label">output json (optional)</label>
+                <input class="form-input" id="srch-out" placeholder="output/pareto.json">
+              </div>
+            </div>
+          </div>
+
+          <!-- ── YAML MODE ── -->
+          <div id="srch-yaml-sec" class="hidden">
             <textarea class="yaml-editor" id="srch-yaml" spellcheck="false" placeholder="# Training config YAML — same format as estimate…"></textarea>
             <div class="presets">
               <span class="preset-lbl">presets:</span>
@@ -745,18 +817,15 @@
               <button class="preset-pill" onclick="loadPreset('srch','dsv3_h100')">DSV3 H100</button>
             </div>
           </div>
+
+          <!-- ── FILE MODE ── -->
           <div id="srch-path-sec" class="hidden">
             <input class="path-input" id="srch-path" placeholder="python/zrt/training/configs/llama3_70b_3d.yaml">
           </div>
-          <div class="form-grid" style="margin-top:10px">
-            <div class="form-group full-col">
-              <label class="form-label">output json (optional)</label>
-              <input class="form-input" id="srch-out" placeholder="output/pareto.json">
-            </div>
-          </div>
+
           <div class="run-row">
             <button class="run-btn srch-btn" id="btn-srch" onclick="runSearch()">▶ run search</button>
-            <span class="run-hint">POST /search → Pareto</span>
+            <span class="run-hint" id="srch-run-hint">POST /search → Pareto</span>
           </div>
         </div>
       </div>
@@ -1006,11 +1075,147 @@ function setSrc(tab, mode) {
     document.getElementById('src-est-path').classList.toggle('on', mode === 'path');
     setEstimateRunState();
   } else {
+    document.getElementById('srch-form-sec').classList.toggle('hidden', mode !== 'form');
     document.getElementById('srch-yaml-sec').classList.toggle('hidden', mode !== 'yaml');
     document.getElementById('srch-path-sec').classList.toggle('hidden', mode !== 'path');
+    document.getElementById('src-srch-form').classList.toggle('on', mode === 'form');
     document.getElementById('src-srch-yaml').classList.toggle('on', mode === 'yaml');
     document.getElementById('src-srch-path').classList.toggle('on', mode === 'path');
+    setSearchRunState();
   }
+}
+
+// ── Search form: chip groups, run state, request builder ──────────────────────
+// Each entry: [label, id-suffix, type, options, defaults]. type='int' values
+// are sent as integers; 'str' as strings (for PP schedules / recompute / opt).
+const _SRCH_CHIPS = [
+  ['TP',         'tp',       'int', [1,2,4,8,16,32,64],    [1,2,4,8]],
+  ['PP',         'pp',       'int', [1,2,4,8,16],          [1,2,4,8]],
+  ['EP',         'ep',       'int', [1,2,4,8,16,32,64],    [1,8]],
+  ['CP',         'cp',       'int', [1,2,4,8],             [1]],
+  ['DP',         'dp',       'int', [1,2,4,8,16,32,64],    [1,2,4,8]],
+  ['ZeRO',       'zero',     'int', [0,1,2,3],             [0,1,2,3]],
+  ['VPP chunks', 'vpp',      'int', [1,2,4,8],             [1,2,4]],
+  ['PP sched',   'sched',    'str', ['1f1b','interleaved','dualpipe','dualpipe_v','zero_bubble'], ['1f1b','interleaved','dualpipe']],
+  ['Recompute',  'recomp',   'str', ['none','selective','full'], ['none','selective','full']],
+  ['Optimizer',  'opt',      'str', ['adam','muon'],       ['adam','muon']],
+];
+
+function renderSrchChips() {
+  const host = document.getElementById('srch-chips-host');
+  if (!host) return;
+  host.innerHTML = _SRCH_CHIPS.map(([label, id, , opts, defaults]) => {
+    const def = new Set(defaults.map(String));
+    const chips = opts.map(v => {
+      const on = def.has(String(v)) ? ' on' : '';
+      return `<button type="button" class="chip${on}" data-srch-chip="${id}" data-v="${v}" onclick="this.classList.toggle('on')">${v}</button>`;
+    }).join('');
+    return `<div class="chip-row">
+      <div class="chip-row-lbl">${label}</div>
+      <div class="chip-group">${chips}</div>
+    </div>`;
+  }).join('');
+}
+
+function _srchChipValues(suffix, type) {
+  const nodes = document.querySelectorAll(`[data-srch-chip="${suffix}"].on`);
+  const out = [];
+  nodes.forEach(n => out.push(type === 'int' ? parseInt(n.dataset.v, 10) : n.dataset.v));
+  return out;
+}
+
+function isSearchFormMode() {
+  const sec = document.getElementById('srch-form-sec');
+  return sec && !sec.classList.contains('hidden');
+}
+
+function setSearchRunState() {
+  const btn = document.getElementById('btn-srch');
+  const hint = document.getElementById('srch-run-hint');
+  if (!btn) return;
+  if (!isSearchFormMode()) {
+    btn.disabled = false;
+    if (hint) hint.textContent = 'POST /search → Pareto';
+    return;
+  }
+  const model = document.getElementById('srch-model-sel')?.value || '';
+  const hw    = document.getElementById('srch-hw-sel')?.value || '';
+  const waiting = !formModelsReady || !formHardwareReady || !model || !hw;
+  btn.disabled = waiting;
+  if (hint) hint.textContent = waiting ? 'loading model / hardware' : 'POST /search → Pareto';
+}
+
+function buildSearchFormBody() {
+  const modelKey = document.getElementById('srch-model-sel').value;
+  const hwKey    = document.getElementById('srch-hw-sel').value;
+  const nodes    = parseInt(document.getElementById('srch-nodes').value || 1);
+  const gpus     = parseInt(document.getElementById('srch-gpus').value  || 8);
+  const mb       = parseInt(document.getElementById('srch-mb').value    || 1);
+  const gb       = parseInt(document.getElementById('srch-gb').value    || 2048);
+  const maxMem   = parseFloat(document.getElementById('srch-maxmem').value || 80);
+
+  // Minimal valid strategy stub so load_specs accepts the YAML. The actual
+  // grid is driven by tp_values/pp_values/... in the request body.
+  const tpList = _srchChipValues('tp', 'int');
+  const ppList = _srchChipValues('pp', 'int');
+  const epList = _srchChipValues('ep', 'int');
+  const cpList = _srchChipValues('cp', 'int');
+  const stubTp = tpList[0] || 1;
+  const stubPp = ppList[0] || 1;
+  const stubEp = epList[0] || 1;
+  const stubCp = cpList[0] || 1;
+  const total  = nodes * gpus;
+  const stubDp = Math.max(1, Math.floor(total / (stubTp * stubPp * stubCp)));
+
+  const customModel = _modelCustom.find(c => c.key === modelKey);
+  const customHw    = _hwCustom.find(c => c.key === hwKey);
+  const modelSection = customModel
+    ? `model:\n${_indentYaml(customModel.content, 2)}`
+    : `model: ${modelKey}`;
+  const hwSection = customHw
+    ? `  hw:\n${_indentYaml(customHw.content, 4)}`
+    : `  hw: ${hwKey}`;
+
+  const yaml = `${modelSection}
+
+system:
+${hwSection}
+  nodes: ${nodes}
+  gpus_per_node: ${gpus}
+  host_mem_gb: 2048
+
+strategy:
+  tp: ${stubTp}
+  cp: ${stubCp}
+  pp: ${stubPp}
+  ep: ${stubEp}
+  dp: ${stubDp}
+  micro_batch: ${mb}
+  global_batch: ${gb}
+  zero_stage: 0
+  optimizer: adam
+  recompute:
+    per_layer:
+      dense: []
+      moe: []
+  offload: {opt_state: false, grads: false, params: false}`;
+
+  return {
+    config_content: yaml,
+    micro_batch: mb,
+    global_batch: gb,
+    max_memory_gb: maxMem,
+    tp_values: tpList,
+    pp_values: ppList,
+    ep_values: epList,
+    cp_values: cpList,
+    dp_values: _srchChipValues('dp', 'int'),
+    zero_stages: _srchChipValues('zero', 'int'),
+    vpp_chunks_values: _srchChipValues('vpp', 'int'),
+    pp_schedules: _srchChipValues('sched', 'str'),
+    recompute_policies: _srchChipValues('recomp', 'str'),
+    optimizer_values: _srchChipValues('opt', 'str'),
+  };
 }
 
 function isEstimateFormMode() {
@@ -1182,14 +1387,18 @@ function rebuildHwPanel() {
     ..._hwCustom.filter(c => c.isNew && !_hwDeleted.has(c.key)),
   ];
 
-  const hwSel = document.getElementById('form-hw-sel');
-  if (hwSel) hwSel.innerHTML = effective.map(h => {
+  const hwOptions = effective.map(h => {
     const label = (customMap.has(h.key) || h.isNew) ? `${esc(h.name||h.key)} [custom]` : esc(h.name||h.key);
     return `<option value="${esc(h.key)}">${label}</option>`;
   }).join('');
+  const hwSel = document.getElementById('form-hw-sel');
+  if (hwSel) hwSel.innerHTML = hwOptions;
+  const srchHwSel = document.getElementById('srch-hw-sel');
+  if (srchHwSel) srchHwSel.innerHTML = hwOptions;
   formHardwareReady = Boolean(effective.length);
   autoDP();
   setEstimateRunState();
+  setSearchRunState();
 
   const body = document.getElementById('hw-body');
   if (!body) return;
@@ -1287,14 +1496,17 @@ function renderModelPanel(models) {
 
 function populateModelSelect(models) {
   const sel = document.getElementById('form-model-sel');
-  if (!sel) return;
   const customKeys = new Set(_modelCustom.map(c => c.key));
-  sel.innerHTML = models.map(m => {
+  const options = models.map(m => {
     const label = (customKeys.has(m.key) || m._custom) ? `${esc(m.name||m.key)} [custom]` : esc(m.name||m.key);
     return `<option value="${esc(m.key)}">${label}</option>`;
   }).join('');
+  if (sel) sel.innerHTML = options;
+  const srchSel = document.getElementById('srch-model-sel');
+  if (srchSel) srchSel.innerHTML = options;
   formModelsReady = Boolean(models.length);
   setEstimateRunState();
+  setSearchRunState();
 }
 
 // ── CRUD modal ────────────────────────────────────────────────────────────────
@@ -1622,15 +1834,24 @@ async function runSearch() {
   const btn = document.getElementById('btn-srch');
   btn.disabled = true;
   try {
+    let body;
     const isPath = !document.getElementById('srch-path-sec').classList.contains('hidden');
-    const body = isPath
-      ? { config_path: document.getElementById('srch-path').value.trim() }
-      : { config_content: document.getElementById('srch-yaml').value.trim() };
-    const out = document.getElementById('srch-out').value.trim();
+    const isYaml = !document.getElementById('srch-yaml-sec').classList.contains('hidden');
+    if (isPath) {
+      body = { config_path: document.getElementById('srch-path').value.trim() };
+    } else if (isYaml) {
+      body = { config_content: document.getElementById('srch-yaml').value.trim() };
+    } else {
+      if (!formModelsReady || !formHardwareReady) {
+        throw new Error('model / hardware is still loading');
+      }
+      body = buildSearchFormBody();
+    }
+    const out = document.getElementById('srch-out')?.value.trim();
     if (out) body.output = out;
     await post('/search', body, 'search');
   } catch(e) { inlineError(e.message, 'search'); }
-  finally { btn.disabled = false; }
+  finally { setSearchRunState(); }
 }
 
 // ── Card lifecycle ─────────────────────────────────────────────────────────────
@@ -1683,175 +1904,25 @@ function refreshCard(job) {
 }
 
 // ── Estimate result ────────────────────────────────────────────────────────────
-function fmtFlops(v) {
-  if (!v) return '—';
-  if (v >= 1e15) return (v/1e15).toFixed(2)+' PF';
-  if (v >= 1e12) return (v/1e12).toFixed(2)+' TF';
-  if (v >= 1e9)  return (v/1e9).toFixed(2)+' GF';
-  return v.toFixed(0);
-}
-function fmtParams(v) {
-  if (!v) return '—';
-  if (v >= 1e12) return (v/1e12).toFixed(2)+'T';
-  if (v >= 1e9)  return (v/1e9).toFixed(1)+'B';
-  if (v >= 1e6)  return (v/1e6).toFixed(0)+'M';
-  return v.toFixed(0);
-}
-
 function renderEstimate(job) {
   const d  = job.result?.data;
   if (!d) return;
-  const st = d.step_time_ms;
-  const md = job.result?.model_detail    || {};
-  const hw = job.result?.hw_detail       || {};
-  const st2= job.result?.strategy_detail || {};
-  const cs = d.config_summary            || {};
+  const reportUrl = job.result?.html_url
+    || (job.result?.html_filename ? `/estimate/${job.result.html_filename}` : '');
 
-  // ── Model section ─────────────────────────────────────────────────
-  const layerStr = Object.entries(md.layer_counts||{}).map(([t,n])=>`${n}×${t}`).join(' · ');
-  const moeBadge = md.is_moe
-    ? `<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:rgba(0,184,144,.15);color:var(--teal);border:1px solid var(--teal-dim)">MoE</span>`
-    : `<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:rgba(212,140,12,.12);color:var(--amber);border:1px solid var(--amber-dim)">Dense</span>`;
-  const modelRows = [
-    { k:'arch',     v: `${md.attn_type||'—'} ${moeBadge}` },
-    { k:'hidden',   v: md.hidden??'—' },
-    { k:'ffn',      v: md.ffn??'—' },
-    { k:'heads',    v: md.num_heads ? `${md.num_heads} / ${md.num_kv_heads} (Q/KV)  head_dim ${md.head_dim}` : '—' },
-    md.is_moe ? { k:'experts', v: `${md.num_experts} × top-${md.top_k}` } : null,
-    { k:'layers',   v: layerStr || (md.num_layers??'—') },
-    { k:'vocab',    v: md.vocab ? `${(md.vocab/1000).toFixed(0)}K` : '—' },
-    { k:'ctx',      v: md.seq_len??'—' },
-    { k:'dtype',    v: md.param_dtype||'—' },
-    { k:'params',   v: fmtParams(md.total_params||d.effective_params) },
-  ].filter(Boolean);
-
-  // ── Hardware section ───────────────────────────────────────────────
-  const hwRows = [
-    { k:'GPU',     v: hw.name||cs.system||'—' },
-    { k:'cluster', v: hw.world_size ? `${hw.nodes} nodes × ${hw.gpus_per_node} GPUs = ${hw.world_size}` : '—' },
-    { k:'BF16',    v: hw.bf16_tflops ? `${hw.bf16_tflops} TFLOPS` : '—' },
-    { k:'FP8',     v: hw.fp8_tops    ? `${hw.fp8_tops} TOPS`      : '—' },
-    { k:'HBM',     v: hw.hbm_gb      ? `${hw.hbm_gb} GB  ·  ${hw.hbm_bw_gbps} GB/s` : '—' },
-    hw.intra ? { k:'intra',  v: hw.intra } : null,
-    hw.inter ? { k:'inter',  v: hw.inter } : null,
-  ].filter(Boolean);
-
-  // ── Strategy section ──────────────────────────────────────────────
-  const stratRows = [
-    { k:'parallel',   v: st2.tp ? `TP${st2.tp} · CP${st2.cp} · PP${st2.pp} · EP${st2.ep} · DP${st2.dp}` : (cs.strategy||'—') },
-    { k:'schedule',   v: `${st2.pp_schedule||d.schedule_name||'—'}  ·  ${st2.num_microbatches??cs.num_microbatches??'—'} µbatches` },
-    { k:'batch',      v: `micro ${st2.micro_batch??cs.micro_batch??'—'}  ·  global ${st2.global_batch??cs.global_batch??'—'}` },
-    { k:'ZeRO',       v: `stage ${st2.zero_stage??cs.zero_stage??'—'}` },
-    { k:'optimizer',  v: st2.optimizer||'—' },
-    { k:'TP overlap', v: st2.tp_overlap||'—' },
-    { k:'FLOPs/tok',  v: fmtFlops(d.flops_per_token) },
-    { k:'total FLOPs',v: fmtFlops(d.total_flops) },
-  ];
-
-  function cfgSection(title, rows) {
-    return `<div class="section">
-      <div class="section-title">${title}</div>
-      <div class="cfg-grid">
-        ${rows.map(r=>`<div class="cfg-row${r.full?' full':''}"><span class="cfg-k">${r.k}</span><span class="cfg-v">${r.v}</span></div>`).join('')}
-      </div></div>`;
-  }
-  const cfgHtml = cfgSection('model', modelRows)
-                + cfgSection('hardware', hwRows)
-                + cfgSection('strategy', stratRows);
-
-  const comps = [
-    { l:'Forward compute',  v:d.fwd_compute_ms,   c:'#00b890' },
-    { l:'Backward compute', v:d.bwd_compute_ms,   c:'#f0a828' },
-    { l:'TP comm',          v:d.tp_exposed_ms||0, c:'#e04848' },
-    { l:'CP comm',          v:d.cp_exposed_ms||0, c:'#e04848' },
-    { l:'EP comm',          v:d.ep_exposed_ms||0, c:'#e04848' },
-    { l:'PP comm',          v:d.pp_exposed_ms||0, c:'#e04848' },
-    { l:'DP comm',          v:d.dp_exposed_ms||0, c:'#e04848' },
-    { l:'Optimizer',        v:(d.optimizer_time_ms||0)+(d.optimizer_comm_ms||0), c:'#7060c8' },
-  ].filter(c => c.v > 0);
-  const bkHtml = comps.map(c=>`
-    <div class="bk-row">
-      <span class="bk-lbl">${c.l}</span>
-      <div class="bk-wrap"><div class="bk-bar" style="width:${(c.v/st*100).toFixed(1)}%;background:${c.c}"></div></div>
-      <span class="bk-val">${fmtMs(c.v)}</span>
-    </div>`).join('');
-
-  let phaseHtml = '';
-  if (d.warmup_ms > 0 || d.steady_ms > 0) {
-    const rows = [
-      ['warmup',   d.warmup_fwd_ms,   d.warmup_bwd_ms,   d.warmup_ms],
-      ['steady',   d.steady_fwd_ms,   d.steady_bwd_ms,   d.steady_ms],
-      ['cooldown', d.cooldown_fwd_ms, d.cooldown_bwd_ms, d.cooldown_ms],
-      ['total',    d.warmup_fwd_ms+d.steady_fwd_ms+d.cooldown_fwd_ms,
-                   d.warmup_bwd_ms+d.steady_bwd_ms+d.cooldown_bwd_ms,
-                   d.warmup_ms+d.steady_ms+d.cooldown_ms],
-    ];
-    phaseHtml = `<div class="section">
-      <div class="section-title">phase breakdown</div>
-      <table class="phase-tbl">
-        <tr><th>phase</th><th>fwd</th><th>bwd</th><th>total</th></tr>
-        ${rows.map(([n,...v],i)=>`<tr${i===3?' class="total"':''}><td>${n}</td>${v.map(x=>`<td>${fmtMs(x)}</td>`).join('')}</tr>`).join('')}
-      </table>
-      ${d.steady_per_mb_ms>0?`<div style="margin-top:7px;font-size:10px;color:var(--text-muted)">per microbatch (steady): fwd ${fmtMs(d.steady_fwd_per_mb_ms)} · bwd ${fmtMs(d.steady_bwd_per_mb_ms)} · total ${fmtMs(d.steady_per_mb_ms)}</div>`:''}
-    </div>`;
-  }
-
-  let memHtml = '';
-  if (d.memory) {
-    const gb = d.memory;
-    const fields = [
-      {l:'weights',v:gb.weights_gb},{l:'grads',v:gb.grads_gb},
-      {l:'opt state',v:gb.opt_state_gb},{l:'activations',v:gb.activations_gb},
-      {l:'comm buf',v:gb.comm_buffers_gb},
-    ].filter(f=>f.v>0);
-    const peak = gb.peak_gb || gb.total_gb || 0;
-    memHtml = `<div class="section">
-      <div class="section-title">memory / gpu</div>
-      <div class="mem-grid">
-        ${fields.map(f=>`<div class="mem-cell"><div class="mem-l">${f.l}</div><div class="mem-v">${f.v.toFixed(1)}</div><div class="mem-u">GB</div></div>`).join('')}
-        <div class="mem-cell"><div class="mem-l">allocated</div><div class="mem-v">${(gb.total_gb||0).toFixed(1)}</div><div class="mem-u">GB</div></div>
-        <div class="mem-cell"><div class="mem-l">peak</div><div class="mem-v hi">${peak.toFixed(1)}</div><div class="mem-u">GB</div></div>
-      </div></div>`;
-  }
-
-  let commHtml = '';
-  if (d.hidden_comm_ms > 0 || d.exposed_comm_ms > 0) {
-    commHtml = `<div class="section">
-      <div class="section-title">communication</div>
-      <div class="cfg-grid">
-        <div class="cfg-row"><span class="cfg-k">exposed</span><span class="cfg-v">${fmtMs(d.exposed_comm_ms||0)}</span></div>
-        <div class="cfg-row"><span class="cfg-k">hidden</span><span class="cfg-v">${fmtMs(d.hidden_comm_ms||0)}</span></div>
-        <div class="cfg-row"><span class="cfg-k">volume</span><span class="cfg-v">${fmtMs(d.total_comm_volume_ms||0)}</span></div>
-        <div class="cfg-row"><span class="cfg-k">DP hidden</span><span class="cfg-v">${fmtMs(d.dp_hidden_ms||0)}</span></div>
-      </div></div>`;
-  }
-
-  let warnHtml = '';
-  if (d.warnings?.length) {
-    warnHtml = `<div class="section"><ul class="warn-list">${d.warnings.map(w=>`<li class="warn-item">${esc(w)}</li>`).join('')}</ul></div>`;
-  }
-
+  // The detailed metrics/config/breakdown sections duplicate what the report
+  // page already shows, so we embed the report itself as the main view and
+  // keep only a slim action row (toggle + Excel download + summary).
   document.getElementById('body-'+job.id).outerHTML = `<div id="body-${job.id}">
-    <div class="mstrip">
-      <div class="mc"><div class="mc-l">Step Time</div><div class="mc-v">${fmtMs(st)}</div></div>
-      <div class="mc"><div class="mc-l">MFU</div><div class="mc-v">${(d.mfu*100).toFixed(1)}<span class="mc-u">%</span></div></div>
-      <div class="mc"><div class="mc-l">HFU</div><div class="mc-v">${(d.hfu*100).toFixed(1)}<span class="mc-u">%</span></div></div>
-      <div class="mc"><div class="mc-l">Bubble</div><div class="mc-v">${(d.bubble_fraction*100).toFixed(1)}<span class="mc-u">%</span></div></div>
-      <div class="mc"><div class="mc-l">Tokens/s</div><div class="mc-v">${d.tokens_per_sec>0?fmtNum(d.tokens_per_sec):'—'}</div></div>
-    </div>
-    ${cfgHtml}
-    <div class="section">
-      <div class="section-title">step time breakdown</div>
-      ${bkHtml}
-    </div>
-    ${phaseHtml}${memHtml}${commHtml}${warnHtml}
     <div class="action-row">
-      <button class="action-btn" data-report-btn="${job.id}" onclick="toggleReport('${job.id}')">View Report ▾</button>
+      ${reportUrl ? `<button class="action-btn" data-report-btn="${job.id}" onclick="toggleReport('${job.id}')">Hide Report ▴</button>` : ''}
       ${job.result?.excel_url ? `<button class="action-btn" type="button" data-job-id="${job.id}" data-artifact-kind="excel">Download Excel</button>` : ''}
-      <span class="action-meta">${esc(d.schedule_name||'')} · ${job.id.slice(0,8)}</span>
+      <span class="action-meta">${esc(d.schedule_name||'')} · MFU ${(d.mfu*100).toFixed(1)}% · step ${fmtMs(d.step_time_ms)} · ${job.id.slice(0,8)}</span>
       <span class="action-msg" data-action-msg="${job.id}"></span>
     </div>
   </div>`;
+
+  if (reportUrl) openReportInline(job.id, apiUrl(reportUrl));
 
   job._metric = `MFU ${(d.mfu*100).toFixed(1)}%`;
   renderHist();
@@ -1870,7 +1941,7 @@ function _paretoRow(jobId, d, i) {
     <td>${(d.mfu*100).toFixed(1)}%</td>
     <td>${(d.bubble_fraction*100).toFixed(1)}%</td>
     <td>${d.tokens_per_sec>0?fmtNum(d.tokens_per_sec):'—'}</td>
-    <td><button class="${cls}" data-pareto-btn="${jobId}-${i}" onclick="openOrRenderParetoDetail('${jobId}',${i})">${label}</button></td>
+    <td><button class="${cls}" data-pareto-btn="${jobId}-${i}" data-idx="${i}" onclick="openOrRenderParetoDetail('${jobId}',${i})">${label}</button></td>
   </tr>`;
 }
 
@@ -1888,7 +1959,7 @@ function renderSearch(job) {
       <div class="mc"><div class="mc-l">Pareto</div><div class="mc-v" style="color:var(--teal)">${r?.pareto_count||0}</div></div>
     </div>
     <div class="section">
-      <div class="section-title">pareto frontier (top 10 — click "open" for detail page; ★ pre-rendered)</div>
+      <div class="section-title">pareto frontier (top 10 — click "open" to expand detail inline; ★ pre-rendered)</div>
       <table class="pareto-tbl">
         <thead><tr><th>#</th><th>strategy</th><th>step</th><th>MFU</th><th>bubble</th><th>tok/s</th><th>detail</th></tr></thead>
         <tbody>${rows}</tbody>
@@ -1905,7 +1976,38 @@ function renderSearch(job) {
   renderHist();
 }
 
-// Open the detail HTML in a new tab. If not yet rendered, ask the server to
+// Refresh the labels/active-state of every pareto detail button for a job.
+// `activeIdx` is the row whose report is currently shown inline (-1 = none).
+function updateParetoBtns(jobId, activeIdx) {
+  const job = jobs.find(j => j.id === jobId);
+  const frontier = job?.result?.pareto_frontier || [];
+  document.querySelectorAll(`[data-pareto-btn^="${jobId}-"]`).forEach(b => {
+    if (b.disabled) return; // mid-render
+    const i = parseInt(b.dataset.idx, 10);
+    const active = i === activeIdx;
+    const ready = !!frontier[i]?.html_url;
+    b.classList.toggle('on-detail', active);
+    b.textContent = active ? 'hide ▴' : (ready ? (i === 0 ? '★ open' : 'open') : 'render');
+  });
+}
+
+// Show a Pareto entry's detail report inline (expand/collapse in place), reusing
+// the card's report wrap. Clicking the already-open row collapses it.
+function showParetoInline(jobId, idx, url) {
+  const wrap = ensureReportWrap(jobId);
+  if (!wrap) return;
+  if (wrap.dataset.idx === String(idx) && wrap.classList.contains('open')) {
+    wrap.classList.remove('open');
+    updateParetoBtns(jobId, -1);
+    return;
+  }
+  wrap.dataset.idx = String(idx);
+  requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.add('open')));
+  loadReportFrame(jobId, apiUrl(url));
+  updateParetoBtns(jobId, idx);
+}
+
+// Open the detail report inline. If not yet rendered, ask the server to
 // render this Pareto entry first.
 async function openOrRenderParetoDetail(jobId, idx) {
   const job = jobs.find(j => j.id === jobId);
@@ -1914,7 +2016,7 @@ async function openOrRenderParetoDetail(jobId, idx) {
   if (!entry) return;
 
   if (entry.html_url) {
-    window.open(apiUrl(entry.html_url), '_blank', 'noopener');
+    showParetoInline(jobId, idx, entry.html_url);
     return;
   }
   // Lazy render.
@@ -1927,39 +2029,54 @@ async function openOrRenderParetoDetail(jobId, idx) {
     entry.html_url      = data.html_url;
     entry.html_filename = data.html_filename;
     btns.forEach(b => { b.disabled = false; b.classList.remove('pending'); b.textContent = 'open'; });
-    window.open(apiUrl(data.html_url), '_blank', 'noopener');
+    showParetoInline(jobId, idx, data.html_url);
   } catch (e) {
     btns.forEach(b => { b.disabled = false; b.classList.remove('pending'); b.classList.add('failed'); b.textContent = 'failed'; b.title = String(e.message || e); });
   }
 }
 
 // ── Report ─────────────────────────────────────────────────────────────────────
+// Create (once) the inline report iframe + loader for a card and return it.
+function ensureReportWrap(jobId) {
+  let wrap = document.getElementById('report-wrap-'+jobId);
+  if (wrap) return wrap;
+  const card = document.getElementById('res-'+jobId);
+  if (!card) return null;
+  wrap = document.createElement('div');
+  wrap.id = 'report-wrap-'+jobId;
+  wrap.className = 'report-wrap';
+  wrap.innerHTML = `
+    <div class="report-loader" data-report-loader="${jobId}">
+      <div class="report-loader-box">
+        <div class="report-loader-top">
+          <div class="report-loader-title">loading report</div>
+          <div class="report-loader-pct" data-report-pct="${jobId}">0%</div>
+        </div>
+        <div class="report-progress"><div class="report-progress-bar" data-report-progress="${jobId}"></div></div>
+        <div class="report-loader-msg" data-report-msg="${jobId}">requesting artifact…</div>
+      </div>
+    </div>
+    <iframe class="report-frame" data-report-frame="${jobId}"></iframe>`;
+  card.appendChild(wrap);
+  return wrap;
+}
+
+// Open the inline report (creating the wrap if needed) and load `url` into it.
+function openReportInline(jobId, url) {
+  const wrap = ensureReportWrap(jobId);
+  if (!wrap) return;
+  requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.add('open')));
+  loadReportFrame(jobId, url);
+}
+
 function toggleReport(jobId) {
   const job = jobs.find(j => j.id === jobId);
   const url = job?.result?.html_url || (job?.result?.html_filename ? `/estimate/${job.result.html_filename}` : '');
   if (!url) return;
-  const card = document.getElementById('res-'+jobId);
   const btn  = document.querySelector('[data-report-btn="'+jobId+'"]');
   let wrap   = document.getElementById('report-wrap-'+jobId);
   if (!wrap) {
-    wrap = document.createElement('div');
-    wrap.id = 'report-wrap-'+jobId;
-    wrap.className = 'report-wrap';
-    wrap.innerHTML = `
-      <div class="report-loader" data-report-loader="${jobId}">
-        <div class="report-loader-box">
-          <div class="report-loader-top">
-            <div class="report-loader-title">loading report</div>
-            <div class="report-loader-pct" data-report-pct="${jobId}">0%</div>
-          </div>
-          <div class="report-progress"><div class="report-progress-bar" data-report-progress="${jobId}"></div></div>
-          <div class="report-loader-msg" data-report-msg="${jobId}">requesting artifact…</div>
-        </div>
-      </div>
-      <iframe class="report-frame" data-report-frame="${jobId}"></iframe>`;
-    card.appendChild(wrap);
-    requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.add('open')));
-    loadReportFrame(jobId, apiUrl(url));
+    openReportInline(jobId, apiUrl(url));
     if (btn) btn.textContent = 'Hide Report ▴';
     return;
   }
@@ -1993,6 +2110,10 @@ async function loadReportFrame(jobId, url) {
   const frame = document.querySelector(`[data-report-frame="${jobId}"]`);
   const loader = document.querySelector(`[data-report-loader="${jobId}"]`);
   if (!frame || !url) return;
+  // Reset state so a reused wrap (e.g. switching search detail rows) re-shows
+  // the loader and fades the new page back in.
+  frame.classList.remove('ready');
+  if (loader) loader.classList.remove('done');
   updateReportProgress(jobId, 3, 'requesting artifact…', false);
   try {
     const r = await fetch(url);
@@ -2084,11 +2205,15 @@ function toggleSearchReport(jobId) {
   const title = body.querySelector('.section-title');
   if (title) {
     title.textContent = isExpanded
-      ? 'pareto frontier (top 10 — click "open" for detail page; ★ pre-rendered)'
-      : `pareto frontier (all ${frontier.length} — click "open" for detail page; ★ pre-rendered)`;
+      ? 'pareto frontier (top 10 — click "open" to expand detail inline; ★ pre-rendered)'
+      : `pareto frontier (all ${frontier.length} — click "open" to expand detail inline; ★ pre-rendered)`;
   }
   body.dataset.expanded = isExpanded ? '0' : '1';
   if (btn) btn.textContent = isExpanded ? `All ${frontier.length} configs ▾` : `Top 10 only ▴`;
+  // Re-applying labels: rebuilding the tbody reset the active "hide" state.
+  const wrap = document.getElementById('report-wrap-'+jobId);
+  const activeIdx = (wrap && wrap.classList.contains('open')) ? parseInt(wrap.dataset.idx, 10) : -1;
+  updateParetoBtns(jobId, activeIdx);
 }
 
 // ── Polling ────────────────────────────────────────────────────────────────────
@@ -2153,7 +2278,10 @@ renderUsername();
 if (!localStorage.getItem(USER_KEY)) openUserModal();
 
 loadPreset('est', 'llama3_70b');
+loadPreset('srch', 'llama3_70b');
+renderSrchChips();
 setEstimateRunState();
+setSearchRunState();
 checkHealth();
 setInterval(checkHealth, 30000);
 renderHist();

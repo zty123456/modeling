@@ -130,7 +130,12 @@ class EstimateRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    """Grid-search parallel strategies for a training config."""
+    """Grid-search parallel strategies for a training config.
+
+    Provide model / system via YAML (`config_path` or `config_content`); the
+    search space dimensions can be narrowed via the optional fields below.
+    Anything left unset falls back to `SearchSpace` defaults.
+    """
 
     config_path: Optional[str] = Field(
         None,
@@ -152,3 +157,27 @@ class SearchRequest(BaseModel):
         None,
         description="提交者用户名（前端 localStorage 带入，用于使用统计）。",
     )
+
+    # ── Search-space overrides (None → use SearchSpace defaults) ──────────
+    tp_values: Optional[List[int]] = Field(None, description="Tensor-parallel degrees to search.")
+    cp_values: Optional[List[int]] = Field(None, description="Context-parallel degrees to search.")
+    pp_values: Optional[List[int]] = Field(None, description="Pipeline-parallel degrees to search.")
+    ep_values: Optional[List[int]] = Field(None, description="Expert-parallel degrees to search.")
+    dp_values: Optional[List[int]] = Field(None, description="Data-parallel degrees to search.")
+    zero_stages: Optional[List[int]] = Field(None, description="ZeRO stages (0..3).")
+    pp_schedules: Optional[List[str]] = Field(
+        None,
+        description="PP schedule names: 1f1b | interleaved | dualpipe | dualpipe_v | zero_bubble.",
+    )
+    recompute_policies: Optional[List[str]] = Field(
+        None, description="Recompute policies: none | selective | full.",
+    )
+    vpp_chunks_values: Optional[List[int]] = Field(None, description="VPP chunk counts.")
+    optimizer_values: Optional[List[str]] = Field(
+        None, description="Optimizers: adam | muon.",
+    )
+    max_memory_gb: Optional[float] = Field(
+        None, gt=0, description="Memory feasibility ceiling per GPU (default 80 GB).",
+    )
+    micro_batch: Optional[int] = Field(None, ge=1, description="Overrides YAML micro_batch.")
+    global_batch: Optional[int] = Field(None, ge=1, description="Overrides YAML global_batch.")

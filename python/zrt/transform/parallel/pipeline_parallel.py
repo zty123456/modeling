@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
+from python.zrt.graph.layer_strategy import LayerProfile, LayerType
+from python.zrt.graph.partition import partition_layers_by_strategy
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.types import TensorMeta, DType
@@ -80,7 +82,16 @@ class PipelineParallelPass(GraphPass):
         pp_schedule = getattr(ctx.training, "pp_schedule", "1f1b") if ctx.training else "1f1b"
         is_vpp = vpp_chunks > 1 and pp_schedule in ("interleaved", "i1f1b", "dualpipev")
 
-        # 1. Build layer_id → {node_ids} and per-layer compute load
+        # 1. Check for typical layer data (from metadata)
+        layer_profile = g.metadata.get("layer_profile")
+        typical_indices = g.metadata.get("typical_indices")
+        typical_costs_fwd = g.metadata.get("typical_costs_fwd")
+        
+        # If typical_costs_fwd not set but we have layer_profile + typical_indices, extract from nodes
+        if layer_profile is not None and typical_indices is not None and typical_costs_fwd is None:
+            typical_costs_fwd = self._extract_typical_costs(g, typical_indices, layer_profile)
+        
+        # 2. Build layer_id → {node_ids} and per-layer compute load
         layer_nodes: Dict[int, Set[str]] = {}
         layer_load:  Dict[int, float]    = {}
 
@@ -102,9 +113,13 @@ class PipelineParallelPass(GraphPass):
 
         sorted_layers = sorted(k for k in layer_nodes if k >= 0)
 
-        # 2. Partition layers → pp stages
-        stages = self._partition(sorted_layers, layer_nodes, layer_load,
-                                 pp, pp_layer_assignment, vpp_chunks, is_vpp)
+        # 3. Partition layers → pp stages (prefer typical layer data if available)
+        stages = self._partition(
+            sorted_layers, layer_nodes, layer_load,
+            pp, pp_layer_assignment, vpp_chunks, pp_schedule,
+            layer_profile=layer_profile,
+            typical_costs=typical_costs_fwd,
+        )
 
         # 2.5 Distribute non-layer (layer_idx=-1) nodes to appropriate stages.
         #     These include embedding, final norm, lm_head, and all backward
@@ -156,8 +171,16 @@ class PipelineParallelPass(GraphPass):
         pp: int,
         explicit: Optional[List[int]],
         vpp_chunks: int = 1,
-        is_vpp: bool = False,
+        pp_schedule: str = "1f1b",
+        layer_profile: Optional["LayerProfile"] = None,
+        typical_costs: Optional[Dict[Any, float]] = None,
     ) -> List[LayerGroup]:
+        """Partition layers into stages.
+        
+        Priority:
+        1. If layer_profile + typical_costs available → use partition_layers_by_strategy
+        2. Otherwise → use layer_load from graph nodes
+        """
         stages = [LayerGroup(stage_id=i) for i in range(pp)]
 
         if not sorted_layers:
@@ -165,37 +188,51 @@ class PipelineParallelPass(GraphPass):
 
         n_layers = len(sorted_layers)
 
-        if explicit and len(explicit) == n_layers:
+        # Use typical layer data if available (from metadata)
+        if layer_profile is not None and typical_costs is not None:
+            profile = layer_profile
+            costs = typical_costs
+        else:
+            # Fallback: build simplified profile from sorted_layers
+            profile = LayerProfile(
+                layer_types=[LayerType.DENSE] * n_layers,
+                typical_indices=[0],
+            )
+            costs: Dict[int, float] = layer_load
+
+        layer_assignment = partition_layers_by_strategy(
+            layer_profile=profile,
+            typical_costs=costs,
+            pp=pp,
+            pp_schedule=pp_schedule,
+            vpp_chunks=vpp_chunks,
+            pp_layer_assignment=explicit,
+        )
+
+        # Compute total_compute_us per stage
+        if layer_profile is not None and typical_costs is not None:
+            # Use typical_costs (LayerType granularity)
+            is_by_layer_type = any(isinstance(k, LayerType) for k in typical_costs.keys())
             for idx, layer_id in enumerate(sorted_layers):
-                s_idx = max(0, min(explicit[idx], pp - 1))
+                s_idx = layer_assignment[idx]
+                stages[s_idx].layer_ids.append(layer_id)
+                stages[s_idx].node_ids.update(layer_nodes[layer_id])
+                if idx < len(layer_profile.layer_types):
+                    layer_type = layer_profile.layer_types[idx]
+                    if is_by_layer_type:
+                        load = typical_costs.get(layer_type, 0.0)
+                    else:
+                        load = typical_costs.get(layer_id, 0.0)
+                else:
+                    load = 0.0
+                stages[s_idx].total_compute_us += load
+        else:
+            # Use layer_load (layer_idx granularity)
+            for idx, layer_id in enumerate(sorted_layers):
+                s_idx = layer_assignment[idx]
                 stages[s_idx].layer_ids.append(layer_id)
                 stages[s_idx].node_ids.update(layer_nodes[layer_id])
                 stages[s_idx].total_compute_us += layer_load.get(layer_id, 0.0)
-        elif is_vpp:
-            total_chunks = pp * vpp_chunks
-            layers_per_chunk = max(1, n_layers // total_chunks)
-            for idx, layer_id in enumerate(sorted_layers):
-                chunk_id = min(idx // layers_per_chunk, total_chunks - 1)
-                s_idx = chunk_id % pp
-                stages[s_idx].layer_ids.append(layer_id)
-                stages[s_idx].node_ids.update(layer_nodes[layer_id])
-                load = layer_load.get(layer_id, 0.0)
-                stages[s_idx].total_compute_us += load
-            if vpp_chunks > 1:
-                logger.info(
-                    "PipelineParallelPass: VPP interleaved assignment "
-                    "(pp=%d, vpp_chunks=%d, layers_per_chunk=%d, total_chunks=%d)",
-                    pp, vpp_chunks, layers_per_chunk, total_chunks,
-                )
-        else:
-            stage_load = [0.0] * pp
-            for layer_id in sorted_layers:
-                min_s = int(min(range(pp), key=lambda i: stage_load[i]))
-                stages[min_s].layer_ids.append(layer_id)
-                stages[min_s].node_ids.update(layer_nodes[layer_id])
-                load = layer_load.get(layer_id, 0.0)
-                stages[min_s].total_compute_us += load
-                stage_load[min_s] += load
 
         return stages
 
@@ -442,3 +479,52 @@ class PipelineParallelPass(GraphPass):
                 "Consider setting --pp-layer-assignment.",
                 ratio,
             )
+
+    def _extract_typical_costs(
+        self,
+        g: "OpGraph",
+        typical_indices: List[int],
+        layer_profile: "LayerProfile",
+    ) -> Dict["LayerType", float]:
+        """Extract typical layer costs from graph node annotations.
+        
+        Args:
+            g: OpGraph with node annotations (latency_us)
+            typical_indices: List of typical layer indices
+            layer_profile: LayerProfile with layer_types mapping
+        
+        Returns:
+            {LayerType: cost_per_layer_in_us} for forward phase
+        """
+        typical_costs: Dict[LayerType, float] = {}
+        
+        for node in g.nodes.values():
+            layer = node.annotations.get("layer") or getattr(node, "layer", "")
+            if not layer:
+                continue
+            
+            try:
+                layer_idx = int(layer)
+            except (ValueError, TypeError):
+                continue
+            
+            if layer_idx not in typical_indices:
+                continue
+            
+            if layer_idx >= len(layer_profile.layer_types):
+                continue
+            
+            # Skip backward nodes (phase in bwd phases)
+            phase = node.annotations.get("phase", "")
+            if phase in ("bwd", "backward", "train_backward"):
+                continue
+            
+            # Skip communication nodes
+            if node.category == "communication":
+                continue
+            
+            layer_type = layer_profile.layer_types[layer_idx]
+            latency = node.annotations.get("latency_us", 0.0)
+            typical_costs[layer_type] = typical_costs.get(layer_type, 0.0) + latency
+        
+        return typical_costs

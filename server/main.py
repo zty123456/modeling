@@ -631,16 +631,12 @@ def _search_worker(job_id: str, req: SearchRequest) -> None:
 
 def _do_search(req: SearchRequest, job_id: str) -> dict:
     from python.zrt.training.io.config_loader import load_specs
-    from python.zrt.training.search.space import SearchSpace
     from python.zrt.training.search.report import report_to_dict
 
     config_path, tmp = _resolve_yaml(req.config_path, req.config_content)
     try:
         model, system, strategy = load_specs(config_path)
-        space = SearchSpace(
-            micro_batch=strategy.micro_batch,
-            global_batch=strategy.global_batch,
-        )
+        space = _build_search_space(req, strategy)
         # Pair each surviving (strategy, report) so we can render any Pareto
         # entry later. The stock grid_search() drops the originating strategy.
         all_pairs = _grid_search_with_strategies(model, system, space)
@@ -698,6 +694,37 @@ def _do_search(req: SearchRequest, job_id: str) -> dict:
 
 
 # ── /search helpers ───────────────────────────────────────────────────────────
+
+def _build_search_space(req: SearchRequest, strategy: Any) -> Any:
+    """Translate SearchRequest overrides into a SearchSpace.
+
+    Anything left unset on the request keeps the SearchSpace default. Numeric
+    lists are forwarded verbatim; enum-valued lists (pp_schedules, optimizer
+    kinds) are mapped through their constructors.
+    """
+    from python.zrt.training.search.space import SearchSpace
+    from python.zrt.training.spec.strategy import OptKind, PPSched
+
+    kwargs: dict[str, Any] = {
+        "micro_batch": req.micro_batch if req.micro_batch is not None else strategy.micro_batch,
+        "global_batch": req.global_batch if req.global_batch is not None else strategy.global_batch,
+    }
+    # Pure-int list overrides — same key on both sides.
+    for key in ("tp_values", "cp_values", "pp_values", "ep_values", "dp_values",
+                "zero_stages", "vpp_chunks_values"):
+        val = getattr(req, key, None)
+        if val:
+            kwargs[key] = val
+    if req.max_memory_gb is not None:
+        kwargs["max_memory_gb"] = req.max_memory_gb
+    if req.pp_schedules:
+        kwargs["pp_schedules"] = [PPSched(s) for s in req.pp_schedules]
+    if req.recompute_policies:
+        kwargs["recompute_policies"] = req.recompute_policies
+    if req.optimizer_values:
+        kwargs["optimizer_values"] = [OptKind(s) for s in req.optimizer_values]
+    return SearchSpace(**kwargs)
+
 
 def _grid_search_with_strategies(model: Any, system: Any, space: Any) -> list[tuple[Any, Any]]:
     """grid_search variant that keeps each report paired with its strategy.

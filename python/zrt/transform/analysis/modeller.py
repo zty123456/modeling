@@ -68,6 +68,7 @@ def estimate_training_from_graphs(
     num_heads: int | None = None,
     kv_heads: int | None = None,
     head_dim: int | None = None,
+    layer_profile: "LayerProfile | None" = None,
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -110,6 +111,25 @@ def estimate_training_from_graphs(
         metadata["total_params"] = int(total_params)
     if model_type is not None:
         metadata["model_type"] = model_type
+    
+    # Add LayerProfile info for precise scaling
+    if layer_profile is not None:
+        metadata["layer_profile"] = layer_profile
+        metadata["num_dense"] = layer_profile.num_dense
+        metadata["num_moe"] = layer_profile.num_moe
+        metadata["num_hca_hash"] = layer_profile.num_hca_hash
+        metadata["num_hca_topk"] = layer_profile.num_hca_topk
+        metadata["num_hca"] = layer_profile.num_hca
+        metadata["num_csa_hash"] = layer_profile.num_csa_hash
+        metadata["num_csa_topk"] = layer_profile.num_csa_topk
+        metadata["num_csa"] = layer_profile.num_csa
+        metadata["num_swa_hash"] = layer_profile.num_swa_hash
+        metadata["num_swa_topk"] = layer_profile.num_swa_topk
+        metadata["num_swa"] = layer_profile.num_swa
+        metadata["typical_indices"] = layer_profile.typical_indices
+        # Auto-set num_layers from LayerProfile if not provided
+        if num_layers_full is None and layer_profile.total_layers > num_layers:
+            metadata["num_layers"] = layer_profile.total_layers
 
     # Force set metadata (overwrite existing keys)
     for key, val in metadata.items():

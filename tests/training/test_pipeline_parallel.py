@@ -858,3 +858,67 @@ class TestPipelineIntegration:
 
         p2p_nodes = [n for n in result.nodes.values() if n.op_type == "comm.send_recv"]
         assert len(p2p_nodes) == 0
+
+
+# ── 6. Typical Layer Partition ─────────────────────────────────────────────
+
+class TestTypicalLayerPartition:
+    """Partition with typical layer costs (LayerType granularity)."""
+
+    def test_typical_layer_greedy_partition_basic(self):
+        """Greedy partition balances stage loads better than uniform."""
+        from python.zrt.graph.layer_strategy import LayerProfile, LayerType
+        from python.zrt.graph.partition import partition_layers_by_strategy
+        
+        layer_types = [LayerType.HCA_HASH, LayerType.HCA_HASH, LayerType.HCA_TOPK, LayerType.SWA_HASH]
+        profile = LayerProfile(layer_types=layer_types, typical_indices=[0, 2])
+        
+        typical_costs_fwd = {LayerType.HCA_HASH: 1000.0, LayerType.HCA_TOPK: 500.0, LayerType.SWA_HASH: 100.0}
+        
+        assignment = partition_layers_by_strategy(profile, typical_costs_fwd, pp=2, pp_schedule="1f1b")
+        
+        # Compute stage fwd manually
+        stage_fwd = [0.0, 0.0]
+        for i, layer_type in enumerate(layer_types):
+            stage_fwd[assignment[i]] += typical_costs_fwd.get(layer_type, 0.0)
+        
+        uniform_diff = abs(2000.0 - 600.0)
+        greedy_diff = abs(stage_fwd[0] - stage_fwd[1])
+        
+        assert greedy_diff < uniform_diff
+        
+    def test_typical_layer_explicit_assignment_override(self):
+        """Explicit pp_layer_assignment takes precedence over greedy."""
+        from python.zrt.graph.layer_strategy import LayerProfile, LayerType
+        from python.zrt.graph.partition import partition_layers_by_strategy
+        
+        layer_types = [LayerType.HCA_HASH, LayerType.HCA_HASH, LayerType.HCA_TOPK, LayerType.SWA_HASH]
+        profile = LayerProfile(layer_types=layer_types, typical_indices=[0, 2])
+        
+        typical_costs_fwd = {LayerType.HCA_HASH: 1000.0, LayerType.HCA_TOPK: 500.0, LayerType.SWA_HASH: 100.0}
+        
+        explicit_assignment = [0, 0, 0, 1]
+        assignment = partition_layers_by_strategy(
+            profile, typical_costs_fwd, pp=2, 
+            pp_schedule="1f1b",
+            pp_layer_assignment=explicit_assignment
+        )
+        
+        assert assignment == explicit_assignment
+        
+    def test_typical_layer_vpp_interleaved_override(self):
+        """VPP interleaved schedule overrides greedy when vpp_chunks > 1."""
+        from python.zrt.graph.layer_strategy import LayerProfile, LayerType
+        from python.zrt.graph.partition import partition_layers_by_strategy
+        
+        layer_types = [LayerType.HCA_HASH] * 8
+        profile = LayerProfile(layer_types=layer_types, typical_indices=[0])
+        
+        typical_costs_fwd = {LayerType.HCA_HASH: 1000.0}
+        
+        assignment = partition_layers_by_strategy(
+            profile, typical_costs_fwd, pp=2,
+            pp_schedule="interleaved", vpp_chunks=2
+        )
+        
+        assert assignment == [0, 0, 1, 1, 0, 0, 1, 1]

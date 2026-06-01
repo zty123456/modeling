@@ -308,6 +308,8 @@ def _parse_strategy(d: dict) -> Strategy:
         vpp_chunks=d.get("vpp_chunks", 1),
         pp_layer_assignment=d.get("pp_layer_assignment"),
         cp_kind=CPKind(d.get("cp_kind", "none")),
+        cp_ulysses=d.get("cp_ulysses"),
+        cp_ring=d.get("cp_ring"),
         zero_stage=d.get("zero_stage", 0),
         recompute=recompute,
         offload=offload,

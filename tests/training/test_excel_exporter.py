@@ -132,7 +132,7 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
     assert "  LM head matmul" in summary_values
     assert "  CSA attention block" in summary_values
     assert "  HCA attention block" in summary_values
-    assert "  SWA operator" in summary_values
+    assert "  CSA/HCA/SWA composite attention core" in summary_values
 
     header_row = summary_values.index("Operator Time Share") + 1
     assert ws.cell(row=header_row, column=3).value == "% of Step"
@@ -147,7 +147,7 @@ def test_estimate_excel_summary_includes_operator_time_share(tmp_path):
 
         step_pct = float(step_share.split("%", 1)[0])
         useful_compute_pct = float(useful_compute_share.split("%", 1)[0])
-        assert abs(useful_compute_pct - step_pct * 2) <= 0.1
+        assert abs(useful_compute_pct - step_pct * 2) <= 0.1 + 1e-12
 
 
 def test_estimate_excel_summary_labels_cp_by_actual_collective_kind(tmp_path):

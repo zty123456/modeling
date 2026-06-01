@@ -81,17 +81,21 @@ class TensorTracker:
 
     Uses tensor object as key instead of id(tensor) to avoid ID collision
     when tensors are GC'd and new tensors reuse the same memory address.
+
+    Also tracks tensor origins (module_path, layer) for backward ops scope inference.
     """
 
     def __init__(self):
         self._counter = 0
         self._id_map: Dict[int, int] = {}  # maps id(tensor) to stable ID
         self._tensor_refs: Dict[int, torch.Tensor] = {}  # weak refs would be better but FakeTensor doesn't support it
+        self._tensor_origins: Dict[int, Tuple[str, str]] = {}  # maps tensor_id → (module_path, layer)
 
     def reset(self):
         self._counter = 0
         self._id_map.clear()
         self._tensor_refs.clear()
+        self._tensor_origins.clear()
 
     def get_id(self, t: torch.Tensor) -> int:
         oid = id(t)
@@ -103,6 +107,25 @@ class TensorTracker:
         self._tensor_refs[oid] = t
         self._counter += 1
         return self._id_map[oid]
+
+    def set_origin(self, tensor_id: int, module_path: str, layer: str) -> None:
+        self._tensor_origins[tensor_id] = (module_path, layer)
+
+    def get_origin(self, tensor_id: int) -> Optional[Tuple[str, str]]:
+        return self._tensor_origins.get(tensor_id)
+
+    def infer_module_from_inputs(self, input_ids: List[int]) -> Tuple[str, str]:
+        origin_counts: Dict[str, int] = {}
+        for tid in input_ids:
+            origin = self.get_origin(tid)
+            if origin and origin[0]:
+                origin_counts[origin[0]] = origin_counts.get(origin[0], 0) + 1
+        
+        if not origin_counts:
+            return "", ""
+        
+        module_path = max(origin_counts.keys(), key=lambda k: origin_counts[k])
+        return module_path, extract_layer_idx(module_path)
 
 
 class RecordingDispatch(TorchDispatchMode):
@@ -136,6 +159,20 @@ class RecordingDispatch(TorchDispatchMode):
             self.tensor_tracker.get_id(t)
         for t in output_tensors:
             self.tensor_tracker.get_id(t)
+
+        # Track module context for origin registration, even when paused
+        # (during forward pass of train_backward phase)
+        module_path = ""
+        if self._module_tracker:
+            module_path = self._module_tracker.current_module
+            in_backward = getattr(self._module_tracker, '_in_backward_phase', False)
+            # Only register origins during forward (when paused in train_backward)
+            # or during forward in train_forward phase
+            if module_path and not in_backward and self._module_tracker._forward_depth > 0:
+                output_ids = [self.tensor_tracker.get_id(t) for t in output_tensors]
+                layer_str = extract_layer_idx(module_path)
+                for out_id in output_ids:
+                    self.tensor_tracker.set_origin(out_id, module_path, layer_str)
 
         if not self.active:
             return out
@@ -172,13 +209,19 @@ class RecordingDispatch(TorchDispatchMode):
             # means a ``register_full_backward_pre_hook`` fired for a
             # specific module — its scope is authoritative.  Otherwise the
             # tracker stack reflects forward residue and should be cleared.
-            if getattr(self._module_tracker, '_in_backward_phase', False):
+            # However, we can infer module_path from input tensor origins.
+            in_backward = getattr(self._module_tracker, '_in_backward_phase', False)
+            if in_backward:
                 pending = getattr(self._module_tracker, '_bwd_expected_pop', 0)
                 if pending == 0:
                     module_path = ""
                     module_class = ""
                     module_class_obj = None
                     call_id = 0
+                    inferred_path, inferred_layer = self.tensor_tracker.infer_module_from_inputs(input_ids)
+                    if inferred_path:
+                        module_path = inferred_path
+                        layer = inferred_layer
 
         if self._target_layers is not None:
             layer_str = extract_layer_idx(module_path)
@@ -222,5 +265,10 @@ class RecordingDispatch(TorchDispatchMode):
             "recompute": in_recompute,
             "call_id": call_id,
         })
+
+        if module_path:
+            layer_str = extract_layer_idx(module_path)
+            for out_id in output_ids:
+                self.tensor_tracker.set_origin(out_id, module_path, layer_str)
 
         return out

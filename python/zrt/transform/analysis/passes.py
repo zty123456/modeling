@@ -286,6 +286,12 @@ class RooflinePass(GraphPass):
             memory_us = base_memory_us + activation_memory_us
             if is_bwd:
                 final_latency_us = base_latency_us + recompute_latency_us
+                if recompute_latency_us > 0:
+                    logger.debug(
+                        "RooflinePass: backward node %s has recompute_latency_us=%.1f us "
+                        "(base=%.1f us)",
+                        node.id, recompute_latency_us, base_latency_us,
+                    )
             elif base_compute_us > 0 or base_memory_us > 0 or activation_memory_us > 0:
                 final_latency_us = base_latency_us + activation_memory_us
             else:
@@ -317,7 +323,8 @@ class RooflinePass(GraphPass):
             node.annotations["arithmetic_intensity"] = ai
             node.annotations["bound"]                = bound
             # Respect pre-existing latency_us (e.g. from profiling or test injection)
-            if "latency_us" not in node.annotations:
+            # BUT for backward nodes, always recalculate to include recompute_latency
+            if "latency_us" not in node.annotations or is_bwd:
                 node.annotations["latency_us"] = final_latency_us
 
         return g

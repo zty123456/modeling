@@ -49,9 +49,10 @@ from python.zrt.graph.patches import (
     patch_hc_for_capture,
     patch_indexer_for_fake,
     patch_moe_for_fake,
-    patch_moe_for_meta,  # backward-compat alias
+    patch_moe_for_meta,
     patch_v4_inference_stubs,
 )
+from python.zrt.graph.layer_strategy import infer_layer_profile
 
 logger = logging.getLogger(__name__)
 
@@ -255,47 +256,81 @@ def load_model(
     model_id: str,
     num_hidden_layers: int = 4,
     training: bool = False,
+    infer_profile: bool = False,
+    pre_truncated_config: Any = None,
 ) -> Tuple[nn.Module, Any, FakeTensorMode]:
     """Load any HF causal LM via FakeTensorMode for op-sequence tracing.
 
     Parameters
     ----------
     model_id:
-        HF Hub ID (``"deepseek-ai/DeepSeek-V3.2"``) **or** a local directory
-        (``"./hf_models/deepseek_v3_2"``).  When the Hub model uses an
-        architecture not yet in the transformers registry (e.g. ``deepseek_v32``),
-        the loader automatically falls back to the matching entry in
-        ``hf_models/`` — no manual intervention needed.
+        HF Hub ID or local directory. Ignored if pre_truncated_config is provided.
     num_hidden_layers:
-        Number of transformer blocks to instantiate (2–4 is enough to see all
-        distinct op patterns including dense + MoE layers).
+        Number of transformer blocks to instantiate. Ignored if pre_truncated_config 
+        already has num_hidden_layers set.
     training:
-        When True, apply ``patch_for_training_capture`` instead of the standard
-        inference patches.  This enables ``backward()`` through the model so the
-        training op graph (forward + backward matmuls, gradient accumulation ops,
-        etc.) can be captured.  Only meaningful for DeepSeek-V4; safe to pass for
-        other models (the patch silently no-ops when the ZRT kernel stubs are not
-        loaded).  The model is left in ``train()`` mode rather than ``eval()``.
+        When True, apply training patches and keep model in train() mode.
+    infer_profile:
+        When True, infer layer structure and save to config._full_layer_profile.
+    pre_truncated_config:
+        If provided, use this already-truncated config instead of reloading.
+        This is used by pipeline.py to avoid double-loading and preserve truncation.
 
     Returns
     -------
     (model, config, fake_mode)
-        model     — MoE-patched, all params are FakeTensors.
-                    eval mode when training=False; train mode when training=True.
-        config    — ``config._full_num_hidden_layers`` stores the original depth.
-        fake_mode — the active ``FakeTensorMode`` context; must remain entered
-                    during forward pass so that new tensors (inputs, intermediates)
-                    are also faked.
     """
     # Step 1: inject version shims + legacy compat attrs
     apply_compat_patches()
 
-    # Step 2: load config with local-registry fallback
-    logger.info("Loading config from %s …", model_id)
-    config, effective_id = _load_config(model_id)
-
-    config._full_num_hidden_layers = getattr(config, "num_hidden_layers", None)
-    config.num_hidden_layers = num_hidden_layers
+    # Step 2: use pre-truncated config if provided, else load fresh
+    if pre_truncated_config is not None:
+        config = pre_truncated_config
+        effective_id = model_id
+    else:
+        logger.info("Loading config from %s …", model_id)
+        config, effective_id = _load_config(model_id)
+        # Save full values before any truncation
+        config._full_num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        config._full_num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
+        full_compress_ratios = list(getattr(config, "compress_ratios", []))
+        if full_compress_ratios:
+            config._full_compress_ratios = full_compress_ratios
+        config.num_hidden_layers = num_hidden_layers
+    
+    # Step 2b: infer layer profile if requested (skip if already set by caller)
+    # CRITICAL: Infer profile BEFORE truncation, using saved full values
+    if infer_profile and not hasattr(config, "_full_layer_profile"):
+        # Restore full layer info temporarily for profile inference
+        full_compress = getattr(config, "_full_compress_ratios", None)
+        full_layers = getattr(config, "_full_num_hidden_layers", None)
+        
+        # Temporarily restore full values if available
+        if full_compress and full_layers:
+            saved_compress = getattr(config, "compress_ratios", None)
+            saved_layers = config.num_hidden_layers
+            config.compress_ratios = full_compress
+            config.num_hidden_layers = full_layers
+        
+        profile = infer_layer_profile(config)
+        config._full_layer_profile = profile
+        
+        # Restore truncated values if we modified them
+        if full_compress and full_layers:
+            config.compress_ratios = saved_compress if saved_compress else full_compress[:saved_layers]
+            config.num_hidden_layers = saved_layers
+        
+        logger.info(
+            "LayerProfile: typical_indices=%s, types: dense=%d, moe=%d, "
+            "hca_hash=%d, hca_topk=%d, csa_hash=%d, csa_topk=%d, "
+            "swa_hash=%d, swa_topk=%d",
+            profile.typical_indices,
+            profile.num_dense, profile.num_moe,
+            profile.num_hca_hash, profile.num_hca_topk,
+            profile.num_csa_hash, profile.num_csa_topk,
+            profile.num_swa_hash, profile.num_swa_topk,
+        )
+    
     _normalize_config(config)
 
     # Step 3: enter FakeTensorMode — all tensors created inside become FakeTensors

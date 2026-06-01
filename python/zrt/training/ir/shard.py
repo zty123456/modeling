@@ -29,6 +29,7 @@ class ShardPlan:
         self.dp = strategy.dp
         self.pp = strategy.pp
         self.cp_kind = strategy.cp_kind
+        self.cp_ulysses, self.cp_ring = strategy.hybrid_cp_factors()
         self.sp = strategy.tp > 1  # Megatron SP on when TP>1
 
     def shard_col_parallel(self, n: int) -> int:
@@ -276,7 +277,9 @@ def _insert_cp_collectives(
 
     Hybrid-CP pattern:
       - Combines Ulysses A2A with Ring P2P overlap
-      - For now, modeled as Ring-CP with extra A2A
+      - Explicit factors use cp_ulysses for head sharding and cp_ring for P2P
+        rounds. Legacy configs without factors preserve the previous total-cp
+        approximation.
 
     Note: When TP is enabled, hidden dimension is already sharded by TP.
     CP communication should use hidden_tp = hidden / tp, not full hidden.
@@ -376,7 +379,7 @@ def _insert_cp_collectives(
                     kind="P2P", group="CP",
                     bytes_=p2p_bytes,
                     inserted_before=op.name,
-                    rounds=cp,
+                    rounds=shard.cp_ring,
                     overlap=True,
                     phase="fwd",
                 ))
@@ -627,11 +630,24 @@ def _apply_tp_sharding(
                 op.meta["heads"] = max(1, op.meta["heads"] // shard.tp)
                 op.meta["heads_tp"] = op.meta["heads"]
                 op.meta["heads_before_tp"] = heads_before_tp
+            if "kv_heads" in op.meta:
+                kv_heads_before_tp = op.meta["kv_heads"]
+                op.meta["kv_heads"] = max(1, op.meta["kv_heads"] // shard.tp)
+                op.meta["kv_heads_tp"] = op.meta["kv_heads"]
+                op.meta["kv_heads_before_tp"] = kv_heads_before_tp
             if "h_kv" in op.meta:
                 op.meta["h_kv"] = max(1, op.meta["h_kv"] // shard.tp)
             for t in op.inputs + op.outputs:
-                if t.shape_logical and t.shape_logical[-1] in (h_attn, h_kv):
-                    t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))
+                if t.shape_logical and t.shape_logical[-1] == h_attn:
+                    t.shape_local = (t.shape_logical[0], max(1, h_attn // shard.tp))
+                elif t.shape_logical and t.shape_logical[-1] == h_kv:
+                    if "kv_heads" in op.meta:
+                        kv_heads_local = op.meta["kv_heads"]
+                        kv_heads_before_tp = op.meta.get("kv_heads_before_tp", kv_heads_local)
+                        kv_head_dim = max(1, h_kv // kv_heads_before_tp)
+                        t.shape_local = (t.shape_logical[0], kv_heads_local * kv_head_dim)
+                    else:
+                        t.shape_local = (t.shape_logical[0], max(1, h_kv // shard.tp))
         elif op.kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
             # Hyper-Connections are token-local: TP does not shard hc or h.
             # The mixes-Linear operates on (hc·h) features that semantically
@@ -698,7 +714,8 @@ def _apply_cp_sharding(
     Ring-CP: seq split across cp ranks, KV chunks streamed via P2P.
       s_local = seq / cp, heads_local = heads_tp.
     Hybrid-CP: Ulysses head sharding plus Ring sequence tiling.
-      s_local = seq / cp, heads_local = heads_tp // cp, cp_tiles = cp.
+      s_local = seq / cp_ring, heads_local = heads_tp // cp_ulysses,
+      cp_tiles = cp_ring. Legacy configs use total cp for both factors.
     """
     if not shard.has_cp:
         return
@@ -719,20 +736,25 @@ def _apply_cp_sharding(
                 op.meta["m"] = op.meta["m"] // shard.cp
         elif op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
             heads_tp = op.meta.get("heads_tp", op.meta.get("heads", 0))
+            kv_heads_tp = op.meta.get("kv_heads_tp", op.meta.get("kv_heads"))
 
             if shard.cp_kind == CPKind.ULYSSES:
                 # Ulysses A2A1: scatter heads across CP ranks, gather seq.
                 # Per-rank attn work: full seq, heads_tp // cp heads.
                 op.meta["heads"] = max(1, heads_tp // shard.cp)
+                if kv_heads_tp is not None:
+                    op.meta["kv_heads"] = max(1, kv_heads_tp // shard.cp)
                 op.meta["heads_gathered_by_cp"] = False
                 # NOTE: do NOT divide op.meta["s"] — full seq is on this
                 # rank during attention.
             elif shard.cp_kind == CPKind.HYBRID:
                 if "s" in op.meta:
-                    op.meta["s"] = op.meta["s"] // shard.cp
-                op.meta["heads"] = max(1, heads_tp // shard.cp)
+                    op.meta["s"] = op.meta["s"] // shard.cp_ring
+                op.meta["heads"] = max(1, heads_tp // shard.cp_ulysses)
+                if kv_heads_tp is not None:
+                    op.meta["kv_heads"] = max(1, kv_heads_tp // shard.cp_ulysses)
                 op.meta["heads_gathered_by_cp"] = False
-                op.meta["cp_tiles"] = shard.cp
+                op.meta["cp_tiles"] = shard.cp_ring
             elif shard.cp_kind == CPKind.RING:
                 if "s" in op.meta:
                     op.meta["s"] = op.meta["s"] // shard.cp

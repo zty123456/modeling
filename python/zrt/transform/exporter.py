@@ -1265,6 +1265,9 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 wb, training_summary, bwd_graph or fwd_graph, ctx
             )
 
+        # Layer Cost Detail sheet
+        self._write_layer_cost_detail_sheet(wb, fwd_graph, ctx)
+
         wb.save(output_path)
         logger.info(f"Exported training graphs to {output_path}")
 
@@ -1781,6 +1784,268 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         ws.column_dimensions["A"].width = 32
         ws.column_dimensions["B"].width = 28
+
+    def _write_layer_cost_detail_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        graph: OpGraph | None,
+        ctx: TransformContext | None,
+    ) -> None:
+        """Write layer cost detail sheet with per-layer timing breakdown.
+
+        PP=1: Shows typical layer costs and total calculation formula.
+        PP>1: Shows per-stage layer composition and cost formula.
+        """
+        if graph is None:
+            return
+
+        metadata = graph.metadata
+        layer_profile = metadata.get("layer_profile", None)
+        typical_indices = metadata.get("typical_indices", None)
+
+        if layer_profile is None or typical_indices is None:
+            return
+
+        pp = ctx.parallel.pp if ctx is not None and ctx.parallel else 1
+
+        ws = wb.create_sheet("Layer Cost Detail")
+        ws.append(["Layer Cost Breakdown"])
+        ws["A1"].font = Font(bold=True, size=13)
+        ws.append([])
+
+        # Extract typical layer costs from graph nodes
+        _BWD_PHASES = {"bwd", "bwd_dx", "bwd_dw"}
+        typical_fwd: dict[str, float] = {}
+        typical_bwd: dict[str, float] = {}
+
+        for node in graph.nodes.values():
+            layer = node.annotations.get("layer") or getattr(node, "layer", "")
+            if not layer:
+                continue
+            try:
+                layer_idx = int(layer)
+            except (ValueError, TypeError):
+                continue
+
+            if layer_idx not in typical_indices:
+                continue
+
+            if layer_idx >= len(layer_profile.layer_types):
+                continue
+
+            layer_type_raw = layer_profile.layer_types[layer_idx]
+            # Convert to string (handle both enum and string)
+            layer_type = layer_type_raw.value if hasattr(layer_type_raw, "value") else str(layer_type_raw)
+            latency_us = node.annotations.get("latency_us", 0.0)
+
+            if node.category == "communication":
+                continue
+            if node.annotations.get("optimizer_step"):
+                continue
+
+            phase = node.annotations.get("phase", "fwd")
+            if phase in _BWD_PHASES:
+                typical_bwd[layer_type] = typical_bwd.get(layer_type, 0.0) + latency_us
+            else:
+                typical_fwd[layer_type] = typical_fwd.get(layer_type, 0.0) + latency_us
+
+        # Convert to ms
+        typical_fwd_ms = {k: v / 1000.0 for k, v in typical_fwd.items()}
+        typical_bwd_ms = {k: v / 1000.0 for k, v in typical_bwd.items()}
+
+        # Layer counts from layer_profile
+        layer_counts = {
+            "dense": getattr(layer_profile, "num_dense", 0),
+            "moe": getattr(layer_profile, "num_moe", 0),
+            "hca_hash": getattr(layer_profile, "num_hca_hash", 0),
+            "hca_topk": getattr(layer_profile, "num_hca_topk", 0),
+            "csa_hash": getattr(layer_profile, "num_csa_hash", 0),
+            "csa_topk": getattr(layer_profile, "num_csa_topk", 0),
+            "swa_hash": getattr(layer_profile, "num_swa_hash", 0),
+            "swa_topk": getattr(layer_profile, "num_swa_topk", 0),
+        }
+
+        if pp == 1:
+            # PP=1: Show total layer cost formula
+            ws.append(["=== Typical Layer Costs ===", "", "", "", ""])
+            ws.append(["Layer Type", "Typical Index", "FWD Cost (ms)", "BWD Cost (ms)", "Total Cost (ms)"])
+
+            for layer_type, count in layer_counts.items():
+                if count == 0:
+                    continue
+
+                # Find typical index for this layer type
+                typical_idx = None
+                for idx in typical_indices:
+                    if idx < len(layer_profile.layer_types):
+                        lt_raw = layer_profile.layer_types[idx]
+                        lt = lt_raw.value if hasattr(lt_raw, "value") else str(lt_raw)
+                        if lt == layer_type:
+                            typical_idx = idx
+                            break
+
+                fwd_cost = typical_fwd_ms.get(layer_type, 0.0)
+                bwd_cost = typical_bwd_ms.get(layer_type, 0.0)
+                total_cost = fwd_cost + bwd_cost
+
+                ws.append([
+                    layer_type,
+                    str(typical_idx) if typical_idx is not None else "N/A",
+                    round(fwd_cost, 3),
+                    round(bwd_cost, 3),
+                    round(total_cost, 3),
+                ])
+
+            ws.append([])
+            ws.append(["=== Total Model Cost Formula ===", "", "", "", ""])
+            ws.append(["Formula: total_fwd = sum(typical_fwd[layer_type] * num_layers[layer_type])", "", "", "", ""])
+            ws.append(["Formula: total_bwd = sum(typical_bwd[layer_type] * num_layers[layer_type])", "", "", "", ""])
+            ws.append([])
+            ws.append(["Layer Type", "Count", "FWD Formula", "FWD Result (ms)", ""])
+
+            total_fwd_ms = 0.0
+            for layer_type, count in layer_counts.items():
+                if count == 0:
+                    continue
+                fwd_cost = typical_fwd_ms.get(layer_type, 0.0)
+                fwd_result = fwd_cost * count
+                total_fwd_ms += fwd_result
+                ws.append([
+                    layer_type,
+                    count,
+                    f"{fwd_cost:.3f} * {count}",
+                    round(fwd_result, 3),
+                    "",
+                ])
+
+            ws.append(["Total FWD", "", "", round(total_fwd_ms, 3), "ms"])
+            ws.append([])
+
+            ws.append(["Layer Type", "Count", "BWD Formula", "BWD Result (ms)", ""])
+            total_bwd_ms = 0.0
+            for layer_type, count in layer_counts.items():
+                if count == 0:
+                    continue
+                bwd_cost = typical_bwd_ms.get(layer_type, 0.0)
+                bwd_result = bwd_cost * count
+                total_bwd_ms += bwd_result
+                ws.append([
+                    layer_type,
+                    count,
+                    f"{bwd_cost:.3f} * {count}",
+                    round(bwd_result, 3),
+                    "",
+                ])
+
+            ws.append(["Total BWD", "", "", round(total_bwd_ms, 3), "ms"])
+            ws.append([])
+            ws.append(["Total Compute", "", "", round(total_fwd_ms + total_bwd_ms, 3), "ms"])
+
+        else:
+            # PP>1: Show per-stage layer composition and cost
+            ws.append(["=== Layer Distribution ===", "", "", "", ""])
+            ws.append(["Total Layers", layer_profile.total_layers, "", "", ""])
+            ws.append(["PP", pp, "", "", ""])
+            ws.append([])
+
+            # Determine which layer types actually exist
+            active_layer_types = [lt for lt, cnt in layer_counts.items() if cnt > 0]
+
+            # Get stage layer assignment
+            total_layers = layer_profile.total_layers
+            stage_size = total_layers // pp
+
+            ws.append(["=== Per-Stage Layer Composition ===", "", "", "", ""])
+
+            # Stage header - only show active layer types
+            header = ["Stage", "Layer Range"] + [lt.upper() for lt in active_layer_types]
+            ws.append(header)
+
+            stage_layer_counts: dict[int, dict[str, int]] = {}
+            for s in range(pp):
+                start_layer = s * stage_size
+                end_layer = (s + 1) * stage_size if s < pp - 1 else total_layers
+
+                counts = {
+                    "dense": 0, "moe": 0,
+                    "hca_hash": 0, "hca_topk": 0,
+                    "csa_hash": 0, "csa_topk": 0,
+                    "swa_hash": 0, "swa_topk": 0,
+                }
+                for idx in range(start_layer, end_layer):
+                    if idx < len(layer_profile.layer_types):
+                        lt_raw = layer_profile.layer_types[idx]
+                        lt = lt_raw.value if hasattr(lt_raw, "value") else str(lt_raw)
+                        counts[lt] = counts.get(lt, 0) + 1
+
+                stage_layer_counts[s] = counts
+                # Only show counts for active layer types
+                row = [f"Stage {s}", f"L{start_layer}-L{end_layer-1}"]
+                row.extend([counts[lt] for lt in active_layer_types])
+                ws.append(row)
+
+            ws.append([])
+            ws.append(["=== Per-Stage Cost Calculation ===", "", "", "", ""])
+            ws.append(["Formula: stage_fwd = sum(typical_fwd[layer_type] * count_in_stage)", "", "", "", ""])
+            ws.append(["Formula: stage_bwd = sum(typical_bwd[layer_type] * count_in_stage)", "", "", "", ""])
+            ws.append([])
+
+            # Calculate per-stage costs
+            ws.append(["Stage", "FWD Formula", "FWD (ms)", "BWD Formula", "BWD (ms)", "Total (ms)"])
+
+            bottleneck_stage = 0
+            bottleneck_total = 0.0
+
+            for s in range(pp):
+                counts = stage_layer_counts[s]
+                fwd_formula_parts = []
+                bwd_formula_parts = []
+                fwd_total = 0.0
+                bwd_total = 0.0
+
+                for layer_type in active_layer_types:
+                    cnt = counts.get(layer_type, 0)
+                    if cnt == 0:
+                        continue
+                    fwd_cost = typical_fwd_ms.get(layer_type, 0.0)
+                    bwd_cost = typical_bwd_ms.get(layer_type, 0.0)
+                    fwd_result = fwd_cost * cnt
+                    bwd_result = bwd_cost * cnt
+                    fwd_total += fwd_result
+                    bwd_total += bwd_result
+
+                    if fwd_cost > 0:
+                        fwd_formula_parts.append(f"{fwd_cost:.3f}*{cnt}")
+                    if bwd_cost > 0:
+                        bwd_formula_parts.append(f"{bwd_cost:.3f}*{cnt}")
+
+                stage_total = fwd_total + bwd_total
+                if stage_total > bottleneck_total:
+                    bottleneck_total = stage_total
+                    bottleneck_stage = s
+
+                ws.append([
+                    f"Stage {s}",
+                    " + ".join(fwd_formula_parts) if fwd_formula_parts else "0",
+                    round(fwd_total, 3),
+                    " + ".join(bwd_formula_parts) if bwd_formula_parts else "0",
+                    round(bwd_total, 3),
+                    round(stage_total, 3),
+                ])
+
+            ws.append([])
+            ws.append(["Bottleneck Stage", f"Stage {bottleneck_stage}", "", "", round(bottleneck_total, 3), "ms"])
+            ws.append([])
+            ws.append(["Note: Pipeline step_time uses bottleneck stage time (max across stages)", "", "", "", ""])
+
+        # Set column widths
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 25
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 18
+        ws.column_dimensions["E"].width = 18
+        ws.column_dimensions["F"].width = 18
+        ws.column_dimensions["G"].width = 12
 
 
 def _get_fused_shapes_from_sem_io(node: OpNode, direction: str) -> str:

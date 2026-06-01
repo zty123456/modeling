@@ -24,9 +24,11 @@ def _strategy(cp_kind: CPKind) -> Strategy:
     return Strategy(tp=2, cp=4, pp=1, ep=1, dp=1, micro_batch=1, cp_kind=cp_kind)
 
 
-def _attn_ops(cp_kind: CPKind):
+def _attn_ops(cp_kind: CPKind, **strategy_overrides):
     model = _model()
     strategy = _strategy(cp_kind)
+    for key, value in strategy_overrides.items():
+        setattr(strategy, key, value)
     graph = build_graph(model, strategy)
     return [
         op for op in graph.ops
@@ -92,6 +94,16 @@ class TestUlyssesCPSharding:
                 f"{op.name}: expected heads={expected_heads}, got {op.meta.get('heads')}"
             )
 
+    def test_ulysses_attn_kv_heads_divided(self):
+        """Ulysses-CP shards K/V heads when available, with replication below one head."""
+        attn_ops, model, strategy = _attn_ops(CPKind.ULYSSES)
+        expected_kv_heads = max(1, (model.num_kv_heads // strategy.tp) // strategy.cp)
+        for op in attn_ops:
+            assert op.meta.get("kv_heads") == expected_kv_heads, (
+                f"{op.name}: expected kv_heads={expected_kv_heads}, "
+                f"got {op.meta.get('kv_heads')}"
+            )
+
     def test_ulysses_heads_not_gathered(self):
         """Debug marker records that heads are scattered, not gathered."""
         attn_ops, model, strategy = _attn_ops(CPKind.ULYSSES)
@@ -99,6 +111,12 @@ class TestUlyssesCPSharding:
             assert op.meta.get("heads_gathered_by_cp") is False, (
                 f"{op.name}: heads_gathered_by_cp should be False"
             )
+
+    def test_ulysses_does_not_set_ring_tiles(self):
+        """Ulysses uses head sharding rather than Ring-style repeated tiles."""
+        attn_ops, _, _ = _attn_ops(CPKind.ULYSSES)
+        for op in attn_ops:
+            assert "cp_tiles" not in op.meta
 
     def test_first_attn_core_metadata(self):
         """Spot-check the first attn_core op for expected metadata values."""
@@ -151,6 +169,16 @@ class TestRingCPSharding:
                 f"{op.name}: expected heads={expected_heads}, got {op.meta.get('heads')}"
             )
 
+    def test_ring_attn_kv_heads_only_tp_sharded(self):
+        """Ring-CP streams sequence tiles and does not shard K/V heads by CP."""
+        attn_ops, model, strategy = _attn_ops(CPKind.RING)
+        expected_kv_heads = max(1, model.num_kv_heads // strategy.tp)
+        for op in attn_ops:
+            assert op.meta.get("kv_heads") == expected_kv_heads, (
+                f"{op.name}: expected kv_heads={expected_kv_heads}, "
+                f"got {op.meta.get('kv_heads')}"
+            )
+
 
 class TestHybridCPSharding:
     """Hybrid/USP combines Ulysses head sharding with Ring sequence tiling."""
@@ -173,3 +201,41 @@ class TestHybridCPSharding:
                 f"got {op.meta.get('heads')}"
             )
             assert op.meta.get("heads_gathered_by_cp") is False
+
+    def test_hybrid_explicit_factors_split_head_and_ring_sharding(self):
+        """Explicit USP factors apply Ulysses to heads and Ring to sequence tiles."""
+        attn_ops, model, strategy = _attn_ops(
+            CPKind.HYBRID,
+            cp=8,
+            cp_ulysses=4,
+            cp_ring=2,
+        )
+        expected_heads = max(1, (model.num_heads // strategy.tp) // strategy.cp_ulysses)
+        expected_kv_heads = max(1, (model.num_kv_heads // strategy.tp) // strategy.cp_ulysses)
+        expected_s = model.seq_len // strategy.cp_ring
+        for op in attn_ops:
+            assert op.meta.get("heads") == expected_heads
+            assert op.meta.get("kv_heads") == expected_kv_heads
+            assert op.meta.get("s") == expected_s
+            assert op.meta.get("cp_tiles") == strategy.cp_ring
+
+    def test_hybrid_explicit_factors_must_multiply_to_total_cp(self):
+        """Explicit USP factors must describe the configured total CP degree."""
+        strategy = _strategy(CPKind.HYBRID)
+        strategy.cp_ulysses = 2
+        strategy.cp_ring = 4
+        with pytest.raises(ValueError, match="cp_ulysses.*cp_ring.*cp"):
+            strategy.hybrid_cp_factors()
+
+    def test_hybrid_explicit_factors_set_ring_collective_rounds(self):
+        """Hybrid Ring P2P repeats only across the Ring subgroup."""
+        model = _model()
+        strategy = _strategy(CPKind.HYBRID)
+        strategy.cp = 8
+        strategy.cp_ulysses = 4
+        strategy.cp_ring = 2
+        graph = build_graph(model, strategy)
+
+        p2p = [c for c in graph.collectives if c.kind == "P2P"]
+        assert p2p
+        assert {c.rounds for c in p2p} == {strategy.cp_ring}

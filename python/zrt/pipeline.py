@@ -644,6 +644,7 @@ def run_trace_phases(
     platform: str = "generic",
     graph_mode: bool = False,
     gradient_checkpointing: bool = False,
+    infer_profile: bool = False,
 ) -> Tuple[Path, Dict[str, List[Dict[str, Any]]]]:
     """Load *model_id* once, trace each requested phase, write separate files.
 
@@ -684,6 +685,13 @@ def run_trace_phases(
         the first dense and first sparse (MoE) layer indices from the model
         config and use those as *target_layers*.  Ignored when
         *target_layers* is already set.
+    infer_profile:
+        When ``True``, use the new LayerProfile system to automatically infer
+        layer structure and select typical layers.  This is more comprehensive
+        than ``auto_layers`` (supports V4 CSA/HCA/SWA/MTP).  When set,
+        ``config._full_layer_profile`` is populated and ``num_layers`` is
+        derived from ``max(typical_indices) + 1``.  The captured records are
+        then filtered to include only the typical layers.
     graph_mode:
         When ``True``, use ``torch.fx``-based graph capture
         (:mod:`python.zrt.graph.fx_capture`) instead of the default
@@ -720,31 +728,76 @@ def run_trace_phases(
     ``<slug>_train_backward_ops.xlsx``     — training backward op table
     …
     """
-    from python.zrt.graph.model_loader import _load_config
+    from python.zrt.graph.model_loader import _load_config, auto_target_layers
     from python.zrt.graph.patches import apply_compat_patches
+    from python.zrt.graph.layer_strategy import infer_layer_profile
 
-    # ── Resolve target_layers before loading the model ────────────────────
-    if auto_layers and target_layers is None:
-        # Quick config-only load to infer layer types (no model weights).
-        apply_compat_patches()
-        cfg_tmp, _ = _load_config(model_id)
-        # target_layers = auto_target_layers(cfg_tmp)
-        logger.info("Auto-selected target layers: %s", target_layers)
+# ── Resolve target_layers before loading the model ────────────────────
+    effective_num_layers = num_layers
+    profile = None
+    cfg_tmp = None
+    full_num_layers = 0
+    full_compress_ratios = []
+    
+    # Load config once for profile inference or V4 handling
+    apply_compat_patches()
+    cfg_tmp, _ = _load_config(model_id)
+    full_num_layers = cfg_tmp.num_hidden_layers
+    full_compress_ratios = list(getattr(cfg_tmp, "compress_ratios", []))
+    
+    # CRITICAL: Save full layer info BEFORE any truncation
+    # This ensures LayerProfile inference uses complete layer distribution
+    cfg_tmp._full_num_hidden_layers = full_num_layers
+    if full_compress_ratios:
+        cfg_tmp._full_compress_ratios = full_compress_ratios
+    
+    if infer_profile and target_layers is None:
+        # New LayerProfile-based inference (supports V4 CSA/HCA/SWA)
+        # Infer profile from FULL config (before truncation)
+        profile = infer_layer_profile(cfg_tmp)
+        cfg_tmp._full_layer_profile = profile  # Save for load_model to skip re-inference
+        target_layers = profile.typical_indices
+        
+        # Minimal layer loading: only load layers needed for typical_indices
+        effective_num_layers = max(target_layers) + 1 if target_layers else num_layers
+        
+        logger.info(
+            "LayerProfile inference: typical_indices=%s, loading %d layers "
+            "(full model: %d transformer, layer types: dense=%d, moe=%d, "
+            "hca_hash=%d, hca_topk=%d, csa_hash=%d, csa_topk=%d, "
+            "swa_hash=%d, swa_topk=%d)",
+            target_layers, effective_num_layers, full_num_layers,
+            profile.num_dense, profile.num_moe,
+            profile.num_hca_hash, profile.num_hca_topk,
+            profile.num_csa_hash, profile.num_csa_topk,
+            profile.num_swa_hash, profile.num_swa_topk,
+        )
+    elif auto_layers and target_layers is None:
+        # Legacy auto_target_layers (first dense + first sparse)
+        target_layers = auto_target_layers(cfg_tmp)
+        logger.info("Auto-selected target layers (legacy): %s", target_layers)
 
     # When specific layers are requested, ensure we load enough layers.
-    effective_num_layers = num_layers
     if target_layers:
         min_required = max(target_layers) + 1
         if min_required > effective_num_layers:
-            logger.info(
-                "Extending num_layers %d → %d to include target layer %d.",
-                effective_num_layers, min_required, max(target_layers),
-            )
             effective_num_layers = min_required
+    
+    # Apply V4 truncation when loading fewer layers than full model
+    # This is done ONCE in pipeline, then passed to load_model
+    if full_compress_ratios and effective_num_layers < len(full_compress_ratios):
+        # V4 model: truncate compress_ratios and disable MTP
+        cfg_tmp.num_nextn_predict_layers = 0
+        cfg_tmp.compress_ratios = full_compress_ratios[:effective_num_layers]
+        cfg_tmp.num_hidden_layers = effective_num_layers
+        logger.info(
+            "V4 truncation: loading %d layers (full: %d), disabled MTP",
+            effective_num_layers, full_num_layers,
+        )
+    else:
+        cfg_tmp.num_hidden_layers = effective_num_layers
 
     # Detect if any requested phases are training phases — needed for DSV4
-    # to apply patch_for_training_capture (removes @inference_mode, upgrades
-    # kernel stubs to differentiable versions).
     is_training_mode = any(p in _TRAINING_PHASES for p in phases)
 
     logger.info(
@@ -752,8 +805,19 @@ def run_trace_phases(
         model_id, effective_num_layers, graph_mode, is_training_mode,
     )
 
+    # Load model with pre-truncated config to avoid double loading
+    # Skip re-inferring profile if already done above
     model, config, fake_mode = load_model(
-        model_id, num_hidden_layers=effective_num_layers, training=is_training_mode)
+        model_id, 
+        num_hidden_layers=effective_num_layers, 
+        training=is_training_mode,
+        infer_profile=infer_profile and profile is None,
+        pre_truncated_config=cfg_tmp,  # Pass truncated config
+    )
+    
+    # Ensure profile is available even when infer_profile=False
+    if profile and not hasattr(config, "_full_layer_profile"):
+        config._full_layer_profile = profile
 
     slug = _make_model_slug(model_id)
     if output_dir is None:
@@ -766,9 +830,7 @@ def run_trace_phases(
     past_key_values: Any = None
     canonical_phases = [_PHASE_ALIASES.get(p, p) for p in phases]
 
-    # Create a shared TensorTracker for training phases so that tensor IDs are
-    # globally unique across train_forward and train_backward.  This enables
-    # exact tensor-ID matching in stitch_fwd_bwd.
+    # Create a shared TensorTracker for training phases
     has_training = any(p in _TRAINING_PHASES for p in canonical_phases)
     shared_tracker = TensorTracker() if has_training else None
 
@@ -806,6 +868,10 @@ def run_trace_phases(
 
             raw_opgraph = records_to_opgraph(
                 records, name=f"{slug}_{phase}", phase=phase)
+            # Add LayerProfile metadata for layer-type scaling
+            if profile:
+                raw_opgraph.metadata["layer_profile"] = profile
+                raw_opgraph.metadata["typical_indices"] = profile.typical_indices
             all_records[phase] = records
             all_graphs[phase] = raw_opgraph
 

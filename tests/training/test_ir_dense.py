@@ -1,7 +1,7 @@
 """Test IR builders — dense block op count and shapes."""
 
 import pytest
-from zrt.training.ir.builders import dense_block, build_graph
+from zrt.training.ir.builders import _moe_block, dense_block, build_graph
 from zrt.training.models.flops import op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
@@ -150,8 +150,38 @@ def test_attn_core_meta():
     assert attn.kind == "attn_core"
     assert attn.meta["s"] == 2048
     assert attn.meta["heads"] == 32
+    assert attn.meta["kv_heads"] == 8
     assert attn.meta["head_dim"] == 128
     assert attn.meta["causal"] is True
+
+
+def test_moe_attn_core_meta_carries_kv_heads():
+    """Legacy MoE attention metadata should preserve grouped K/V head count."""
+    ops = _moe_block(
+        hidden=4096, ffn=16384, moe_ffn=4096,
+        num_experts=8, top_k=2, n_shared_experts=1,
+        seq=2048, num_heads=32, num_kv_heads=8, head_dim=128,
+        layer_id=0,
+    )
+    attn = next(op for op in ops if op.kind == "attn_core")
+
+    assert attn.meta["kv_heads"] == 8
+
+
+def test_v4_attn_meta_carries_single_kv_head():
+    """V4 MQA cost modeling needs the shared KV-head count in attention metadata."""
+    model = ModelSpec(
+        hidden=128, ffn=256, num_heads=8, num_kv_heads=1,
+        head_dim=16, vocab=1000, seq_len=256,
+        layers=[LayerKind.DENSE],
+        q_lora_rank=32, qk_rope_head_dim=4,
+        o_lora_rank=16, o_groups=4,
+        compress_ratios=[0], swa_window=64,
+    )
+    graph = build_graph(model, Strategy())
+    attn = next(op for op in graph.ops if op.kind == "swa_attn")
+
+    assert attn.meta["kv_heads"] == 1
 
 
 def test_tp_ag_rs_phase_both():

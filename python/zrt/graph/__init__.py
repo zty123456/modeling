@@ -32,6 +32,11 @@ _MODULE_MAP = {
     "export_graphs": "python.zrt.report.onnx_exporter",
     "find_local_fallback": "python.zrt.graph.compat",
     "_LOCAL_REGISTRY": "python.zrt.graph.compat",
+    # ── Layer strategy (no torch required) ──────────────────────────────────
+    "LayerType": "python.zrt.graph.layer_strategy",
+    "LayerProfile": "python.zrt.graph.layer_strategy",
+    "infer_layer_profile": "python.zrt.graph.layer_strategy",
+    "scale_layer_costs": "python.zrt.graph.layer_strategy",
 }
 
 _CACHE: dict = {}
@@ -59,4 +64,8 @@ __all__ = [
     "_patch_moe_for_meta",
     "find_local_fallback",
     "_LOCAL_REGISTRY",
+    "LayerType",
+    "LayerProfile",
+    "infer_layer_profile",
+    "scale_layer_costs",
 ]
