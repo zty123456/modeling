@@ -78,20 +78,25 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
                 # No additional constraints beyond seq_len divisible by cp
                 pass
         if strategy.cp_kind == CPKind.HYBRID:
+            try:
+                cp_ulysses, cp_ring = strategy.hybrid_cp_factors()
+            except ValueError as exc:
+                warnings.append(str(exc))
+                cp_ulysses, cp_ring = strategy.cp, strategy.cp
             effective_heads = model.num_heads
             if strategy.tp > 1:
                 effective_heads = model.num_heads // strategy.tp
-            if effective_heads % strategy.cp != 0:
+            if effective_heads % cp_ulysses != 0:
                 warnings.append(
-                    f"Hybrid CP requires (num_heads // tp) % cp == 0, "
-                    f"got ({model.num_heads} // {strategy.tp}) % {strategy.cp} = "
-                    f"{effective_heads % strategy.cp}"
+                    f"Hybrid CP requires (num_heads // tp) % cp_ulysses == 0, "
+                    f"got ({model.num_heads} // {strategy.tp}) % {cp_ulysses} = "
+                    f"{effective_heads % cp_ulysses}"
                 )
             block_size = 128
-            if model.seq_len % (strategy.cp * block_size) != 0:
+            if model.seq_len % (cp_ring * block_size) != 0:
                 warnings.append(
-                    f"Hybrid CP requires seq_len % (cp * block_size) == 0, "
-                    f"got {model.seq_len} % ({strategy.cp} * {block_size})"
+                    f"Hybrid CP requires seq_len % (cp_ring * block_size) == 0, "
+                    f"got {model.seq_len} % ({cp_ring} * {block_size})"
                 )
         if strategy.cp > system.gpus_per_node:
             warnings.append(

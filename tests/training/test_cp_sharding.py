@@ -24,9 +24,11 @@ def _strategy(cp_kind: CPKind) -> Strategy:
     return Strategy(tp=2, cp=4, pp=1, ep=1, dp=1, micro_batch=1, cp_kind=cp_kind)
 
 
-def _attn_ops(cp_kind: CPKind):
+def _attn_ops(cp_kind: CPKind, **strategy_overrides):
     model = _model()
     strategy = _strategy(cp_kind)
+    for key, value in strategy_overrides.items():
+        setattr(strategy, key, value)
     graph = build_graph(model, strategy)
     return [
         op for op in graph.ops
@@ -199,3 +201,41 @@ class TestHybridCPSharding:
                 f"got {op.meta.get('heads')}"
             )
             assert op.meta.get("heads_gathered_by_cp") is False
+
+    def test_hybrid_explicit_factors_split_head_and_ring_sharding(self):
+        """Explicit USP factors apply Ulysses to heads and Ring to sequence tiles."""
+        attn_ops, model, strategy = _attn_ops(
+            CPKind.HYBRID,
+            cp=8,
+            cp_ulysses=4,
+            cp_ring=2,
+        )
+        expected_heads = max(1, (model.num_heads // strategy.tp) // strategy.cp_ulysses)
+        expected_kv_heads = max(1, (model.num_kv_heads // strategy.tp) // strategy.cp_ulysses)
+        expected_s = model.seq_len // strategy.cp_ring
+        for op in attn_ops:
+            assert op.meta.get("heads") == expected_heads
+            assert op.meta.get("kv_heads") == expected_kv_heads
+            assert op.meta.get("s") == expected_s
+            assert op.meta.get("cp_tiles") == strategy.cp_ring
+
+    def test_hybrid_explicit_factors_must_multiply_to_total_cp(self):
+        """Explicit USP factors must describe the configured total CP degree."""
+        strategy = _strategy(CPKind.HYBRID)
+        strategy.cp_ulysses = 2
+        strategy.cp_ring = 4
+        with pytest.raises(ValueError, match="cp_ulysses.*cp_ring.*cp"):
+            strategy.hybrid_cp_factors()
+
+    def test_hybrid_explicit_factors_set_ring_collective_rounds(self):
+        """Hybrid Ring P2P repeats only across the Ring subgroup."""
+        model = _model()
+        strategy = _strategy(CPKind.HYBRID)
+        strategy.cp = 8
+        strategy.cp_ulysses = 4
+        strategy.cp_ring = 2
+        graph = build_graph(model, strategy)
+
+        p2p = [c for c in graph.collectives if c.kind == "P2P"]
+        assert p2p
+        assert {c.rounds for c in p2p} == {strategy.cp_ring}

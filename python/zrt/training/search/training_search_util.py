@@ -364,6 +364,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         tp_overlap=TPOverlap(config.get("tp_overlap", "none")),
         ep_overlap=config.get("ep_overlap", False),
         cp_kind=CPKind(config.get("cp_kind", "none")),
+        cp_ulysses=config.get("cp_ulysses"),
+        cp_ring=config.get("cp_ring"),
         dualbatch=config.get("dualbatch", False),
         dp_overlap_in_bubble=config.get("dp_overlap_in_bubble", True),
         dp_grad_buckets=config.get("dp_grad_buckets", 25),
@@ -445,6 +447,8 @@ class TrainingConfigManager:
             tp_overlap=TPOverlap(other_config.get("tp_overlap", "none")),
             ep_overlap=other_config.get("ep_overlap", False),
             cp_kind=CPKind(other_config.get("cp_kind", "none")),
+            cp_ulysses=other_config.get("cp_ulysses"),
+            cp_ring=other_config.get("cp_ring"),
             dualbatch=other_config.get("dualbatch", False),
             dp_overlap_in_bubble=other_config.get("dp_overlap_in_bubble", True),
             dp_grad_buckets=other_config.get("dp_grad_buckets", 25),
@@ -762,6 +766,8 @@ def _graph_cache_key(config: Dict[str, Any]) -> Tuple[Any, ...]:
         int(config.get("cp", 1)),
         int(config.get("ep", 1)),
         config.get("cp_kind", "none"),
+        config.get("cp_ulysses"),
+        config.get("cp_ring"),
     )
 
 

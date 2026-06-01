@@ -25,18 +25,21 @@ def _tm(tid: str, shape: tuple[int, ...], dtype: DType = DType.BF16) -> TensorMe
 
 
 def _node(op_type: str, inputs: list[TensorMeta], outputs: list[TensorMeta],
-          attrs: dict | None = None, fused_from: list[str] | None = None) -> OpNode:
+          attrs: dict | None = None, fused_from: list[str] | None = None,
+          annotations: dict | None = None) -> OpNode:
     return OpNode(
         id="test", op_type=op_type, inputs=inputs, outputs=outputs,
         attrs=attrs or {}, fused_from=fused_from or [],
+        annotations=annotations or {},
     )
 
 
 def _fmr(op_type: str, inputs: list[TensorMeta], outputs: list[TensorMeta],
-         attrs: dict | None = None, fused_from: list[str] | None = None) -> tuple[float, float, float]:
+         attrs: dict | None = None, fused_from: list[str] | None = None,
+         annotations: dict | None = None) -> tuple[float, float, float]:
     """Run _fmr and return (flops, read_bytes, write_bytes)."""
     sim = RooflineSimulator()
-    node = _node(op_type, inputs, outputs, attrs, fused_from)
+    node = _node(op_type, inputs, outputs, attrs, fused_from, annotations)
     return sim._fmr(node)
 
 
@@ -230,6 +233,23 @@ class TestAttention:
         expected = 4.0 * N * H * Sq * Sk * D + 4.0 * N * H * Sq * Sk
         assert flops == expected
 
+    @pytest.mark.parametrize("kv_heads", [1, 2])
+    def test_sdpa_kv_bytes_use_kv_heads(self, kv_heads):
+        """MQA/GQA K/V reads use K tensor heads rather than Q heads."""
+        N, q_heads, Sq, Sk, D = 1, 8, 64, 256, 32
+        b = 2
+        flops, r, w = _fmr(
+            "aten.scaled_dot_product_attention.default",
+            [
+                _tm("q", (N, q_heads, Sq, D)),
+                _tm("k", (N, kv_heads, Sk, D)),
+                _tm("v", (N, kv_heads, Sk, D)),
+            ],
+            [_tm("out", (N, q_heads, Sq, D))],
+        )
+        expected_r = (N * q_heads * Sq * D + 2 * N * kv_heads * Sk * D) * b
+        assert r == expected_r
+
 
 class TestSparseAttention:
     """SparseFlashAttention: FLOPs = base * sparsity_ratio"""
@@ -246,6 +266,21 @@ class TestSparseAttention:
         base = 4.0 * N * H * Sq * Sk * D + 4.0 * N * H * Sq * Sk
         assert flops == base
 
+    def test_sparse_attn_kv_bytes_use_kv_heads(self):
+        """Sparse MQA reads each shared KV head once."""
+        N, q_heads, kv_heads, Sq, Sk, D = 1, 8, 1, 512, 512, 64
+        b = 2
+        flops, r, w = _fmr(
+            "SparseFlashAttention",
+            [
+                _tm("q", (N, q_heads, Sq, D)),
+                _tm("k", (N, kv_heads, Sk, D)),
+                _tm("v", (N, kv_heads, Sk, D)),
+            ],
+            [_tm("out", (N, q_heads, Sq, D))],
+        )
+        assert r == (N * q_heads * Sq * D + 2 * N * kv_heads * Sk * D) * b
+
 
 class TestPagedAttention:
     """PagedAttention: same as FA + block_tables indexing"""
@@ -261,6 +296,44 @@ class TestPagedAttention:
         )
         expected = 4.0 * N * H * Sq * Sk * D + 4.0 * N * H * Sq * Sk
         assert flops == expected
+
+    def test_paged_attn_kv_bytes_use_annotated_kv_heads(self):
+        """Paged attention has no K input, so cache metadata supplies KV heads."""
+        N, q_heads, kv_heads, D = 32, 8, 1, 64
+        Sq, Sk, b = 1, 128, 2
+        flops, r, w = _fmr(
+            "PageAttentionFP16",
+            [_tm("q", (N, q_heads, Sq, D))],
+            [_tm("out", (N, q_heads, Sq, D))],
+            annotations={"kv_cache_len": Sk, "kv_heads": kv_heads},
+        )
+        expected_r = (
+            N * q_heads * Sq * D * b
+            + 2 * N * kv_heads * Sk * D * b
+            + N * Sk * 8
+        )
+        assert r == expected_r
+
+    def test_paged_attn_kv_bytes_use_cache_tensor_heads(self):
+        """Captured paged-attention cache tensors are authoritative when present."""
+        N, q_heads, kv_heads, D = 32, 8, 2, 64
+        Sq, Sk, blocks, block_size, b = 1, 128, 16, 16, 2
+        flops, r, w = _fmr(
+            "PageAttentionFP16",
+            [
+                _tm("q", (N, q_heads, Sq, D)),
+                _tm("k_cache", (blocks, kv_heads, block_size, D)),
+                _tm("v_cache", (blocks, kv_heads, block_size, D)),
+            ],
+            [_tm("out", (N, q_heads, Sq, D))],
+            annotations={"kv_cache_len": Sk},
+        )
+        expected_r = (
+            N * q_heads * Sq * D * b
+            + 2 * N * kv_heads * Sk * D * b
+            + N * Sk * 8
+        )
+        assert r == expected_r
 
 
 # ─────────────────────────────────────────────────────────────────────────────

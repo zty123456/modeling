@@ -168,6 +168,11 @@ class Strategy:
 
     # context parallel
     cp_kind: CPKind = CPKind.NONE
+    # Optional true Hybrid/USP decomposition.  Legacy Hybrid configs leave
+    # both unset and keep the historical approximation where total CP is used
+    # for both Ulysses head sharding and Ring sequence tiling.
+    cp_ulysses: int | None = None
+    cp_ring: int | None = None
 
     # memory
     zero_stage: int = 0  # 0/1/2/3; 3 == FSDP
@@ -205,6 +210,23 @@ class Strategy:
     # Default reproduces v1 behaviour: all casts assumed fused → 0 cost.
     quant: QuantPolicy = field(default_factory=QuantPolicy)
 
+    def hybrid_cp_factors(self) -> tuple[int, int]:
+        """Return (Ulysses factor, Ring factor) for Hybrid CP."""
+        if self.cp_kind != CPKind.HYBRID:
+            return self.cp, self.cp
+        if self.cp_ulysses is None and self.cp_ring is None:
+            return self.cp, self.cp
+        if self.cp_ulysses is None or self.cp_ring is None:
+            raise ValueError("Hybrid CP requires both cp_ulysses and cp_ring")
+        if self.cp_ulysses <= 0 or self.cp_ring <= 0:
+            raise ValueError("Hybrid CP requires cp_ulysses > 0 and cp_ring > 0")
+        if self.cp_ulysses * self.cp_ring != self.cp:
+            raise ValueError(
+                f"Hybrid CP requires cp_ulysses({self.cp_ulysses}) * "
+                f"cp_ring({self.cp_ring}) == cp({self.cp})"
+            )
+        return self.cp_ulysses, self.cp_ring
+
     def num_microbatches(self) -> int:
         """Number of microbatches per training step."""
         if self.global_batch > 0:
@@ -239,6 +261,11 @@ class Strategy:
             errors.append(
                 f"ffn({model.ffn}) not divisible by TP({self.tp})"
             )
+
+        try:
+            self.hybrid_cp_factors()
+        except ValueError as exc:
+            errors.append(str(exc))
 
         if self.cp_kind == CPKind.ULYSSES and model.num_heads % self.cp != 0:
             errors.append(

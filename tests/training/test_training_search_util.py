@@ -11,6 +11,7 @@ import pandas as pd
 from zrt.training.search.training_search_util import (
     TrainingConfigManager,
     _load_model_spec,
+    _graph_cache_key,
     _make_strategy_from_config,
     _make_system_from_config,
     _analysis_value,
@@ -235,6 +236,23 @@ class TestMakeStrategyFromConfig:
         strategy = _make_strategy_from_config(config)
 
         assert strategy.cp_kind == CPKind.ULYSSES
+
+    def test_hybrid_cp_factors(self):
+        strategy = _make_strategy_from_config({
+            "cp": 8,
+            "cp_kind": "hybrid",
+            "cp_ulysses": 4,
+            "cp_ring": 2,
+        })
+
+        assert strategy.cp_ulysses == 4
+        assert strategy.cp_ring == 2
+
+    def test_graph_cache_key_includes_hybrid_cp_factors(self):
+        base = {"cp": 8, "cp_kind": "hybrid", "cp_ulysses": 4, "cp_ring": 2}
+        other = {**base, "cp_ulysses": 2, "cp_ring": 4}
+
+        assert _graph_cache_key(base) != _graph_cache_key(other)
 
 
 class TestTrainingConfigManager:
