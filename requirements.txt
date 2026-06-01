@@ -4,10 +4,11 @@
 torch>=2.0.0
 
 # transformers: model config/modeling utilities
-# No upper-version pin: runtime version shims in python/zrt/graph/compat.py
-# handle API removals between 4.x and 5.x (e.g. is_flash_attn_greater_or_equal_2_10).
+# Keep the upper bound on the latest version this fake-tracing stack is
+# validated against; newer 5.x releases have changed enough internals to
+# alter captured training graph structure.
 # Tested on: 4.57.6 and 5.4.0
-transformers>=4.36.0
+transformers>=4.36.0,<5.5.0
 
 # openpyxl: write formatted Excel workbook
 openpyxl>=3.1.0
