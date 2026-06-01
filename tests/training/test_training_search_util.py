@@ -240,6 +240,16 @@ class TestMakeStrategyFromConfig:
 class TestTrainingConfigManager:
     """Test TrainingConfigManager functionality."""
 
+    def test_validation_strategy_non_interleaved_ignores_vpp(self):
+        manager = TrainingConfigManager(param_grid={})
+
+        strategy = manager._build_strategy_for_validation(
+            tp=1, cp=1, pp=1, ep=1, dp=1,
+            other_config={"pp_schedule": "1f1b", "vpp_chunks": 4},
+        )
+
+        assert strategy.vpp_chunks == 1
+
     def test_generate_static_configs_basic(self):
         manager = TrainingConfigManager(
             param_grid={"world_size": [1], "tp": [1], "cp": [1], "pp": [1], "dp": [1]},
@@ -794,19 +804,19 @@ class TestFormatResults:
         assert df.iloc[0]["step_time_ms"] == 100.0
         assert df.iloc[0]["mfu"] == 0.45
 
-    def test_format_results_sorted_by_mfu(self):
+    def test_format_results_sorted_by_tokens_per_sec(self):
         reports = [
-            TrainingReport(mfu=0.3, step_time_ms=200),
-            TrainingReport(mfu=0.5, step_time_ms=100),
-            TrainingReport(mfu=0.4, step_time_ms=150),
+            TrainingReport(mfu=0.3, step_time_ms=200, tokens_per_sec=100),
+            TrainingReport(mfu=0.5, step_time_ms=100, tokens_per_sec=300),
+            TrainingReport(mfu=0.4, step_time_ms=150, tokens_per_sec=200),
         ]
         configs = [{"model": f"model_{i}"} for i in range(3)]
 
         df = format_results(reports, configs)
 
-        assert df.iloc[0]["mfu"] == 0.5
-        assert df.iloc[1]["mfu"] == 0.4
-        assert df.iloc[2]["mfu"] == 0.3
+        assert df.iloc[0]["tokens_per_sec"] == 300
+        assert df.iloc[1]["tokens_per_sec"] == 200
+        assert df.iloc[2]["tokens_per_sec"] == 100
 
     def test_format_results_preserves_small_nonzero_optimizer_compute(self):
         report = TrainingReport(

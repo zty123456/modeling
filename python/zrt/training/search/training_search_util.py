@@ -344,8 +344,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
 
     pp_schedule = PPSched(config.get("pp_schedule", "1f1b"))
     vpp_chunks = config.get("vpp_chunks", 1)
-    # if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
-    #     vpp_chunks = 1
+    if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
+        vpp_chunks = 1
 
     return Strategy(
         tp=config.get("tp", 1),
@@ -415,8 +415,8 @@ class TrainingConfigManager:
     ) -> Strategy:
         pp_schedule = PPSched(other_config.get("pp_schedule", "1f1b"))
         vpp_chunks = other_config.get("vpp_chunks", 1)
-        # if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
-        #     vpp_chunks = 1
+        if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
+            vpp_chunks = 1
 
         recompute = RecomputePolicy()
         rc_str = other_config.get("recompute", "none")
@@ -1391,7 +1391,10 @@ def export_best_configs_excel(
         best_config = best_row["config"]
         best_report = best_row["report"]
 
-        model = _load_model_spec(model_name)
+        model = _load_model_spec(
+            model_name,
+            quant_preset=best_config.get("quant_preset") or None,
+        )
         model.seq_len = seq_len
 
         hw = load_hw(hw_name)
