@@ -1334,7 +1334,7 @@ class TrainingPipelinePass(GraphPass):
                 muon_ag.annotations["latency_us"] = ag_time_us
                 muon_ag.annotations["comm_time_us"] = ag_time_us
                 muon_ag.annotations["compute_us"] = 0.0
-                .annotations["memory_us"] = 0.0
+                muon_ag.annotations["memory_us"] = 0.0
                 muon_ag.annotations["bound"] = "comm"
                 muon_ag.annotations["overlap_type"] = "moonshot_ag" if rotation_active else "none"
                 muon_ag.annotations["overlap_target"] = "compute:optimizer_step+fwd_window" if rotation_active else ""
@@ -1356,7 +1356,7 @@ class TrainingPipelinePass(GraphPass):
                 if rotation_active:
                     muon_rs.annotations["overlap_hide_window_us"] = fwd_window_us
 
-            if opt_nomuon_agde and opt_compute_us > 0:
+            if opt_node and not (muon_ag or muon_rs) and opt_compute_us > 0:
                 opt_node.annotations["latency_us"] = opt_compute_us
                 opt_node.annotations["compute_us"] = opt_compute_us
                 opt_node.annotations["memory_us"] = 0.0
