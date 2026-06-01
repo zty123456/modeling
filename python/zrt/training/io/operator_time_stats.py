@@ -216,6 +216,39 @@ def _append_if_present(
     )
 
 
+def classify_op_groups(op: dict) -> list[str]:
+    """Return the semantic group tags an op belongs to.
+
+    These groups are the ones that cannot be derived from ``kind`` alone
+    (attention vs matmul vs ffn, etc.). They reuse the same predicates that
+    ``build_operator_time_stats`` uses so the static summary and the
+    interactive report share a single source of truth. An op can belong to
+    several groups at once (e.g. a ``q_proj`` matmul is both ``matmul`` and
+    ``attention_matmul``).
+    """
+    groups: list[str] = []
+    if _is_matmul_op(op) or _is_lm_head_op(op):
+        groups.append("matmul")
+    if _is_attention_op(op):
+        groups.append("attention")
+    if _is_attention_matmul_op(op):
+        groups.append("attention_matmul")
+    if _is_ffn_matmul_op(op):
+        groups.append("ffn")
+    if _is_lm_head_op(op):
+        groups.append("lm_head")
+    if _is_mtp_embed_matmul_op(op):
+        groups.append("mtp_embed")
+
+    kind = str(op.get("kind", "") or "").lower()
+    if kind == "indexer_topk":
+        groups.append("indexer")
+    if kind == "attn_core":
+        groups.append("sparse_fa")
+
+    return groups
+
+
 def _has_swa_window(op: dict) -> bool:
     kind = str(op.get("kind", "") or "").lower()
     if kind not in {"sparse_attn", "hca_attn", "swa_attn"}:

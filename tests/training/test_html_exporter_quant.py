@@ -118,3 +118,53 @@ def test_html_export_includes_operator_time_share(tmp_path):
     assert "MLA attention block" in html
     assert "useful compute" in html
     assert "pct_of_useful_compute" in html
+
+
+def test_html_export_includes_interactive_op_share(tmp_path):
+    model = ModelSpec(
+        hidden=128,
+        ffn=256,
+        num_heads=4,
+        num_kv_heads=4,
+        head_dim=32,
+        vocab=1000,
+        seq_len=64,
+        layers=[LayerKind.DENSE, LayerKind.MOE],
+        num_experts=8,
+        moe_ffn=256,
+        top_k=2,
+    )
+    system = _system()
+    strategy = Strategy()
+    graph = build_graph(model, strategy)
+    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+    out = tmp_path / "op_share.html"
+
+    export_estimate_html(
+        report=TrainingReport(step_time_ms=100.0, compute_time_ms=50.0),
+        graph=graph,
+        model=model,
+        system=system,
+        strategy=strategy,
+        op_costs=op_costs,
+        output_path=out,
+    )
+
+    html = out.read_text(encoding="utf-8")
+    # JSON payload still injected via the safe literal path, no raw enum leakage.
+    assert "const DATA = JSON.parse(" in html
+    assert "Dtype." not in html
+    # New interactive section + its controls and client-side helpers are present.
+    assert '<section id="op-share">' in html
+    assert "5. 算子耗时占比分析" in html
+    assert "function renderOpShare()" in html
+    assert "renderOpShare();" in html
+    assert "opFocus" in html
+    assert "opBreakdown" in html
+    assert "function donutSvg(" in html
+    # Calibration section renumbered to 6 (op-share inserted before it).
+    assert "6. 报告校准" in html
+    # Per-op enrichment fields the component depends on are embedded in DATA.
+    assert "op_groups" in html
+    assert "cube_flops" in html
+    assert "vector_flops" in html

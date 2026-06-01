@@ -23,7 +23,10 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from zrt.training.io.operator_time_stats import build_operator_time_stats
+from zrt.training.io.operator_time_stats import (
+    build_operator_time_stats,
+    classify_op_groups,
+)
 
 if TYPE_CHECKING:
     from zrt.training.ir.training_graph import Graph, Op
@@ -569,6 +572,10 @@ def _op_to_dict(op: "Op", cost: "OpCost", system, model=None) -> dict:
         "dx_ms": dx_t * 1000,
         "dw_ms": dw_t * 1000,
         "total_ms": (fwd_t + dx_t + dw_t) * 1000,
+        "cube_flops": cost.fwd_cube_flops + cost.dx_cube_flops + cost.dw_cube_flops,
+        "vector_flops": (
+            cost.fwd_vector_flops + cost.dx_vector_flops + cost.dw_vector_flops
+        ),
         "inputs": detail["inputs"],
         "outputs": detail["outputs"],
         "fwd_formula": detail["fwd_formula"],
@@ -1049,6 +1056,7 @@ def _build_layer_tree(
 
             od = _op_to_dict(op, cost, system, model)
             od["component_group"] = _component_of_op(op)
+            od["op_groups"] = classify_op_groups(od)
 
             tree["global_ops"].append(od)
             all_op_dicts.append(od)
@@ -1090,6 +1098,7 @@ def _build_layer_tree(
 
                 od = _op_to_dict(op, cost, system, model)
                 od["component_group"] = _component_of_op(op)
+                od["op_groups"] = classify_op_groups(od)
 
                 blk_data["ops"].append(od)
                 all_op_dicts.append(od)
@@ -1128,6 +1137,7 @@ def _build_layer_tree(
 
                 od = _op_to_dict(op, cost, system, model)
                 od["component_group"] = _component_of_op(op)
+                od["op_groups"] = classify_op_groups(od)
 
                 blk_data["ops"].append(od)
                 all_op_dicts.append(od)
@@ -1639,6 +1649,50 @@ details[open] > summary::before { content: "−"; }
   border-radius: 10px;
   margin: 8px 0;
 }
+.pie-toolbar {
+  display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end;
+  margin: 12px 0 18px;
+}
+.pie-field { display: flex; flex-direction: column; gap: 7px; }
+.pie-flabel {
+  font-size: 11px; font-weight: 800; letter-spacing: .03em;
+  text-transform: uppercase; color: var(--muted);
+}
+.pie-toolbar select {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 11px; background: white; font-weight: 650; min-width: 220px;
+}
+.opshare-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tog {
+  cursor: pointer; user-select: none;
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 6px 13px; font-size: 12px; font-weight: 650;
+  background: white; color: var(--text); line-height: 1.4;
+}
+.tog.on { background: #2563eb; border-color: #2563eb; color: white; }
+.opshare-head {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline;
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px;
+  background: #f8fafc; margin-bottom: 14px;
+}
+.opshare-head b { font-size: 18px; }
+.opshare-empty { color: var(--muted); padding: 16px 0; }
+.pie-layout {
+  display: flex; gap: 28px; align-items: center; flex-wrap: wrap;
+}
+.pie-svg { width: 200px; height: 200px; flex: 0 0 auto; }
+.pie-center-top { font-size: 13px; font-weight: 800; fill: var(--text); }
+.pie-center-sub { font-size: 15px; font-weight: 800; fill: #2563eb; }
+.pie-legend { flex: 1; min-width: 260px; display: flex; flex-direction: column; gap: 2px; }
+.pie-leg-row {
+  display: grid; grid-template-columns: 14px 1fr auto auto; gap: 10px;
+  align-items: center; padding: 5px 6px; border-radius: 8px; font-size: 13px;
+}
+.pie-leg-row:hover { background: #f5f7fb; }
+.pie-dot { width: 12px; height: 12px; border-radius: 3px; }
+.pie-leg-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pie-leg-val { color: var(--muted); white-space: nowrap; }
+.pie-leg-pct { font-weight: 800; white-space: nowrap; min-width: 56px; text-align: right; }
 @media (max-width: 1100px) {
   .grid-2, .grid-3, .grid-4, .model-flow { grid-template-columns: 1fr; }
   .flow-block:not(:last-child)::after { display: none; }
@@ -1656,6 +1710,7 @@ details[open] > summary::before { content: "−"; }
   <section id="topology"></section>
   <section id="model-overview"></section>
   <section id="hierarchy"></section>
+  <section id="op-share"></section>
   <section id="calibration"></section>
 </main>
 
@@ -1992,7 +2047,7 @@ function renderCalibration() {
   const rows = DATA.calibration || [];
 
   document.getElementById("calibration").innerHTML = `
-    <h2>5. 报告校准</h2>
+    <h2>6. 报告校准</h2>
     <p class="muted">校准分为结构校验、公开 kernel benchmark 对齐、以及目标集群本地 step-time 采样。公开 benchmark 不一定与当前训练配置完全同构，需要看 status 和 note。</p>
 
     <table class="calib-table">
@@ -2022,10 +2077,300 @@ function renderCalibration() {
   `;
 }
 
+// ── Operator time-share analysis (pie) ──────────────────────────────────────
+const OPSHARE = { ops: [], groups: [] };
+const OPSHARE_COLORS = [
+  "#2563eb", "#16a34a", "#d97706", "#9333ea", "#dc2626", "#0891b2",
+  "#ca8a04", "#db2777", "#65a30d", "#0ea5e9", "#7c3aed", "#e11d48",
+  "#0d9488", "#a16207", "#4f46e5", "#be123c",
+];
+
+function opTopBound(op) {
+  // Mirror _build_summary: anything not memory/comm counts as compute.
+  const b = String(op.bound || "").toLowerCase();
+  if (b.includes("memory") || b.includes("hbm")) return "memory";
+  if (b.includes("comm")) return "comm";
+  return "compute";
+}
+
+// Flatten the layer tree into a single op list. Each op already carries
+// op_groups / cube_flops / vector_flops / layer_id / layer_kind from the
+// Python exporter, so all analysis happens client-side with no extra fetch.
+function flattenOps(tree) {
+  const out = [];
+  (tree.global_ops || []).forEach(op => out.push(op));
+  (tree.layers || []).forEach(layer => {
+    (layer.blocks || []).forEach(block => {
+      (block.ops || []).forEach(op => out.push(op));
+    });
+  });
+  return out;
+}
+
+function opPhaseTime(op, fwdOn, bwdOn) {
+  return (fwdOn ? Number(op.fwd_ms || 0) : 0)
+    + (bwdOn ? Number(op.dx_ms || 0) + Number(op.dw_ms || 0) : 0);
+}
+
+const OPGROUP_LABELS = {
+  matmul: "matmul", attention: "attention", attention_matmul: "attn matmul",
+  ffn: "ffn / moe", lm_head: "lm_head", mtp_embed: "mtp embed",
+  indexer: "indexer", sparse_fa: "sparse FA",
+};
+const FOCUS_OPTS = [
+  ["__all__", "全部算子"],
+  ["matmul", "matmul"],
+  ["attention", "attention"],
+  ["ffn", "ffn / moe"],
+  ["attention_matmul", "attn matmul"],
+  ["lm_head", "lm_head"],
+  ["indexer", "indexer"],
+  ["sparse_fa", "sparse FA"],
+];
+const BREAKDOWN_OPTS = [
+  ["component_group", "模型组件 (attn / moe / …)"],
+  ["kind", "算子 kind"],
+  ["layer_kind", "layer 类型 (dense / moe / mtp)"],
+  ["layer_id", "layer 编号"],
+  ["op_group", "语义分组"],
+  ["compute_unit", "计算单元 (cube / vector / mem / comm)"],
+  ["phase", "前向 / 反向"],
+];
+
+// Time pieces of an op split into (phase × compute-unit), used only by the
+// compute_unit / phase breakdowns. Compute-bound ops are apportioned to cube /
+// vector by their FLOP ratio; memory / comm ops stay whole.
+function opUnitPieces(op, fwdOn, bwdOn) {
+  const tb = opTopBound(op);
+  const pieces = [];
+  const phases = [
+    ["forward", fwdOn ? Number(op.fwd_ms || 0) : 0],
+    ["backward", bwdOn ? Number(op.dx_ms || 0) + Number(op.dw_ms || 0) : 0],
+  ];
+  const cf = Number(op.cube_flops || 0);
+  const vf = Number(op.vector_flops || 0);
+  const tot = cf + vf;
+  for (const [phase, pt] of phases) {
+    if (pt <= 0) continue;
+    if (tb !== "compute") {
+      pieces.push({ phase, unit: tb, t: pt });
+    } else if (tot > 0) {
+      if (cf > 0) pieces.push({ phase, unit: "cube", t: pt * cf / tot });
+      if (vf > 0) pieces.push({ phase, unit: "vector", t: pt * vf / tot });
+    } else {
+      pieces.push({ phase, unit: "compute_other", t: pt });
+    }
+  }
+  return pieces;
+}
+
+function uniqSorted(values) {
+  return Array.from(new Set(values.filter(v => v !== "" && v != null))).sort();
+}
+
+function togStates(sel) {
+  const out = {};
+  document.querySelectorAll(`[data-sel="${sel}"]`).forEach(el => {
+    out[el.dataset.val] = el.classList.contains("on");
+  });
+  return out;
+}
+
+function selectedVals(sel) {
+  return Object.entries(togStates(sel)).filter(([, on]) => on).map(([v]) => v);
+}
+
+function chip(sel, val, label, on, sub) {
+  return `<span class="tog${sub ? " sub" : ""}${on ? " on" : ""}" `
+    + `data-sel="${esc(sel)}" data-val="${esc(val)}">${esc(label)}</span>`;
+}
+
+function renderOpShare() {
+  const tree = DATA.tree || {};
+  OPSHARE.ops = flattenOps(tree);
+  OPSHARE.groups = new Set([].concat(...OPSHARE.ops.map(o => o.op_groups || [])));
+
+  // Only offer a focus option when at least one op carries that group.
+  const focusOpts = FOCUS_OPTS.filter(
+    ([v]) => v === "__all__" || OPSHARE.groups.has(v)
+  );
+
+  document.getElementById("op-share").innerHTML = `
+    <h2>5. 算子耗时占比分析</h2>
+    <p class="muted">先选「聚焦算子」(看哪一类)，再选「拆分维度」(按什么切饼)，
+    饼图与图例展示各部分的耗时占比，帮助定位瓶颈。耗时来自 IR op 的 fwd + dx + dw 估算，
+    全部在浏览器端计算。</p>
+
+    <div class="pie-toolbar">
+      <label class="pie-field">
+        <span class="pie-flabel">聚焦算子</span>
+        <select id="opFocus">
+          ${focusOpts.map(([v, l], i) =>
+            `<option value="${esc(v)}"${i === 0 ? " selected" : ""}>${esc(l)}</option>`).join("")}
+        </select>
+      </label>
+      <label class="pie-field">
+        <span class="pie-flabel">拆分维度</span>
+        <select id="opBreakdown">
+          ${BREAKDOWN_OPTS.map(([v, l], i) =>
+            `<option value="${esc(v)}"${i === 0 ? " selected" : ""}>${esc(l)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="pie-field">
+        <span class="pie-flabel">阶段</span>
+        <div class="opshare-chips" data-group="phase">
+          ${chip("phase", "forward", "前向", true)}
+          ${chip("phase", "backward", "反向", true)}
+        </div>
+      </div>
+    </div>
+
+    <div id="opShareResult"></div>
+  `;
+
+  const sec = document.getElementById("op-share");
+  sec.querySelector('[data-group="phase"]').addEventListener("click", e => {
+    const el = e.target.closest(".tog");
+    if (!el) return;
+    el.classList.toggle("on");
+    recomputeOpShare();
+  });
+  document.getElementById("opFocus").addEventListener("change", recomputeOpShare);
+  document.getElementById("opBreakdown").addEventListener("change", recomputeOpShare);
+
+  recomputeOpShare();
+}
+
+// Bucket key for one op under the chosen breakdown dimension. Returns a list of
+// {key, t} so that multi-valued dimensions (compute_unit, phase, op_group) can
+// split a single op across several slices.
+function opShareContribs(op, breakdown, fwdOn, bwdOn) {
+  if (breakdown === "compute_unit" || breakdown === "phase") {
+    const out = [];
+    for (const pc of opUnitPieces(op, fwdOn, bwdOn)) {
+      const key = breakdown === "phase"
+        ? (pc.phase === "forward" ? "前向" : "反向")
+        : ({ cube: "cube", vector: "vector", memory: "memory", comm: "comm",
+             compute_other: "compute (无 FLOPs)" }[pc.unit] || pc.unit);
+      out.push({ key, t: pc.t });
+    }
+    return out;
+  }
+
+  const t = opPhaseTime(op, fwdOn, bwdOn);
+  if (t <= 0) return [];
+
+  if (breakdown === "op_group") {
+    const tags = op.op_groups || [];
+    if (!tags.length) return [{ key: "(无语义分组)", t }];
+    return tags.map(tag => ({ key: OPGROUP_LABELS[tag] || tag, t }));
+  }
+
+  let key;
+  switch (breakdown) {
+    case "kind": key = op.kind || "?"; break;
+    case "layer_kind":
+      key = Number(op.layer_id) < 0 ? "global" : (op.layer_kind || "?"); break;
+    case "layer_id":
+      key = Number(op.layer_id) < 0 ? "global" : ("Layer " + op.layer_id); break;
+    default: key = op.component_group || "other"; // component_group
+  }
+  return [{ key, t }];
+}
+
+function recomputeOpShare() {
+  const focus = document.getElementById("opFocus").value;
+  const breakdown = document.getElementById("opBreakdown").value;
+  const phaseOn = togStates("phase");
+  const fwdOn = !!phaseOn.forward;
+  const bwdOn = !!phaseOn.backward;
+  const overlaps = breakdown === "op_group";
+
+  const buckets = new Map();
+  let total = 0;
+  for (const op of OPSHARE.ops) {
+    if (focus !== "__all__" && !(op.op_groups || []).includes(focus)) continue;
+    for (const c of opShareContribs(op, breakdown, fwdOn, bwdOn)) {
+      if (c.t <= 0) continue;
+      buckets.set(c.key, (buckets.get(c.key) || 0) + c.t);
+      total += c.t;
+    }
+  }
+
+  const p = (DATA.summary && DATA.summary.performance) || {};
+  const stepT = Number(p.step_time_ms || 0);
+  const usefulT = Number(p.compute_time_ms || 0);
+  // For overlapping breakdowns the slice sum exceeds the op total, so the pie
+  // is normalized against the bucket sum (its own 100%), not `total`.
+  const pieDenom = (overlaps
+    ? Array.from(buckets.values()).reduce((a, b) => a + b, 0)
+    : total) || 1e-12;
+
+  const rows = Array.from(buckets.entries())
+    .map(([k, t], i) => ({ k, t })).sort((a, b) => b.t - a.t)
+    .map((r, i) => ({ ...r, color: OPSHARE_COLORS[i % OPSHARE_COLORS.length] }));
+
+  const el = document.getElementById("opShareResult");
+  if (!rows.length) {
+    el.innerHTML = `<div class="opshare-empty">当前筛选无匹配算子。</div>`;
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="opshare-head">
+      <span>聚焦合计 <b>${fmt.ms(total)}</b></span>
+      <span>占 step time <b>${fmt.pct(stepT > 0 ? total / stepT : 0)}</b></span>
+      <span>占 useful compute <b>${fmt.pct(usefulT > 0 ? total / usefulT : 0)}</b></span>
+    </div>
+    ${overlaps ? `<p class="muted">注：语义分组可重叠（如 q_proj 同属 matmul 与 attn matmul），饼图按各分组之和归一化。</p>` : ""}
+    <div class="pie-layout">
+      ${donutSvg(rows, pieDenom)}
+      <div class="pie-legend">
+        ${rows.map(r => `
+          <div class="pie-leg-row">
+            <span class="pie-dot" style="background:${r.color}"></span>
+            <span class="pie-leg-name">${esc(r.k)}</span>
+            <span class="pie-leg-val">${fmt.ms(r.t)}</span>
+            <span class="pie-leg-pct">${fmt.pct(r.t / pieDenom)}</span>
+          </div>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
+// Pure-SVG donut (no chart library). Each slice is a stroked circle arc placed
+// via stroke-dasharray / dashoffset, starting at 12 o'clock.
+function donutSvg(rows, denom) {
+  const R = 70, CX = 90, CY = 90, SW = 34, C = 2 * Math.PI * R;
+  let acc = 0;
+  const arcs = rows.map(r => {
+    const frac = Math.max(0, r.t / denom);
+    const len = frac * C;
+    const seg = `<circle cx="${CX}" cy="${CY}" r="${R}" fill="none" `
+      + `stroke="${r.color}" stroke-width="${SW}" `
+      + `stroke-dasharray="${len.toFixed(3)} ${(C - len).toFixed(3)}" `
+      + `stroke-dashoffset="${(-acc).toFixed(3)}" `
+      + `transform="rotate(-90 ${CX} ${CY})"><title>${esc(r.k)} · ${fmt.pct(frac)}</title></circle>`;
+    acc += len;
+    return seg;
+  }).join("");
+  const top = rows[0];
+  return `
+    <svg class="pie-svg" viewBox="0 0 180 180" role="img" aria-label="operator time share">
+      <circle cx="${CX}" cy="${CY}" r="${R}" fill="none" stroke="#eef1f6" stroke-width="${SW}"></circle>
+      ${arcs}
+      <text x="${CX}" y="${CY - 4}" text-anchor="middle" class="pie-center-top">${esc(top.k)}</text>
+      <text x="${CX}" y="${CY + 16}" text-anchor="middle" class="pie-center-sub">${fmt.pct(top.t / denom)}</text>
+    </svg>
+  `;
+}
+
 renderSummary();
 renderTopology();
 renderModelOverview();
 renderHierarchy();
+renderOpShare();
 renderCalibration();
 </script>
 </body>

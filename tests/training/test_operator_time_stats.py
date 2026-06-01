@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from zrt.training.io.operator_time_stats import build_operator_time_stats
+from zrt.training.io.operator_time_stats import (
+    build_operator_time_stats,
+    classify_op_groups,
+)
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.report import TrainingReport
 
@@ -122,6 +125,54 @@ def test_operator_time_stats_uses_compute_time_for_schedule_aware_step_scale():
     assert matmul["pct_of_step"] == 0.25
     assert matmul["pct_of_useful_compute"] == 0.5
     assert matmul["op_count"] == 1
+
+
+def test_classify_op_groups_attention_matmul_is_both_matmul_and_attention():
+    groups = classify_op_groups(
+        {"name": "L0.q_proj", "kind": "matmul", "component": "attention"}
+    )
+    assert "matmul" in groups
+    assert "attention" in groups
+    assert "attention_matmul" in groups
+    assert "ffn" not in groups
+
+
+def test_classify_op_groups_ffn_matmul():
+    groups = classify_op_groups(
+        {"name": "L0.routed_expert_ffn", "kind": "matmul", "component": "routed_expert"}
+    )
+    assert "matmul" in groups
+    assert "ffn" in groups
+    assert "attention_matmul" not in groups
+
+
+def test_classify_op_groups_lm_head_is_matmul_family():
+    groups = classify_op_groups({"name": "lm_head", "kind": "lm_head"})
+    assert "matmul" in groups
+    assert "lm_head" in groups
+
+
+def test_classify_op_groups_mtp_embed():
+    groups = classify_op_groups(
+        {"name": "L0.mtp_embed_proj", "kind": "matmul", "layer_kind": "mtp"}
+    )
+    assert "matmul" in groups
+    assert "mtp_embed" in groups
+
+
+def test_classify_op_groups_kind_based_indexer_and_sparse_fa():
+    assert classify_op_groups({"name": "idx", "kind": "indexer_topk"}) == [
+        "attention",
+        "indexer",
+    ]
+    assert classify_op_groups({"name": "fa", "kind": "attn_core"}) == [
+        "attention",
+        "sparse_fa",
+    ]
+
+
+def test_classify_op_groups_non_compute_op_has_no_groups():
+    assert classify_op_groups({"name": "L0.norm", "kind": "rmsnorm"}) == []
 
 
 def test_operator_time_stats_falls_back_to_microbatch_pp_scale_without_compute_time():
