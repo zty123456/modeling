@@ -69,7 +69,7 @@ RAW_DATA_HEADERS = [
 
 ANALYSIS_HEADERS = [
     "组号", "硬件+seq", "TP", "PP", "DP", "EP", "CP", "重计算",
-    "单卡迭代时间", "单卡吞吐", "单卡吞吐归一化", "计算占比",
+    "迭代时间", "集群吞吐", "集群吞吐归一化", "计算占比",
     "TP通信占比", "EP通信占比", "PP通信占比", "DP通信占比",
     "CP通信占比", "优化器占比", "空泡占比", "fw_time", "bw_time",
     "recompute_time", "计算时间", "TP通信时间(未掩盖)",
@@ -86,8 +86,8 @@ RAW_TO_ANALYSIS = {
     "EP": "ep",
     "CP": "cp",
     "重计算": "recompute",
-    "单卡迭代时间": "step_time_ms",
-    "单卡吞吐": "tokens_per_sec",
+    "迭代时间": "step_time_ms",
+    "集群吞吐": "tokens_per_sec",
     "fw_time": "fwd_compute_ms",
     "bw_time": "bwd_compute_ms",
     "recompute_time": "recompute_time_ms",
@@ -1268,7 +1268,7 @@ def _analysis_value(
             + _safe_float(row, "bwd_compute_ms")
             + _safe_float(row, "recompute_time_ms")
         )
-    if header == "单卡吞吐归一化":
+    if header == "集群吞吐归一化":
         current = _safe_float(row, "tokens_per_sec")
         return round(current / baseline_tokens, 3) if baseline_tokens else None
     if step_time <= 0:
@@ -1310,7 +1310,7 @@ def _write_analysis_sheet(
             cell.value = _analysis_value(header, row, baseline)
             if header in PERCENT_ANALYSIS_HEADERS:
                 cell.number_format = "0.00%"
-            elif header == "单卡吞吐归一化":
+            elif header == "集群吞吐归一化":
                 cell.number_format = "0.000"
             elif isinstance(cell.value, float):
                 cell.number_format = "0.00"

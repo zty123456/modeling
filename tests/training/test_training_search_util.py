@@ -1016,7 +1016,7 @@ class TestBestAnalysisReport:
         assert _analysis_value("计算时间", row, 100.0) == 60.0
         assert _analysis_value("计算占比", row, 100.0) == 0.6
         assert _analysis_value("优化器占比", row, 100.0) == 0.07
-        assert _analysis_value("单卡吞吐归一化", row, 100.0) == 1.5
+        assert _analysis_value("集群吞吐归一化", row, 100.0) == 1.5
 
     def test_export_best_analysis_excel_merges_group_label_cells(self):
         output_dir = Path("output") / "test_best_analysis_group_merge"
@@ -1068,6 +1068,15 @@ class TestBestAnalysisReport:
             import openpyxl
 
             wb = openpyxl.load_workbook(excel_path)
+            analysis_headers = [
+                cell.value for cell in next(wb["analysis"].iter_rows(min_row=1, max_row=1))
+            ]
+            assert "迭代时间" in analysis_headers
+            assert "集群吞吐" in analysis_headers
+            assert "集群吞吐归一化" in analysis_headers
+            assert "单卡迭代时间" not in analysis_headers
+            assert "单卡吞吐" not in analysis_headers
+            assert "单卡吞吐归一化" not in analysis_headers
             assert "A2:A3" in {str(rng) for rng in wb["raw_data"].merged_cells.ranges}
             assert "A4:A5" in {str(rng) for rng in wb["raw_data"].merged_cells.ranges}
             assert "A2:A3" in {str(rng) for rng in wb["analysis"].merged_cells.ranges}

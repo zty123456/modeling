@@ -287,7 +287,7 @@ output/training_search/{model}_ws_{world_size}/
 | TP/EP/PP/DP/CP 通信占比 | 对应 `*_exposed_ms / step_time_ms` |
 | 优化器占比 | `optimizer_compute_ms / step_time_ms` |
 | 空泡占比 | `bubble_time_ms / step_time_ms` |
-| 单卡吞吐归一化 | 当前硬件 `tokens_per_sec / 同组同 seq 的基准硬件 tokens_per_sec` |
+| 集群吞吐归一化 | 当前硬件 `tokens_per_sec / 同组同 seq 的基准硬件 tokens_per_sec` |
 
 Excel 报表会自动合并并居中 `组号` 列；表头为蓝底，偶数对比组整组数据行为绿底。
 
