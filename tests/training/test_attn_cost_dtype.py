@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from zrt.training.ir.training_graph import Op, Tensor
-from zrt.training.models.flops import _attn_cost
+from zrt.training.models.flops import op_cost, _attn_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 
@@ -93,3 +93,33 @@ def test_attn_cost_with_explicit_compression_ratio():
     cost = _attn_cost(op, m, system=None)
     assert cost.fwd_bytes > 0
     assert cost.fwd_cube_flops > 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "extra_meta"),
+    [
+        ("attn_core", {}),
+        ("sparse_attn", {"sparse_topk": 64, "swa_window": 16}),
+        ("hca_attn", {"compress_ratio": 4, "swa_window": 16}),
+        ("swa_attn", {"swa_window": 64}),
+    ],
+)
+def test_mqa_kv_bytes_use_kv_heads(kind, extra_meta):
+    """MQA shares one K/V head across Q heads instead of rereading K/V per Q head."""
+    model = _model()
+    mha = _make_attn_op()
+    mha.kind = kind
+    mha.meta.update(extra_meta)
+    mha.meta["kv_heads"] = 4
+
+    mqa = _make_attn_op()
+    mqa.kind = kind
+    mqa.meta.update(extra_meta)
+    mqa.meta["kv_heads"] = 1
+
+    mha_cost = op_cost(mha, model)
+    mqa_cost = op_cost(mqa, model)
+
+    assert mqa_cost.fwd_bytes < mha_cost.fwd_bytes
+    assert mqa_cost.dx_bytes < mha_cost.dx_bytes
+    assert mqa_cost.fwd_cube_flops == mha_cost.fwd_cube_flops

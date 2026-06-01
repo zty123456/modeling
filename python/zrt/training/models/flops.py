@@ -265,6 +265,7 @@ def _attn_cost(op: Op, model: ModelSpec | None, system: SystemSpec | None = None
     b = op.meta.get("b", 1)
     s = op.meta.get("s", 0)
     h = op.meta.get("heads", 0)
+    kv_h = op.meta.get("kv_heads", h)
     d = op.meta.get("head_dim", 0)
     causal = op.meta.get("causal", True)
 
@@ -338,7 +339,7 @@ def _attn_cost(op: Op, model: ModelSpec | None, system: SystemSpec | None = None
 
     q_elems  = b * h * s * d
     o_elems  = b * h * s * d
-    kv_elems = b * h * Tr * tc_eff * Bc * d
+    kv_elems = b * kv_h * Tr * tc_eff * Bc * d
     # fwd: read Q + 2×KV at fwd-act dtype; write O at out_act dtype.
     fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
     # Backward: ≈2× fwd minus small saved-state (M, L) overhead. dO and
@@ -376,6 +377,7 @@ def _sparse_attn_cost(op: Op, system: SystemSpec | None = None,
     b = op.meta.get("b", 1)
     s = op.meta.get("s", 0)
     h = op.meta.get("heads", 0)
+    kv_h = op.meta.get("kv_heads", h)
     d = op.meta.get("head_dim", 0)
     topk = op.meta.get("sparse_topk", 0)
     swa = op.meta.get("swa_window", 0)
@@ -397,7 +399,7 @@ def _sparse_attn_cost(op: Op, system: SystemSpec | None = None,
     tc_eff = Tc  # top-k positions are scattered, no causal halving
     q_elems = b * h * s * d
     o_elems = b * h * s * d
-    kv_elems = b * h * Tr * tc_eff * Bc * d
+    kv_elems = b * kv_h * Tr * tc_eff * Bc * d
     fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
     dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 
@@ -422,6 +424,7 @@ def _hca_attn_cost(op: Op, system: SystemSpec | None = None,
     b = op.meta.get("b", 1)
     s = op.meta.get("s", 0)
     h = op.meta.get("heads", 0)
+    kv_h = op.meta.get("kv_heads", h)
     d = op.meta.get("head_dim", 0)
     ratio = op.meta.get("compress_ratio", 0)
     swa = op.meta.get("swa_window", 0)
@@ -444,7 +447,7 @@ def _hca_attn_cost(op: Op, system: SystemSpec | None = None,
     tc_eff = (Tc + 1) / 2  # always causal
     q_elems = b * h * s * d
     o_elems = b * h * s * d
-    kv_elems = b * h * Tr * tc_eff * Bc * d
+    kv_elems = b * kv_h * Tr * tc_eff * Bc * d
     fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
     dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 
@@ -469,6 +472,7 @@ def _swa_attn_cost(op: Op, system: SystemSpec | None = None,
     b = op.meta.get("b", 1)
     s = op.meta.get("s", 0)
     h = op.meta.get("heads", 0)
+    kv_h = op.meta.get("kv_heads", h)
     d = op.meta.get("head_dim", 0)
     swa = op.meta.get("swa_window", 0)
 
@@ -488,7 +492,7 @@ def _swa_attn_cost(op: Op, system: SystemSpec | None = None,
     tc_eff = (Tc + 1) / 2  # always causal
     q_elems = b * h * s * d
     o_elems = b * h * s * d
-    kv_elems = b * h * Tr * tc_eff * Bc * d
+    kv_elems = b * kv_h * Tr * tc_eff * Bc * d
     fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
     dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 

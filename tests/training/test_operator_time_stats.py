@@ -193,8 +193,9 @@ def test_operator_time_stats_emits_dsv4_csa_hca_and_swa_rows():
     assert by_label["CSA attention block"]["time_ms"] == 10.0
     assert by_label["CSA attention block"]["pct_of_step"] == 0.1
     assert by_label["HCA attention block"]["time_ms"] == 10.0
-    assert by_label["SWA operator"]["time_ms"] == 18.0
-    assert by_label["SWA operator"]["op_count"] == 3
+    composite_label = "CSA/HCA/SWA composite attention core"
+    assert by_label[composite_label]["time_ms"] == 18.0
+    assert by_label[composite_label]["op_count"] == 3
 
 
 def test_operator_time_stats_emits_dsv32_sparse_fa_indexer_and_mla_rows():

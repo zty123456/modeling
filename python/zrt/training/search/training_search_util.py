@@ -344,8 +344,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
 
     pp_schedule = PPSched(config.get("pp_schedule", "1f1b"))
     vpp_chunks = config.get("vpp_chunks", 1)
-    # if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
-    #     vpp_chunks = 1
+    if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
+        vpp_chunks = 1
 
     return Strategy(
         tp=config.get("tp", 1),
@@ -364,6 +364,8 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         tp_overlap=TPOverlap(config.get("tp_overlap", "none")),
         ep_overlap=config.get("ep_overlap", False),
         cp_kind=CPKind(config.get("cp_kind", "none")),
+        cp_ulysses=config.get("cp_ulysses"),
+        cp_ring=config.get("cp_ring"),
         dualbatch=config.get("dualbatch", False),
         dp_overlap_in_bubble=config.get("dp_overlap_in_bubble", True),
         dp_grad_buckets=config.get("dp_grad_buckets", 25),
@@ -415,8 +417,8 @@ class TrainingConfigManager:
     ) -> Strategy:
         pp_schedule = PPSched(other_config.get("pp_schedule", "1f1b"))
         vpp_chunks = other_config.get("vpp_chunks", 1)
-        # if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
-        #     vpp_chunks = 1
+        if pp_schedule not in (PPSched.INTERLEAVED, PPSched.DUALPIPE_V):
+            vpp_chunks = 1
 
         recompute = RecomputePolicy()
         rc_str = other_config.get("recompute", "none")
@@ -445,6 +447,8 @@ class TrainingConfigManager:
             tp_overlap=TPOverlap(other_config.get("tp_overlap", "none")),
             ep_overlap=other_config.get("ep_overlap", False),
             cp_kind=CPKind(other_config.get("cp_kind", "none")),
+            cp_ulysses=other_config.get("cp_ulysses"),
+            cp_ring=other_config.get("cp_ring"),
             dualbatch=other_config.get("dualbatch", False),
             dp_overlap_in_bubble=other_config.get("dp_overlap_in_bubble", True),
             dp_grad_buckets=other_config.get("dp_grad_buckets", 25),
@@ -762,6 +766,8 @@ def _graph_cache_key(config: Dict[str, Any]) -> Tuple[Any, ...]:
         int(config.get("cp", 1)),
         int(config.get("ep", 1)),
         config.get("cp_kind", "none"),
+        config.get("cp_ulysses"),
+        config.get("cp_ring"),
     )
 
 
@@ -1391,7 +1397,10 @@ def export_best_configs_excel(
         best_config = best_row["config"]
         best_report = best_row["report"]
 
-        model = _load_model_spec(model_name)
+        model = _load_model_spec(
+            model_name,
+            quant_preset=best_config.get("quant_preset") or None,
+        )
         model.seq_len = seq_len
 
         hw = load_hw(hw_name)

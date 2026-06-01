@@ -5,7 +5,7 @@ import tempfile
 import os
 from pathlib import Path
 
-from zrt.training.io.config_loader import load_specs, _parse_layers
+from zrt.training.io.config_loader import load_specs, _parse_layers, _parse_strategy
 from zrt.training.search.estimator import estimate
 from zrt.training.search.report import report_to_dict, report_to_json, report_summary
 from zrt.training.spec.model import LayerKind
@@ -27,6 +27,18 @@ def test_parse_layers_star_bracket():
 def test_parse_layers_bracket_star():
     layers = _parse_layers("3*[dense]+2*[moe]")
     assert layers == [LayerKind.DENSE]*3 + [LayerKind.MOE]*2
+
+
+def test_parse_strategy_hybrid_cp_factors():
+    strategy = _parse_strategy({
+        "cp": 8,
+        "cp_kind": "hybrid",
+        "cp_ulysses": 4,
+        "cp_ring": 2,
+    })
+
+    assert strategy.cp_ulysses == 4
+    assert strategy.cp_ring == 2
 
 
 def test_config_loading():

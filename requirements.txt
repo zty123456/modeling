@@ -20,3 +20,7 @@ onnx>=1.14.0
 
 # pandas: training search result tables (training_search_util)
 pandas>=2.0.0
+
+# server: FastAPI service dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0

@@ -310,7 +310,8 @@ def build_operator_time_stats(
             rows, "HCA attention block", hca_ops, step_time_ms, useful_compute_ms, time_scale
         )
         _append_if_present(
-            rows, "SWA operator", swa_component_ops, step_time_ms, useful_compute_ms, time_scale
+            rows, "CSA/HCA/SWA composite attention core", swa_component_ops,
+            step_time_ms, useful_compute_ms, time_scale
         )
 
     if _is_dsv32(model):
