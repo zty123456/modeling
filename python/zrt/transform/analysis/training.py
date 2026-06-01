@@ -693,46 +693,16 @@ class TrainingPipelinePass(GraphPass):
         stage_bwd_dw: dict[int, float] = {}
         stage_timelines: dict[int, "Timeline"] = {}  # per-stage DAGScheduler output
 
-        # Strategy 3: global capture + stage composition
+        # Check for typical layer data for layer-type scaling
         layer_profile = g.metadata.get("layer_profile", None)
         typical_indices = g.metadata.get("typical_indices", None)
-        use_strategy3 = (
-            layer_profile is not None
-            and typical_indices is not None
-            and pp > 1
-            and layer_scale != 1.0
-        )
         use_layer_type_scaling = (
             layer_profile is not None
             and typical_indices is not None
             and layer_scale != 1.0
         )
 
-        if use_strategy3:
-            typical_costs_fwd, typical_costs_bwd = self._extract_typical_costs_by_phase(
-                g, typical_indices, layer_profile
-            )
-            if typical_costs_fwd and typical_costs_bwd:
-                layer_assignment = self._get_layer_assignment(ctx, layer_profile.total_layers, pp)
-                stage_fwd = layer_profile.compose_stage_times(typical_costs_fwd, pp, layer_assignment)
-                stage_bwd = layer_profile.compose_stage_times(typical_costs_bwd, pp, layer_assignment)
-                for s in range(pp):
-                    stage_bwd_dw[s] = stage_fwd.get(s, 0.0)  # dw ≈ fwd (approximation)
-                logger.info(
-                    "Strategy 3 compose_stage_times: typical_costs_fwd=%s us, "
-                    "typical_costs_bwd=%s us, pp=%d, stage_fwd=[%.1f, ...] us, stage_bwd=[%.1f, ...] us",
-                    {k.value: f"{v:.1f}" for k, v in typical_costs_fwd.items()},
-                    {k.value: f"{v:.1f}" for k, v in typical_costs_bwd.items()},
-                    pp,
-                    stage_fwd.get(0, 0.0),
-                    stage_bwd.get(0, 0.0),
-                )
-                g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
-                g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
-                g.metadata["stage_timelines_bwd_dw"] = dict(stage_bwd_dw)
-                g.metadata["strategy3_used"] = True
-
-        if not use_strategy3 and pp > 1 and any("stage_id" in n.annotations for n in g.nodes.values()):
+        if pp > 1 and any("stage_id" in n.annotations for n in g.nodes.values()):
             # Per-stage scheduling: schedule each stage's subgraph independently
             stage_node_sets: dict[int, set[str]] = {}
             for node in g.nodes.values():
@@ -788,21 +758,57 @@ class TrainingPipelinePass(GraphPass):
             # Step 2: homogeneous fallback when too few traced layers cover all pp stages.
             # E.g. DeepSeek-V3 with --layers 4 traces only 2 representative layers but
             # pp=4, so stages 2-3 are empty. Distribute total evenly across all stages.
+            # OR when stage_fwd distribution is severely imbalanced (ratio > 5x).
             stages_with_fwd = sum(1 for s in range(pp) if stage_fwd.get(s, 0.0) > 0)
-            if 0 < stages_with_fwd < pp:
-                total_fwd_us_h = sum(stage_fwd.values())
-                total_bwd_us_h = sum(stage_bwd.values())
-                per_fwd_h = total_fwd_us_h / pp
-                per_bwd_h = total_bwd_us_h / pp
-                logger.debug(
-                    "TrainingPipelinePass: %d/%d stages have fwd ops "
-                    "(too few traced layers for pp=%d); applying homogeneous fallback "
-                    "per_fwd=%.1fms per_bwd=%.1fms",
-                    stages_with_fwd, pp, pp, per_fwd_h / 1000, per_bwd_h / 1000,
-                )
-                for s in range(pp):
-                    stage_fwd[s] = per_fwd_h
-                    stage_bwd[s] = per_bwd_h
+            
+            # Check for severe imbalance
+            fwd_values = [stage_fwd.get(s, 0.0) for s in range(pp)]
+            max_fwd = max(fwd_values) if fwd_values else 0.0
+            min_fwd = min(v for v in fwd_values if v > 0) if any(v > 0 for v in fwd_values) else 0.0
+            fwd_imbalance_ratio = max_fwd / min_fwd if min_fwd > 0 else 0.0
+            
+            needs_fallback = (0 < stages_with_fwd < pp) or (fwd_imbalance_ratio > 5.0)
+            
+            if needs_fallback:
+                # FIX: Use layer-type scaling for total, then simple uniform distribution
+                # Avoid double scaling bug (compose_stage_times would scale twice)
+                if use_layer_type_scaling:
+                    fwd_scaled_ms, bwd_scaled_ms, _ = (
+                        self._scale_compute_by_layer_type(g, layer_profile, typical_indices)
+                    )
+                    total_fwd_us = fwd_scaled_ms * 1000.0
+                    total_bwd_us = bwd_scaled_ms * 1000.0
+                    
+                    per_fwd = total_fwd_us / pp
+                    per_bwd = total_bwd_us / pp
+                    
+                    logger.info(
+                        "TrainingPipelinePass: %d/%d stages have fwd ops "
+                        "(too few traced layers for pp=%d); using layer-type scaling "
+                        "with uniform distribution. "
+                        "total_fwd=%.1fms, total_bwd=%.1fms, per_stage_fwd=%.1fms, per_stage_bwd=%.1fms",
+                        stages_with_fwd, pp, pp,
+                        total_fwd_us / 1000.0, total_bwd_us / 1000.0,
+                        per_fwd / 1000.0, per_bwd / 1000.0,
+                    )
+                    
+                    for s in range(pp):
+                        stage_fwd[s] = per_fwd
+                        stage_bwd[s] = per_bwd
+                else:
+                    total_fwd_us_h = sum(stage_fwd.values())
+                    total_bwd_us_h = sum(stage_bwd.values())
+                    per_fwd_h = total_fwd_us_h / pp
+                    per_bwd_h = total_bwd_us_h / pp
+                    logger.debug(
+                        "TrainingPipelinePass: %d/%d stages have fwd ops "
+                        "(too few traced layers for pp=%d); applying homogeneous fallback "
+                        "per_fwd=%.1fms per_bwd=%.1fms",
+                        stages_with_fwd, pp, pp, per_fwd_h / 1000, per_bwd_h / 1000,
+                    )
+                    for s in range(pp):
+                        stage_fwd[s] = per_fwd_h
+                        stage_bwd[s] = per_bwd_h
 
             g.metadata["stage_timelines_fwd"] = dict(stage_fwd)
             g.metadata["stage_timelines_bwd"] = dict(stage_bwd)
@@ -822,53 +828,51 @@ class TrainingPipelinePass(GraphPass):
             # pp=1 or no stage_id: schedule whole graph as single unit.
             # When pp > 1 without stage annotations, divide total by pp for
             # per-stage estimate (homogeneous fallback).
-            # Skip this branch if Strategy 3 already computed stage times.
-            if not use_strategy3:
-                if pp > 1:
-                    logger.warning(
-                        "PipelineParallelPass has not assigned stage_id annotations; "
-                        "dividing whole-graph latency by pp=%d as homogeneous fallback. "
-                        "Results will ignore real stage heterogeneity and warmup/cooldown "
-                        "structure. Run PipelineParallelPass before this pass for accurate "
-                        "per-stage scheduling.",
-                        pp,
-                    )
+            if pp > 1:
+                logger.warning(
+                    "PipelineParallelPass has not assigned stage_id annotations; "
+                    "dividing whole-graph latency by pp=%d as homogeneous fallback. "
+                    "Results will ignore real stage heterogeneity and warmup/cooldown "
+                    "structure. Run PipelineParallelPass before this pass for accurate "
+                    "per-stage scheduling.",
+                    pp,
+                )
 
-                if use_layer_type_scaling:
-                    fwd_scaled_ms, bwd_scaled_ms, _ = (
-                        self._scale_compute_by_layer_type(g, layer_profile, typical_indices)
-                    )
-                    fwd = fwd_scaled_ms * 1000.0  # convert to us
-                    bwd = bwd_scaled_ms * 1000.0  # convert to us
-                    logger.info(
-                        "TrainingPipelinePass: using layer-type scaling for stage_fwd/bwd: "
-                        "fwd=%.1f us, bwd=%.1f us",
-                        fwd, bwd,
-                    )
-                else:
-                    tl = sched.schedule(g)
-                    stage_timelines[0] = tl
-                    _fwd = tl.phase_latency("fwd")
-                    _bwd = tl.phase_latency("bwd")
-                    fwd = _fwd if isinstance(_fwd, (int, float)) else 0.0
-                    bwd = _bwd if isinstance(_bwd, (int, float)) else 0.0
-                    if fwd == 0.0 and bwd == 0.0:
-                        fwd = tl.total_latency_us / 2.0
-                        bwd = tl.total_latency_us / 2.0
-                    elif fwd == 0.0:
-                        fwd = tl.total_latency_us - bwd
-                    elif bwd == 0.0:
-                        bwd = tl.total_latency_us - fwd
-                    if layer_scale != 1.0:
-                        fwd *= layer_scale
-                        bwd *= layer_scale
+            if use_layer_type_scaling:
+                fwd_scaled_ms, bwd_scaled_ms, _ = (
+                    self._scale_compute_by_layer_type(g, layer_profile, typical_indices)
+                )
+                fwd = fwd_scaled_ms * 1000.0  # convert to us
+                bwd = bwd_scaled_ms * 1000.0  # convert to us
+                logger.info(
+                    "TrainingPipelinePass: using layer-type scaling for stage_fwd/bwd: "
+                    "fwd=%.1f us, bwd=%.1f us",
+                    fwd, bwd,
+                )
+            else:
+                tl = sched.schedule(g)
+                stage_timelines[0] = tl
+                _fwd = tl.phase_latency("fwd")
+                _bwd = tl.phase_latency("bwd")
+                fwd = _fwd if isinstance(_fwd, (int, float)) else 0.0
+                bwd = _bwd if isinstance(_bwd, (int, float)) else 0.0
+                if fwd == 0.0 and bwd == 0.0:
+                    fwd = tl.total_latency_us / 2.0
+                    bwd = tl.total_latency_us / 2.0
+                elif fwd == 0.0:
+                    fwd = tl.total_latency_us - bwd
+                elif bwd == 0.0:
+                    bwd = tl.total_latency_us - fwd
+                if layer_scale != 1.0:
+                    fwd *= layer_scale
+                    bwd *= layer_scale
 
-                per_stage_fwd = fwd / pp
-                per_stage_bwd = bwd / pp
-                for s in range(pp):
-                    stage_fwd[s] = per_stage_fwd
-                    stage_bwd[s] = per_stage_bwd
-                    stage_bwd_dw[s] = 0.0
+            per_stage_fwd = fwd / pp
+            per_stage_bwd = bwd / pp
+            for s in range(pp):
+                stage_fwd[s] = per_stage_fwd
+                stage_bwd[s] = per_stage_bwd
+                stage_bwd_dw[s] = 0.0
             g.metadata["pp_per_stage_timelines"] = stage_timelines
 
         # ── PP scheduling ──────────────────────────────────────────────────
@@ -1368,125 +1372,6 @@ class TrainingPipelinePass(GraphPass):
             return 0.0
         return bwd_us * dw_flops / total_bwd_flops
 
-    def _extract_typical_layer_costs(
-        self,
-        g: "OpGraph",
-        typical_indices: list[int],
-        layer_profile: Any,
-    ) -> dict[Any, float]:
-        """Extract per-layer latency for typical indices, grouped by LayerType.
-        
-        Strategy 3: extract captured typical layer latency, then compose stage times.
-        
-        Args:
-            g: OpGraph with node annotations (compute_us, latency_us)
-            typical_indices: List of typical layer indices (e.g., [0, 2])
-            layer_profile: LayerProfile with layer_types mapping
-        
-        Returns:
-            {LayerType: cost_per_layer_in_us}
-        """
-        from python.zrt.graph.layer_strategy import LayerType
-        
-        # Aggregate latency per layer index
-        layer_latency: dict[int, float] = {}
-        layer_node_count: dict[int, int] = {}
-        
-        for node in g.nodes.values():
-            if node.layer:
-                try:
-                    layer_idx = int(node.layer)
-                except (ValueError, TypeError):
-                    continue
-                
-                if layer_idx not in typical_indices:
-                    continue
-                
-                latency = node.annotations.get("compute_us") or node.annotations.get("latency_us") or 0.0
-                layer_latency[layer_idx] = layer_latency.get(layer_idx, 0.0) + latency
-                layer_node_count[layer_idx] = layer_node_count.get(layer_idx, 0) + 1
-        
-        # Map layer index → LayerType, then compute per-type cost
-        typical_costs: dict[LayerType, float] = {}
-        for idx in typical_indices:
-            if idx not in layer_latency:
-                continue
-            
-            if idx >= len(layer_profile.layer_types):
-                continue
-            
-            layer_type = layer_profile.layer_types[idx]
-            latency_sum = layer_latency[idx]
-            # cost_per_layer is total latency for this typical layer (all ops combined)
-            cost_per_layer = latency_sum
-            
-            # Only set if not already set (first typical layer of this type)
-            if layer_type not in typical_costs:
-                typical_costs[layer_type] = cost_per_layer
-        
-        logger.debug(
-            "_extract_typical_layer_costs: indices=%s, costs=%s",
-            typical_indices,
-            {k.value: f"{v:.1f}us" for k, v in typical_costs.items()},
-        )
-        
-        return typical_costs
-
-    def _extract_typical_costs_by_phase(
-        self,
-        g: "OpGraph",
-        typical_indices: list[int],
-        layer_profile: Any,
-    ) -> tuple[dict[Any, float], dict[Any, float]]:
-        """Extract fwd and bwd costs separately for typical layers.
-
-        Args:
-            g: OpGraph with node annotations (latency_us, phase)
-            typical_indices: List of typical layer indices
-            layer_profile: LayerProfile with layer_types mapping
-
-        Returns:
-            (typical_costs_fwd, typical_costs_bwd) in us, keyed by LayerType
-        """
-        from python.zrt.graph.layer_strategy import LayerType
-
-        def _is_bwd_node(node):
-            return node.annotations.get("phase", "") in _BWD_PHASES
-
-        typical_fwd: dict[LayerType, float] = {}
-        typical_bwd: dict[LayerType, float] = {}
-
-        for node in g.nodes.values():
-            layer = node.annotations.get("layer") or getattr(node, "layer", "")
-            if not layer:
-                continue
-
-            try:
-                layer_idx = int(layer)
-            except (ValueError, TypeError):
-                continue
-
-            if layer_idx not in typical_indices:
-                continue
-
-            if layer_idx >= len(layer_profile.layer_types):
-                continue
-
-            layer_type = layer_profile.layer_types[layer_idx]
-            latency = node.annotations.get("latency_us", 0.0)
-
-            if node.category == "communication":
-                continue
-            if node.annotations.get("optimizer_step"):
-                continue
-
-            if _is_bwd_node(node):
-                typical_bwd[layer_type] = typical_bwd.get(layer_type, 0.0) + latency
-            else:
-                typical_fwd[layer_type] = typical_fwd.get(layer_type, 0.0) + latency
-
-        return typical_fwd, typical_bwd
-
     @staticmethod
     def _scale_compute_by_layer_type(
         g: "OpGraph",
@@ -1600,6 +1485,10 @@ class TrainingPipelinePass(GraphPass):
         pp: int,
     ) -> Optional[list[int]]:
         """Get layer assignment from context or generate uniform distribution.
+        
+        DEPRECATED: Use partition_layers_by_strategy from python.zrt.graph.partition instead.
+        This method only supports uniform distribution and explicit assignment,
+        not greedy bin-packing or VPP interleaved schedules.
         
         Args:
             ctx: TransformContext (may have pp_layer_assignment)

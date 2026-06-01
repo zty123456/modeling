@@ -310,7 +310,7 @@ class TestScaleLayerCosts:
 
 
 class TestComposeStageTimes:
-    """Tests for compose_stage_times (Strategy 3)."""
+    """Tests for compose_stage_times."""
 
     def test_compose_uniform_pp4(self):
         """Uniform distribution with PP=4."""

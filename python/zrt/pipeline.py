@@ -745,6 +745,12 @@ def run_trace_phases(
     full_num_layers = cfg_tmp.num_hidden_layers
     full_compress_ratios = list(getattr(cfg_tmp, "compress_ratios", []))
     
+    # CRITICAL: Save full layer info BEFORE any truncation
+    # This ensures LayerProfile inference uses complete layer distribution
+    cfg_tmp._full_num_hidden_layers = full_num_layers
+    if full_compress_ratios:
+        cfg_tmp._full_compress_ratios = full_compress_ratios
+    
     if infer_profile and target_layers is None:
         # New LayerProfile-based inference (supports V4 CSA/HCA/SWA)
         # Infer profile from FULL config (before truncation)
@@ -862,7 +868,7 @@ def run_trace_phases(
 
             raw_opgraph = records_to_opgraph(
                 records, name=f"{slug}_{phase}", phase=phase)
-            # Add LayerProfile metadata for Strategy 3 scaling
+            # Add LayerProfile metadata for layer-type scaling
             if profile:
                 raw_opgraph.metadata["layer_profile"] = profile
                 raw_opgraph.metadata["typical_indices"] = profile.typical_indices

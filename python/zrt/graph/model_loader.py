@@ -299,9 +299,27 @@ def load_model(
         config.num_hidden_layers = num_hidden_layers
     
     # Step 2b: infer layer profile if requested (skip if already set by caller)
+    # CRITICAL: Infer profile BEFORE truncation, using saved full values
     if infer_profile and not hasattr(config, "_full_layer_profile"):
+        # Restore full layer info temporarily for profile inference
+        full_compress = getattr(config, "_full_compress_ratios", None)
+        full_layers = getattr(config, "_full_num_hidden_layers", None)
+        
+        # Temporarily restore full values if available
+        if full_compress and full_layers:
+            saved_compress = getattr(config, "compress_ratios", None)
+            saved_layers = config.num_hidden_layers
+            config.compress_ratios = full_compress
+            config.num_hidden_layers = full_layers
+        
         profile = infer_layer_profile(config)
         config._full_layer_profile = profile
+        
+        # Restore truncated values if we modified them
+        if full_compress and full_layers:
+            config.compress_ratios = saved_compress if saved_compress else full_compress[:saved_layers]
+            config.num_hidden_layers = saved_layers
+        
         logger.info(
             "LayerProfile: typical_indices=%s, types: dense=%d, moe=%d, "
             "hca_hash=%d, hca_topk=%d, csa_hash=%d, csa_topk=%d, "

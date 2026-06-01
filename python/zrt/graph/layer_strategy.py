@@ -73,50 +73,7 @@ class LayerProfile:
     def total_layers(self) -> int:
         return len(self.layer_types)
     
-    def compose_stage_times(
-        self,
-        typical_costs: Dict[LayerType, float],
-        pp: int,
-        layer_assignment: Optional[List[int]] = None,
-    ) -> Dict[int, float]:
-        """
-        Compose per-stage times from global typical layer costs.
-        
-        This implements Strategy 3: global capture + stage composition.
-        
-        Args:
-            typical_costs: {LayerType: cost_per_layer} from capture
-            pp: Pipeline parallel degree
-            layer_assignment: Optional assignment per layer (0 to pp-1)
-                             If None, assume uniform distribution
-        
-        Returns:
-            {stage: stage_total_time}
-        """
-        total = self.total_layers
-        
-        if layer_assignment is None:
-            stage_size = total // pp
-            layer_assignment = [
-                min(i // stage_size, pp - 1) for i in range(total)
-            ]
-        
-        stage_counts: Dict[int, Dict[LayerType, int]] = {s: {} for s in range(pp)}
-        for layer_idx, layer_type in enumerate(self.layer_types):
-            stage = layer_assignment[layer_idx]
-            stage_counts[stage][layer_type] = (
-                stage_counts[stage].get(layer_type, 0) + 1
-            )
-        
-        stage_times: Dict[int, float] = {}
-        for stage in range(pp):
-            stage_time = 0.0
-            for layer_type, count in stage_counts[stage].items():
-                cost = typical_costs.get(layer_type, 0.0)
-                stage_time += cost * count
-            stage_times[stage] = stage_time
-        
-        return stage_times
+    
 
 
 def infer_layer_profile(config: Any) -> LayerProfile:

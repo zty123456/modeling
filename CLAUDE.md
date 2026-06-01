@@ -95,6 +95,7 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 - `model_loader.py`: loads HF model via `FakeTensorMode` — no real weights or memory allocated
 - `dispatch.py` + `tracker.py`: intercept aten ops during forward pass via `TorchDispatchMode` + `ModuleTracker`
 - `graph_builder.py`: produces raw `OpGraph`
+- `partition.py`: unified PP stage partition strategies (uniform/greedy/VPP interleaved)
 - `transform_runner.py`: runs the transform pipeline on a captured graph
 - `patches.py`: MoE meta patch (replaces `.cpu().numpy()` on meta tensors); Indexer patch for DeepSeek V3.2; V4 inference stubs
 - `compat.py`: version shims for transformers 4.x vs 5.x API differences
