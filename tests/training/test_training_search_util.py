@@ -1071,10 +1071,10 @@ class TestBestAnalysisReport:
             analysis_headers = [
                 cell.value for cell in next(wb["analysis"].iter_rows(min_row=1, max_row=1))
             ]
-            assert "迭代时间" in analysis_headers
+            assert "单卡迭代时间" in analysis_headers
             assert "集群吞吐" in analysis_headers
             assert "集群吞吐归一化" in analysis_headers
-            assert "单卡迭代时间" not in analysis_headers
+            assert "迭代时间" not in analysis_headers
             assert "单卡吞吐" not in analysis_headers
             assert "单卡吞吐归一化" not in analysis_headers
             assert "A2:A3" in {str(rng) for rng in wb["raw_data"].merged_cells.ranges}

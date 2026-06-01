@@ -69,7 +69,7 @@ RAW_DATA_HEADERS = [
 
 ANALYSIS_HEADERS = [
     "组号", "硬件+seq", "TP", "PP", "DP", "EP", "CP", "重计算",
-    "迭代时间", "集群吞吐", "集群吞吐归一化", "计算占比",
+    "单卡迭代时间", "集群吞吐", "集群吞吐归一化", "计算占比",
     "TP通信占比", "EP通信占比", "PP通信占比", "DP通信占比",
     "CP通信占比", "优化器占比", "空泡占比", "fw_time", "bw_time",
     "recompute_time", "计算时间", "TP通信时间(未掩盖)",
@@ -86,7 +86,7 @@ RAW_TO_ANALYSIS = {
     "EP": "ep",
     "CP": "cp",
     "重计算": "recompute",
-    "迭代时间": "step_time_ms",
+    "单卡迭代时间": "step_time_ms",
     "集群吞吐": "tokens_per_sec",
     "fw_time": "fwd_compute_ms",
     "bw_time": "bwd_compute_ms",
