@@ -192,13 +192,21 @@ class TestRingCP:
 
         g = ContextParallelPass().run(graph, ctx)
         g = CommInserterPass().run(g, ctx)
+        
+        # StreamAssignPass sets overlap_type annotation
+        from python.zrt.transform.analysis.passes import StreamAssignPass
+        g = StreamAssignPass().run(g, ctx)
 
         p2p_nodes = [n for n in g.nodes.values()
                      if n.op_type == "comm.send_recv" and n.attrs.get("role") == "cp_ring"]
         for p2p in p2p_nodes:
             target = p2p.annotations.get("overlap_target", "")
-            assert target == "attention_block", (
-                f"Expected overlap_target 'attention_block', got '{target}'"
+            overlap_type = p2p.annotations.get("overlap_type", "")
+            assert target.startswith("ring_cp:"), (
+                f"Expected overlap_target to start with 'ring_cp:', got '{target}'"
+            )
+            assert overlap_type == "ring_cp", (
+                f"Expected overlap_type 'ring_cp', got '{overlap_type}'"
             )
 
     def test_ring_round_and_scope_attrs(self):

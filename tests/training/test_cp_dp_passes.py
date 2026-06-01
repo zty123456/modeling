@@ -125,11 +125,22 @@ def test_comm_inserter_cp_ring_inserts_p2p_with_overlap_target():
     ctx = _ctx(cp=cp, cp_kind="ring")
     g = ContextParallelPass().run(g, ctx)
     result = CommInserterPass().run(g, ctx)
+    
+    # StreamAssignPass sets overlap_type annotation
+    from python.zrt.transform.analysis.passes import StreamAssignPass
+    result = StreamAssignPass().run(result, ctx)
 
     p2p_nodes = [n for n in result.nodes.values() if n.op_type == "comm.send_recv"]
     assert len(p2p_nodes) == 1  # one per-layer P2P node
     for p2p in p2p_nodes:
-        assert p2p.annotations.get("overlap_target") == "attention_block"
+        overlap_target = p2p.annotations.get("overlap_target", "")
+        overlap_type = p2p.annotations.get("overlap_type", "")
+        assert overlap_target.startswith("ring_cp:"), (
+            f"Expected overlap_target to start with 'ring_cp:', got '{overlap_target}'"
+        )
+        assert overlap_type == "ring_cp", (
+            f"Expected overlap_type 'ring_cp', got '{overlap_type}'"
+        )
         assert p2p.attrs["rounds"] == cp
 
 
