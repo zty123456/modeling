@@ -809,7 +809,7 @@ def _batched(iterable, batch_size: int):
 
 
 def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
-    from zrt.training.ir.builders import build_graph
+    from zrt.training.ir.opgraph_builder import build_explicit_graph
 
     model_name = config.get("model", "deepseek_v3_2")
     hw_name = config.get("hw", "nvidia_h100_sxm")
@@ -859,7 +859,7 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         graph_key = _graph_cache_key(config)
         graph = _WORKER_GRAPH_CACHE.get(graph_key)
         if graph is None:
-            graph = build_graph(model, strategy)
+            graph = build_explicit_graph(model, strategy)
             _WORKER_GRAPH_CACHE[graph_key] = graph
         report = estimate(model, system, strategy, graph=graph)
 
@@ -1380,8 +1380,8 @@ def export_best_configs_excel(
         all_results: List[Dict],
         output_path: str
 ) -> None:
-    from zrt.training.ir.builders import build_graph
-    from zrt.training.models.flops import op_cost as _op_cost
+    from zrt.training.ir.opgraph_builder import build_explicit_graph
+    from zrt.training.models.flops import op_cost_from_node as _op_cost_from_node
     from zrt.training.io.excel_exporter import export_estimate_excel
 
     if not all_results:
@@ -1428,10 +1428,11 @@ def export_best_configs_excel(
 
         strategy = _make_strategy_from_config(best_config)
 
-        graph = build_graph(model, strategy)
+        graph = build_explicit_graph(model, strategy)
         op_costs = {}
-        for op in graph.ops:
-            op_costs[op.name] = _op_cost(op, model, system)
+        for node in graph.nodes.values():
+            if not node.is_comm:
+                op_costs[node.id] = _op_cost_from_node(node, model, system)
 
         excel_name = f"{model_name}_{hw_name}_seq{seq_len}_ws{world_size}_best.xlsx"
         excel_path = os.path.join(output_path, excel_name)
@@ -1636,8 +1637,8 @@ if __name__ == "__main__":
         "model": ["deepseek_v4_pro"],
         "hw": ["nvidia_b300", "nvidia_gb300_nvl576", "ascend_910c"],
         "world_size": [8192],
-        "tp": [1, 2, 4, 8, 16, 32, 64, 128],
-        "cp": [1, 2, 4, 8, 16, 32, 64, 128],
+        "tp": [1, 2, 4, 8,],
+        "cp": [1, 2, 4, 8,],
         "pp": [1, 2, 4, 8, 16],
         # EP must divide DP under the current expert-DP sharding model.
         "ep": [32, 64, 128],

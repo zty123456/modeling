@@ -8,19 +8,42 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Union
 
-from zrt.training.ir.training_graph import Collective, Graph, Op
+if TYPE_CHECKING:
+    from zrt.ir.node import OpNode
 from zrt.training.io.perf_tables import (
     effective_flops, effective_hbm_bw_bps, peak_tflops_for,
 )
-from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
+from zrt.training.models.comm import CommSpec, collective_time, comm_spec_from_node, tier_for_group, total_comm_time
 from zrt.training.topology import CommDomain
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.models.mega_moe import mega_moe_stage_time
 from zrt.training.spec.dtype import Dtype
-from zrt.training.spec.model import LayerKind, ModelSpec
+from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy, TPOverlap
 from zrt.training.spec.system import SystemSpec
+
+
+def _kind(op) -> str:
+    if hasattr(op, "attrs"):
+        return op.attrs.get("spec_kind", op.op_type)
+    return op.kind
+
+
+def _name(op) -> str:
+    return op.id if hasattr(op, "id") else op.name
+
+
+def _layer_id(op) -> int:
+    if hasattr(op, "layer") and isinstance(getattr(op, "layer", None), str):
+        if op.layer and op.layer != "-1":
+            try:
+                return int(op.layer)
+            except (ValueError, TypeError):
+                pass
+        return -1
+    return getattr(op, "layer_id", -1)
 
 
 @dataclass
@@ -139,16 +162,9 @@ def op_to_time_hetero(
     return max(compute_t, memory_t)
 
 
-def _resolve_compute_dtype(op: Op, model: ModelSpec) -> Dtype:
-    """Map ``op.component`` to its compute dtype, falling back to act_dtype.
-
-    Used by stage.py to per-op-dispatch compute dtypes in mixed-quant
-    configurations (FP8 attention with BF16 norms, FP4 routed experts with
-    BF16 shared experts, etc.). Embedding and norm components are always
-    BF16 — they have negligible compute cost and quantizing them is
-    numerically unstable.
-    """
-    comp = getattr(op, "component", None)
+def _resolve_compute_dtype(op: "OpNode", model: ModelSpec) -> Dtype:
+    """Map ``op.component`` to its compute dtype, falling back to act_dtype."""
+    comp = op.component
     if comp == "attention":
         return model.attn_compute_dtype
     if comp == "routed_expert":
@@ -173,25 +189,14 @@ def _cost_phase_time(
 
 
 def stage_time(
-    stage_ops: list[Op],
-    stage_collectives: list[Collective],
+    stage_ops: "list[OpNode]",
+    stage_collectives: "list[CommSpec]",
     model: ModelSpec,
     system: SystemSpec,
     strategy: Strategy,
     domain: CommDomain | None = None,
 ) -> StageTime:
-    """Compute forward + backward time for one PP stage and one microbatch.
-
-    Parameters
-    ----------
-    domain
-        Optional shared :class:`CommDomain`. When provided, ALL
-        per-collective costs are priced through it — picking up the
-        N-tier explicit-ranks path automatically for 3+ tier systems
-        (no per-call rebuilds of ParallelGroups). When ``None``, a
-        local domain is constructed inline; callers in the search hot
-        path should pass a pre-built one to avoid the rebuild.
-    """
+    """Compute forward + backward time for one PP stage and one microbatch."""
     if domain is None:
         domain = CommDomain(system=system, strategy=strategy)
     gpu_name = system.gpu.name
@@ -206,7 +211,8 @@ def stage_time(
 
     for op in stage_ops:
         cost = op_cost(op, model, system)
-        overlap = gpu.overlap_ratio.get(op.kind, 0.0)
+        k = _kind(op)
+        overlap = gpu.overlap_ratio.get(k, 0.0)
         op_dtype = _resolve_compute_dtype(op, model)
         fwd_t = _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
         dx_t  = _cost_phase_time(cost, "dx",  system, gpu_name, overlap, op_dtype)
@@ -214,7 +220,7 @@ def stage_time(
         t_fwd    += fwd_t
         t_bwd_dx += dx_t
         t_bwd_dw += dw_t
-        if op.kind == "mega_moe":
+        if _kind(op) == "mega_moe":
             mega_time = mega_moe_stage_time(
                 op, model, system, strategy, gpu,
                 fwd_compute_s=fwd_t,
@@ -320,7 +326,12 @@ def stage_time(
 
     ep_imbalance = 1.0
     if strategy.ep > 1 and model.num_experts > 0:
-        has_moe = any(op.layer_kind == LayerKind.MOE for op in stage_ops)
+        def _is_moe(o):
+            if hasattr(o, "attrs"):
+                return o.attrs.get("layer_kind") == "moe"
+            lk = getattr(o, "layer_kind", None)
+            return (lk.value if hasattr(lk, "value") else str(lk)) == "moe"
+        has_moe = any(_is_moe(op) for op in stage_ops)
         if has_moe:
             ep_imbalance = ep_imbalance_factor(model.num_experts, strategy.ep,
                                                getattr(model, 'top_k', 1))
@@ -362,7 +373,7 @@ def stage_time(
         for op in stage_ops:
             if _is_routed_expert_compute(op):
                 cost = op_cost(op, model, system)
-                op_overlap = gpu.overlap_ratio.get(op.kind, 0.0)
+                op_overlap = gpu.overlap_ratio.get(_kind(op), 0.0)
                 op_dtype = _resolve_compute_dtype(op, model)
                 dx_t = _cost_phase_time(cost, "dx", system, gpu_name, op_overlap, op_dtype)
                 dw_t = _cost_phase_time(cost, "dw", system, gpu_name, op_overlap, op_dtype)
@@ -469,15 +480,10 @@ def stage_time(
 
 
 def _recompute_time(
-    ops: list[Op], model: ModelSpec, system: SystemSpec,
+    ops: "list[OpNode]", model: ModelSpec, system: SystemSpec,
     strategy: Strategy, gpu_name: str,
 ) -> float:
-    """Extra forward time for recomputed ops (Korthikanti-style).
-
-    Mirrors ``recompute_overhead_flops`` (FLOPs side) — same category
-    mapping, same FA-kernel dedup. The category mapping is imported from
-    flops.py so the two sides stay in sync.
-    """
+    """Extra forward time for recomputed ops (Korthikanti-style)."""
     from zrt.training.models.flops import _op_recompute_categories as _flops_op_cats
 
     policy = strategy.recompute.per_layer
@@ -488,28 +494,23 @@ def _recompute_time(
 
     t = 0.0
     for op in ops:
-        if op.layer_id < 0:
+        lid = _layer_id(op)
+        if lid < 0:
             continue
-        # v2 cast ops: their cost is tied to the consumer's HBM read and
-        # is already counted in the main stage_time loop. Recomputing them
-        # is conceptually "redo the consumer's input cast" — handled as a
-        # 2nd-order effect; the main stage_time path covers it via the
-        # restored consumer fwd time. See §12.7 of mixed_quant_v2 doc.
-        if op.kind == "cast":
+        k = _kind(op)
+        if k == "cast":
             continue
-        lk = model.layers[op.layer_id].value if op.layer_id < len(model.layers) else ""
+        lk = model.layers[lid].value if lid < len(model.layers) else ""
         cats = policy.get(lk, set())
         if not cats:
             continue
 
         op_cats = _flops_op_cats(op)
         if "full" in cats or (op_cats & cats):
-            if op.kind in FA_KERNEL_KINDS:
-                # FA backward already pays the recompute time via the
-                # 2.5×fwd convention — see recompute_overhead_flops.
+            if k in FA_KERNEL_KINDS:
                 continue
             cost = op_cost(op, model, system)
-            overlap = system.gpu.overlap_ratio.get(op.kind, 0.0)
+            overlap = system.gpu.overlap_ratio.get(k, 0.0)
             op_dtype = _resolve_compute_dtype(op, model)
             t += _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
 
@@ -517,28 +518,21 @@ def _recompute_time(
 
 
 def _ep_parallel_fraction(
-    ops: list[Op], model: ModelSpec, system: SystemSpec,
+    ops: "list[OpNode]", model: ModelSpec, system: SystemSpec,
     strategy: Strategy, gpu_name: str,
 ) -> float:
-    """Estimate the fraction of compute time from EP-parallel ops.
-
-    Only routed expert FFN ops are EP-parallel; attention, shared expert,
-    embedding, and other ops are replicated across EP ranks.
-    Returns a value in [0, 1].
-    """
+    """Estimate the fraction of compute time from EP-parallel ops."""
     t_total = 0.0
     t_ep = 0.0
     for op in ops:
-        if op.kind == "cast":
-            # cast ops are neither EP-parallel nor representative of
-            # compute time — exclude from both numerator and denominator
-            # of the imbalance fraction.
+        k = _kind(op)
+        if k == "cast":
             continue
         cost = op_cost(op, model, system)
         if cost.fwd_cube_flops > 0 or cost.fwd_vector_flops > 0 or cost.fwd_bytes > 0:
             op_dtype = _resolve_compute_dtype(op, model)
             t = _cost_phase_time(cost, "fwd", system, gpu_name,
-                                 system.gpu.overlap_ratio.get(op.kind, 0.0), op_dtype)
+                                 system.gpu.overlap_ratio.get(k, 0.0), op_dtype)
         else:
             continue
         t_total += t
@@ -576,15 +570,10 @@ def _wave_overlap_saved(comm_time: float, gemm_time: float, K: int = 4) -> float
 
 
 def _ep_comm_time(
-    collectives: list[Collective], strategy: Strategy, system: SystemSpec,
+    collectives: "list[CommSpec]", strategy: Strategy, system: SystemSpec,
     domain: CommDomain | None = None,
 ) -> float:
-    """Total EP A2A communication time (seconds).
-
-    Uses the shared :class:`CommDomain` when provided so the N-tier
-    explicit-ranks path applies (A2A picks the outermost spanned tier
-    for 3+ tier systems). Local fall-back domain otherwise.
-    """
+    """Total EP A2A communication time (seconds)."""
     if domain is None:
         domain = CommDomain(system=system, strategy=strategy)
     total = 0.0
@@ -595,7 +584,7 @@ def _ep_comm_time(
 
 
 def _ep_gemm_time(
-    ops: list[Op], model: ModelSpec, system: SystemSpec,
+    ops: "list[OpNode]", model: ModelSpec, system: SystemSpec,
     strategy: Strategy, gpu_name: str,
 ) -> float:
     """Routed expert GEMM time (seconds) — the compute that overlaps with EP A2A."""
@@ -604,45 +593,38 @@ def _ep_gemm_time(
         if _is_routed_expert_compute(op):
             cost = op_cost(op, model, system)
             op_dtype = _resolve_compute_dtype(op, model)
+            k = _kind(op)
             total += _cost_phase_time(cost, "fwd", system, gpu_name,
-                                      system.gpu.overlap_ratio.get(op.kind, 0.0), op_dtype)
+                                      system.gpu.overlap_ratio.get(k, 0.0), op_dtype)
     return total
 
 
-def _is_routed_expert_compute(op: Op) -> bool:
-    return op.kind == "mega_moe" or (
-        op.kind == "matmul" and "routed_expert" in op.name
+def _is_routed_expert_compute(op) -> bool:
+    k = _kind(op)
+    return k == "mega_moe" or (
+        k == "matmul" and "routed_expert" in _name(op)
     )
 
 
 def _tp_gemm_time(
-    ops: list[Op], model: ModelSpec, system: SystemSpec,
+    ops: "list[OpNode]", model: ModelSpec, system: SystemSpec,
     gpu_name: str, phase: str = "fwd",
 ) -> float:
-    """Total matmul time available to overlap TP AG/RS (Megatron-SP).
-
-    In Megatron-SP, each AG/RS is bracketed by a dense matmul that runs while
-    the collective is in flight. The overlappable matmuls are exactly those
-    that ir/shard.py:_insert_tp_collectives attaches an AG/RS to:
-        - qkv (AG before)        - o_proj (RS after)
-        - up_proj (AG before)    - down_proj (RS after)
-        - gate_proj (AG before, SwiGLU path)
-
-    phase="fwd" sums fwd time; phase="bwd" sums dx + dw time per matmul.
-    """
+    """Total matmul time available to overlap TP AG/RS (Megatron-SP)."""
     OVERLAPPABLE_SUBSTRINGS = ("qkv", "o_proj", "up_proj", "down_proj", "gate_proj")
     total = 0.0
     for op in ops:
-        if op.kind != "matmul":
+        k = _kind(op)
+        if k != "matmul":
             continue
-        if not any(s in op.name for s in OVERLAPPABLE_SUBSTRINGS):
+        if not any(s in _name(op) for s in OVERLAPPABLE_SUBSTRINGS):
             continue
         cost = op_cost(op, model, system)
-        overlap = system.gpu.overlap_ratio.get(op.kind, 0.0)
+        overlap = system.gpu.overlap_ratio.get(k, 0.0)
         op_dtype = _resolve_compute_dtype(op, model)
         if phase == "fwd":
             total += _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
-        else:  # "bwd"
+        else:
             total += _cost_phase_time(cost, "dx", system, gpu_name, overlap, op_dtype)
             total += _cost_phase_time(cost, "dw", system, gpu_name, overlap, op_dtype)
     return total

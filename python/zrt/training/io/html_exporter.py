@@ -31,6 +31,28 @@ from zrt.training.io.operator_time_stats import (
 if TYPE_CHECKING:
     from zrt.training.ir.training_graph import Graph, Op
     from zrt.training.models.flops import OpCost
+
+
+def _iter_ops(graph):
+    """Iterate compute ops from either Graph or OpGraph."""
+    if hasattr(graph, "ops"):
+        return graph.ops
+    if hasattr(graph, "nodes"):
+        from zrt.training.models.flops import _OpNodeAsOp
+        return [_OpNodeAsOp(n) for n in graph.nodes.values() if not n.is_comm]
+    return []
+
+
+def _ops_for_layer(graph, layer_id: int):
+    """Get ops for a specific layer from either Graph or OpGraph."""
+    if hasattr(graph, "ops_for_layer"):
+        return graph.ops_for_layer(layer_id)
+    if hasattr(graph, "nodes"):
+        from zrt.training.models.flops import _OpNodeAsOp
+        lid_str = str(layer_id)
+        return [_OpNodeAsOp(n) for n in graph.nodes.values()
+                if not n.is_comm and n.layer == lid_str]
+    return []
     from zrt.training.spec.model import ModelSpec
     from zrt.training.spec.report import TrainingReport
     from zrt.training.spec.strategy import Strategy
@@ -1078,9 +1100,10 @@ def _build_layer_tree(
     """Build hierarchical tree: model -> layer -> block -> op."""
     layers = getattr(model, "layers", [])
 
+    all_ops = _iter_ops(graph)
     tree = {
         "model_name": f"{len(layers)} layers, hidden={getattr(model, 'hidden', '-')}",
-        "total_ops": len(graph.ops),
+        "total_ops": len(all_ops),
         "layers": [],
         "global_ops": [],
     }
@@ -1090,7 +1113,7 @@ def _build_layer_tree(
     from zrt.training.models.flops import op_cost
 
     # Global ops: embedding / final head etc.
-    for op in graph.ops:
+    for op in all_ops:
         if getattr(op, "layer_id", -1) < 0:
             cost = op_costs.get(op.name)
             if cost is None:
@@ -1106,7 +1129,7 @@ def _build_layer_tree(
     # Per-layer data.
     for lid in range(len(layers)):
         lk = _enum_value(layers[lid]).lower()
-        layer_ops = graph.ops_for_layer(lid)
+        layer_ops = _ops_for_layer(graph, lid)
         blocks = _classify_ops_in_layer(layer_ops, lk)
 
         layer_data = {
