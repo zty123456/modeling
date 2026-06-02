@@ -1254,23 +1254,21 @@ def _build_calibration_data(
 
     rows.append(
         {
-            "name": "DeepSeek-V4-Pro architecture",
+            "name": "DeepSeek-V4-Pro 架构",
             "official": (
-                "DeepSeek-V4-Pro public model card/technical material: "
-                "1.6T total params, 49B activated params, 1M context, "
-                "FP4+FP8 mixed precision."
+                "DeepSeek-V4-Pro 公开模型卡 / 技术资料：总参数 1.6T，"
+                "激活参数 49B，上下文 1M，FP4+FP8 混合精度。"
             ),
             "modeled": (
                 f"hidden={hidden}, experts={num_experts}, top_k={top_k}, "
                 f"moe_ffn={moe_ffn}, layers={len(getattr(model, 'layers', []))}"
             ),
             "status": "pass" if is_dsv4_pro_like else "check",
-            "delta": "structure check",
-            "source": "DeepSeek-V4-Pro model card / technical report",
+            "delta": "结构校验",
+            "source": "DeepSeek-V4-Pro 模型卡 / 技术报告",
             "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro",
             "note": (
-                "Use this row to confirm the YAML/model spec matches the public "
-                "DeepSeek-V4-Pro geometry."
+                "用于确认 YAML / 模型配置与公开的 DeepSeek-V4-Pro 几何结构一致。"
             ),
         }
     )
@@ -1298,22 +1296,22 @@ def _build_calibration_data(
         err_pct = abs(modeled_us - official_us) / official_us * 100.0
         delta = f"{err_pct:.1f}%"
         status = "pass" if err_pct <= 20.0 else "warn"
-        modeled = f"{modeled_us:.1f} us avg routed_expert_fwd"
+        modeled = f"routed_expert_fwd 平均 {modeled_us:.1f} us"
     elif modeled_us is not None:
-        delta = "not apples-to-apples"
+        delta = "口径不一致"
         status = "info"
-        modeled = f"{modeled_us:.1f} us avg routed_expert_fwd"
+        modeled = f"routed_expert_fwd 平均 {modeled_us:.1f} us"
     else:
-        delta = "no routed expert op found"
+        delta = "未找到 routed expert 算子"
         status = "check"
         modeled = "-"
 
     rows.append(
         {
-            "name": "DeepGEMM Mega MoE benchmark",
+            "name": "DeepGEMM Mega MoE 基准",
             "official": (
-                "DeepSeek-V4-Pro EP8, 512 tokens/rank: 369.6 us; "
-                "1098 TFLOPS; 4619 GB/s global memory; 182 GB/s interconnect."
+                "DeepSeek-V4-Pro EP8，512 tokens/rank：369.6 us；"
+                "1098 TFLOPS；全局显存 4619 GB/s；互联 182 GB/s。"
             ),
             "modeled": modeled,
             "status": status,
@@ -1321,32 +1319,30 @@ def _build_calibration_data(
             "source": "DeepGEMM PR #316",
             "url": "https://github.com/deepseek-ai/DeepGEMM/pull/316",
             "note": (
-                "This is a serving MegaMoE kernel reference. For this training "
-                "report, treat it as a routed expert kernel sanity check unless "
-                "EP=8, token shape and dtype match the PR scenario."
+                "这是推理(serving)场景的 MegaMoE kernel 参考值。在本训练报告中，"
+                "除非 EP=8、token 形状与 dtype 与该 PR 场景一致，"
+                "否则仅作为 routed expert kernel 的合理性校验。"
             ),
         }
     )
 
     rows.append(
         {
-            "name": "Step-level calibration placeholder",
+            "name": "整步级校准（占位）",
             "official": (
-                "No public official full-step Ascend 910C DeepSeek-V4-Pro "
-                "training reference is embedded in this exporter."
+                "本导出器未内置公开的 Ascend 910C DeepSeek-V4-Pro 整步训练参考值。"
             ),
             "modeled": (
                 f"step_time={getattr(report, 'step_time_ms', 0.0):.3f} ms, "
                 f"MFU={getattr(report, 'mfu', 0.0) * 100:.2f}%"
             ),
             "status": "check",
-            "delta": "requires local cluster sampling",
-            "source": "Local benchmark hook",
+            "delta": "需目标集群本地采样",
+            "source": "本地基准采样钩子",
             "url": "",
             "note": (
-                "Recommended: add one measured step-time sample from the target "
-                "cluster and store it in report metadata; then compute "
-                "correction_factor = measured_step_ms / modeled_step_ms."
+                "建议：从目标集群采集一个实测 step-time 样本并写入 report metadata，"
+                "再计算 correction_factor = measured_step_ms / modeled_step_ms。"
             ),
         }
     )
