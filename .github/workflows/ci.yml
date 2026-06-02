@@ -6,7 +6,6 @@ on:
   push:
     branches: [main]
 
-# 取消同一 PR 的前一次运行，节省 CI 分钟数
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -14,23 +13,118 @@ concurrency:
 env:
   PYTHONPATH: python
   PYTHON_VERSION: "3.12"
-  # 覆盖率门禁阈值 — 单点定义，修改后所有作业和 job name 一并更新
-  # 历史欠账还清后建议把 GLOBAL_COVERAGE_THRESHOLD 上调至 80
   GLOBAL_COVERAGE_THRESHOLD: "65"
   PATCH_COVERAGE_THRESHOLD: "80"
 
 jobs:
-  # ── 门禁 1: 代码规范 (ruff) ──────────────────────────────────────────────
-  # PR 阶段：只检查 PR 实际改动的【行】（不是整个文件），避免历史欠账阻塞新 PR
-  # main push 阶段：全量扫描但 soft-fail，给历史欠账可视化展示窗口
-  # 历史欠账清理后可改为 push 也硬失败、并移除 PR 路径的行号过滤
+  classify-changes:
+    name: Classify Changes
+    runs-on: ubuntu-latest
+    outputs:
+      gate_mode: ${{ steps.classify.outputs.gate_mode }}
+      has_python_source_diff: ${{ steps.classify.outputs.has_python_source_diff }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify PR diff
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "gate_mode=full" >> "$GITHUB_OUTPUT"
+            echo "has_python_source_diff=true" >> "$GITHUB_OUTPUT"
+            echo "changed_files=push-to-main" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch origin "${{ github.base_ref }}"
+          BASE="origin/${{ github.base_ref }}"
+          git diff --name-only "${BASE}...HEAD" > /tmp/changed-files.txt
+
+          python - <<'PY'
+          from pathlib import Path
+          import os
+
+          files = [
+              line.strip().replace("\\", "/")
+              for line in Path("/tmp/changed-files.txt").read_text().splitlines()
+              if line.strip()
+          ]
+
+          high_risk_exact = {
+              "pytest.ini",
+              "pyproject.toml",
+              "setup.py",
+              "setup.cfg",
+              "tox.ini",
+              "noxfile.py",
+              "conftest.py",
+          }
+
+          def is_doc(path: str) -> bool:
+              name = path.rsplit("/", 1)[-1].lower()
+              return (
+                  path.startswith("docs/")
+                  or name.startswith("readme")
+                  or name.endswith(".md")
+              )
+
+          def is_config(path: str) -> bool:
+              return (
+                  path.startswith("python/zrt/training/configs/")
+                  and path.lower().endswith((".yaml", ".yml", ".json"))
+              )
+
+          def is_full(path: str) -> bool:
+              lower = path.lower()
+              name = lower.rsplit("/", 1)[-1]
+              return (
+                  lower.startswith("python/") and lower.endswith(".py")
+                  or lower.startswith("tests/") and lower.endswith(".py")
+                  or lower.startswith(".github/workflows/")
+                  or name.startswith("requirements") and name.endswith(".txt")
+                  or lower in high_risk_exact
+              )
+
+          if not files:
+              mode = "docs-only"
+          elif any(is_full(path) for path in files):
+              mode = "full"
+          elif all(is_config(path) for path in files):
+              mode = "config-smoke"
+          elif all(is_doc(path) for path in files):
+              mode = "docs-only"
+          else:
+              # Fail closed: unknown paths still get full pytest/coverage.
+              mode = "full"
+
+          has_python_source = any(
+              path.startswith("python/zrt/") and path.endswith(".py")
+              for path in files
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"gate_mode={mode}\n")
+              out.write(f"has_python_source_diff={str(has_python_source).lower()}\n")
+
+          print(f"gate_mode={mode}")
+          print(f"has_python_source_diff={has_python_source}")
+          print("changed files:")
+          for path in files:
+              print(f"  {path}")
+          PY
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # diff 需要 base 历史
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -39,7 +133,7 @@ jobs:
       - name: Install ruff
         run: pip install ruff
 
-      - name: Lint PR-changed lines only (PR — hard fail)
+      - name: Lint PR-changed lines only
         if: github.event_name == 'pull_request'
         shell: bash
         run: |
@@ -49,13 +143,12 @@ jobs:
 
           CHANGED=$(git diff --name-only --diff-filter=AM "${BASE}...HEAD" -- '*.py')
           if [ -z "$CHANGED" ]; then
-            echo "No Python file changes — skipping lint."
+            echo "No Python file changes; skipping lint."
             exit 0
           fi
           echo "Files in PR diff:"
           echo "$CHANGED"
 
-          # ruff 整文件扫描（输出 JSON），随后用 git diff 算出改动行号、只保留落在改动行上的违规
           echo "$CHANGED" | xargs ruff check --output-format=json > ruff_violations.json || true
 
           export BASE
@@ -67,8 +160,6 @@ jobs:
           from pathlib import Path
 
           base = os.environ["BASE"]
-
-          # 1. 解析 unified diff，得到 {file: set(改动后的行号)}
           diff = subprocess.check_output(
               ["git", "diff", "--unified=0", "--diff-filter=AM",
                f"{base}...HEAD", "--", "*.py"],
@@ -81,7 +172,6 @@ jobs:
                   cur = line[6:]
                   changed_lines[cur] = set()
               elif line.startswith("@@") and cur is not None:
-                  # @@ -old,oldcount +new,newcount @@
                   new_part = line.split()[2].lstrip("+")
                   if "," in new_part:
                       start, count = map(int, new_part.split(","))
@@ -90,7 +180,6 @@ jobs:
                   for ln in range(start, start + max(count, 1)):
                       changed_lines[cur].add(ln)
 
-          # 2. 过滤 ruff 违规，只保留行号在 PR 改动行集合里的
           with open("ruff_violations.json") as f:
               violations = json.load(f)
 
@@ -116,33 +205,39 @@ jobs:
                 f"(filtered from {len(violations)} file-level violations).")
           PY
 
-      - name: Lint full tree (push to main — soft fail, surface historical debt)
+      - name: Lint full tree on main push
         if: github.event_name == 'push'
         continue-on-error: true
         run: ruff check python/ tests/
 
-  # ── 门禁 2: 单元测试 + 全局覆盖率门槛（历史代码基线，后续逐步提升）────────
   test:
-    name: Test & Global Coverage Gate (≥${{ env.GLOBAL_COVERAGE_THRESHOLD }}%)
+    name: Test & Global Coverage Gate
     runs-on: ubuntu-latest
+    needs: classify-changes
     steps:
       - uses: actions/checkout@v4
         with:
-          # diff-cover 需要完整历史以对比 base 分支
           fetch-depth: 0
 
+      - name: Show gate mode
+        run: |
+          echo "gate_mode=${{ needs.classify-changes.outputs.gate_mode }}"
+
       - uses: actions/setup-python@v5
+        if: needs.classify-changes.outputs.gate_mode == 'full'
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
       - name: Install dependencies
+        if: needs.classify-changes.outputs.gate_mode == 'full'
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
           pip install pytest pytest-cov diff-cover
 
-      - name: Run tests (skip network tests)
+      - name: Run tests with coverage
+        if: needs.classify-changes.outputs.gate_mode == 'full'
         run: |
           pytest tests/ \
             -m "not network" \
@@ -153,43 +248,121 @@ jobs:
             -q
 
       - name: Upload coverage artifact
+        if: needs.classify-changes.outputs.gate_mode == 'full'
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: coverage-report
           path: coverage.xml
           retention-days: 7
 
-  # ── 门禁 3: PR 新增/修改代码必须有测试覆盖（patch coverage 门槛）─────────
-  # 防止"全局达标但新增代码全部没测试"的搭便车情形。
-  # 仅源码（python/zrt/**.py）参与计算；纯文档/配置/重命名等无源码改动的 PR
-  # 会因 diff 不包含可测行而被 diff-cover 自动放行。
+      - uses: actions/setup-python@v5
+        if: needs.classify-changes.outputs.gate_mode == 'config-smoke'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install config smoke dependencies
+        if: needs.classify-changes.outputs.gate_mode == 'config-smoke'
+        run: pip install pyyaml
+
+      - name: Config smoke check
+        if: needs.classify-changes.outputs.gate_mode == 'config-smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}"
+          BASE="origin/${{ github.base_ref }}"
+          git diff --name-only "${BASE}...HEAD" > /tmp/changed-files.txt
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          import yaml
+
+          from zrt.training.io.config_loader import load_specs, _resolve_model
+
+          files = [
+              Path(line.strip())
+              for line in Path("/tmp/changed-files.txt").read_text().splitlines()
+              if line.strip()
+          ]
+          config_files = [
+              path for path in files
+              if str(path).replace("\\", "/").startswith("python/zrt/training/configs/")
+              and path.suffix.lower() in {".yaml", ".yml", ".json"}
+          ]
+          if not config_files:
+              raise SystemExit("config-smoke mode had no config files")
+
+          for path in config_files:
+              text = path.read_text(encoding="utf-8")
+              if path.suffix.lower() == ".json":
+                  json.loads(text)
+                  print(f"JSON OK: {path}")
+                  continue
+              yaml.safe_load(text)
+              normalized = str(path).replace("\\", "/")
+              if normalized.startswith("python/zrt/training/configs/models/"):
+                  _resolve_model(path.stem)
+                  print(f"Model config OK: {path}")
+              else:
+                  load_specs(path)
+                  print(f"Training config OK: {path}")
+          PY
+
+      - name: Upload skip marker
+        if: needs.classify-changes.outputs.gate_mode != 'full'
+        run: |
+          echo "Skipped full pytest for gate_mode=${{ needs.classify-changes.outputs.gate_mode }}" > coverage-skip.txt
+
+      - name: Upload skip artifact
+        if: needs.classify-changes.outputs.gate_mode != 'full'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-skip
+          path: coverage-skip.txt
+          retention-days: 7
+
   patch-coverage:
-    name: Patch Coverage Gate (≥${{ env.PATCH_COVERAGE_THRESHOLD }}% on PR diff)
+    name: Patch Coverage Gate
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    needs: test
+    needs:
+      - classify-changes
+      - test
     steps:
+      - name: Skip patch coverage
+        if: needs.classify-changes.outputs.gate_mode != 'full' || needs.classify-changes.outputs.has_python_source_diff != 'true'
+        run: |
+          echo "Skipping patch coverage."
+          echo "gate_mode=${{ needs.classify-changes.outputs.gate_mode }}"
+          echo "has_python_source_diff=${{ needs.classify-changes.outputs.has_python_source_diff }}"
+
       - uses: actions/checkout@v4
+        if: needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         with:
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
+        if: needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install diff-cover
+        if: needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         run: pip install diff-cover
 
       - name: Download coverage artifact
+        if: needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         uses: actions/download-artifact@v4
         with:
           name: coverage-report
 
       - name: Ensure base branch is available
+        if: needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         run: git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
 
       - name: Enforce patch coverage threshold
+        if: needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         run: |
           diff-cover coverage.xml \
             --compare-branch=origin/${{ github.base_ref }} \
@@ -199,7 +372,7 @@ jobs:
             --markdown-report=patch-coverage.md
 
       - name: Upload patch coverage report
-        if: always()
+        if: always() && needs.classify-changes.outputs.gate_mode == 'full' && needs.classify-changes.outputs.has_python_source_diff == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: patch-coverage-report
@@ -208,57 +381,89 @@ jobs:
             patch-coverage.md
           retention-days: 7
 
-  # ── 预留门禁 3: 类型检查 (mypy) ─────────────────────────────────────────
-  # 取消下方注释即可启用；建议先修复现有类型错误后再开启
-  #
-  # type-check:
-  #   name: Type Check (mypy)
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: ${{ env.PYTHON_VERSION }}
-  #     - name: Install mypy
-  #       run: pip install mypy torch --index-url https://download.pytorch.org/whl/cpu
-  #     - name: Run mypy
-  #       run: mypy python/zrt/ --ignore-missing-imports
+  coverage-regression:
+    name: Coverage No-Regression Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs:
+      - classify-changes
+      - test
+    steps:
+      - name: Skip coverage no-regression
+        if: needs.classify-changes.outputs.gate_mode != 'full'
+        run: |
+          echo "Skipping coverage no-regression for gate_mode=${{ needs.classify-changes.outputs.gate_mode }}."
 
-  # ── 预留门禁 4: 安全扫描 (pip-audit + bandit) ────────────────────────────
-  # 取消下方注释即可启用
-  #
-  # security:
-  #   name: Security Scan
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: ${{ env.PYTHON_VERSION }}
-  #     - name: Install scanners
-  #       run: pip install bandit pip-audit
-  #     - name: bandit (source code SAST)
-  #       run: bandit -r python/zrt/ -ll -x python/zrt/training/configs
-  #     - name: pip-audit (dependency CVE scan)
-  #       run: pip-audit -r requirements.txt
+      - uses: actions/checkout@v4
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        with:
+          fetch-depth: 0
 
-  # ── 预留门禁 5: 慢速集成测试（可选，仅 main push 触发）───────────────────
-  # 取消下方注释即可启用
-  #
-  # integration-test:
-  #   name: Integration Tests (slow)
-  #   runs-on: ubuntu-latest
-  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: ${{ env.PYTHON_VERSION }}
-  #         cache: pip
-  #     - name: Install dependencies
-  #       run: |
-  #         pip install torch --index-url https://download.pytorch.org/whl/cpu
-  #         pip install -r requirements.txt pytest pytest-cov
-  #     - name: Run slow tests
-  #       run: |
-  #         pytest tests/ -m "slow" -q
+      - uses: actions/setup-python@v5
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Download PR coverage artifact
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: pr-coverage
+
+      - name: Parse PR coverage
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        run: |
+          python - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          path = pathlib.Path("pr-coverage/coverage.xml")
+          root = ET.parse(path).getroot()
+          pct = int(round(float(root.attrib["line-rate"]) * 100))
+          pathlib.Path("/tmp/pr_pct.txt").write_text(str(pct))
+          print(f"PR coverage: {pct}%")
+          PY
+
+      - name: Measure base branch coverage
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        run: |
+          git clean -fdx
+          git checkout ${{ github.base_ref }}
+          pytest tests/ -m "not network" \
+            --continue-on-collection-errors \
+            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/base.txt || true
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          txt = pathlib.Path("/tmp/base.txt").read_text()
+          m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", txt)
+          if not m:
+              print("ERROR: TOTAL coverage line not found in pytest output.", file=sys.stderr)
+              sys.exit(1)
+          pct = m.group(1)
+          pathlib.Path("/tmp/base_pct.txt").write_text(pct)
+          print(f"Base coverage: {pct}%")
+          PY
+
+      - name: Enforce no regression
+        if: needs.classify-changes.outputs.gate_mode == 'full'
+        run: |
+          BASE=$(cat /tmp/base_pct.txt)
+          PR=$(cat /tmp/pr_pct.txt)
+          echo "Base branch: ${BASE}% | This PR: ${PR}%"
+          if [ "$PR" -lt "$BASE" ]; then
+            echo "Coverage regression: ${PR}% < ${BASE}% (base branch)"
+            exit 1
+          fi
+          echo "Coverage did not regress: ${PR}% >= ${BASE}%"
